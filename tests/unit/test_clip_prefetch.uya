@@ -1,0 +1,74 @@
+// tests/unit/test_clip_prefetch.uya - Ctrl-V 预取单元测试
+// 说明：覆盖两个纯函数（按键判定、去抖窗口）与开关语义。
+//       真正的"读 X11 并入库"是端到端行为，放在 tests/integration/t13_ctrlv_import.py
+//       （那里用一个假 X 服务器，不碰用户的真剪贴板）。
+
+use std.testing.assert_eq_i64;
+use std.testing.expect;
+
+use clip.prefetch.ClipPrefetch;
+use clip.prefetch.prefetch_new;
+use clip.prefetch.prefetch_should_run;
+use clip.prefetch.prefetch_byte_is_ctrl_v;
+use clip.prefetch.PREFETCH_DEBOUNCE_MS;
+
+test "只有 Ctrl-V 触发预取（0x16）" {
+    const prefix: byte = 29 as byte;      // 默认前缀 ^]
+    try expect(prefetch_byte_is_ctrl_v(22 as byte, prefix));
+    // 邻近的键一个都不能误触发：0x15 (^U)、0x17 (^W)、0x06 (^F)、0x1d (^])。
+    try expect(!prefetch_byte_is_ctrl_v(21 as byte, prefix));
+    try expect(!prefetch_byte_is_ctrl_v(23 as byte, prefix));
+    try expect(!prefetch_byte_is_ctrl_v(6 as byte, prefix));
+    try expect(!prefetch_byte_is_ctrl_v(29 as byte, prefix));
+    // 普通可见字符
+    try expect(!prefetch_byte_is_ctrl_v(118 as byte, prefix));   // 'v'
+    try expect(!prefetch_byte_is_ctrl_v(0 as byte, prefix));
+}
+
+test "前缀键就是 ^v 时不抢（用户的选择优先）" {
+    // --prefix=^v：0x16 归前缀状态机，预取必须让路。
+    try expect(!prefetch_byte_is_ctrl_v(22 as byte, 22 as byte));
+    // 换了前缀之后，别的字节仍然不受影响。
+    try expect(prefetch_byte_is_ctrl_v(22 as byte, 1 as byte));   // prefix=^A
+}
+
+test "去抖窗口的边界" {
+    var st: ClipPrefetch = prefetch_new(true);
+    // 从未试过：立刻可以跑。
+    try expect(prefetch_should_run(&st, 1000000u64));
+    // 试过一次之后：窗口内不跑，窗口外才跑。
+    st.last_try_ms = 1000000u64;
+    try expect(!prefetch_should_run(&st, 1000000u64));                        // 同一毫秒
+    try expect(!prefetch_should_run(&st, 1000000u64 + PREFETCH_DEBOUNCE_MS - 1u64));  // 差 1ms
+    try expect(prefetch_should_run(&st, 1000000u64 + PREFETCH_DEBOUNCE_MS));          // 正好到点
+    try expect(prefetch_should_run(&st, 1000000u64 + PREFETCH_DEBOUNCE_MS + 500u64)); // 更久
+}
+
+test "时钟回拨不炸也不跑" {
+    var st: ClipPrefetch = prefetch_new(true);
+    st.last_try_ms = 5000u64;
+    // now < last（时钟被拨回去，或同一毫秒内的连击）：按"太近"处理，绝不因此跑起来。
+    try expect(!prefetch_should_run(&st, 4000u64));
+    try expect(!prefetch_should_run(&st, 0u64));
+}
+
+test "关掉开关后一律不跑" {
+    var st: ClipPrefetch = prefetch_new(false);
+    try expect(!st.enabled);
+    try expect(!prefetch_should_run(&st, 1000000u64));
+    // 就算手动把时间戳清零（"从没试过"的状态），关着就是关着。
+    st.last_try_ms = 0u64;
+    try expect(!prefetch_should_run(&st, 1000000u64));
+    // 打开之后同样的状态就能跑。
+    st.enabled = true;
+    try expect(prefetch_should_run(&st, 1000000u64));
+}
+
+test "新建状态的字段默认值" {
+    var on: ClipPrefetch = prefetch_new(true);
+    try expect(on.enabled);
+    try assert_eq_i64(on.last_try_ms as i64, 0);
+    try assert_eq_i64(on.reason[0] as i64, 0);          // 原因字段是空串
+    var off: ClipPrefetch = prefetch_new(false);
+    try expect(!off.enabled);
+}

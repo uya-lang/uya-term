@@ -19,7 +19,8 @@ export enum PtyMode {
 /// 解析后的命令行。
 /// 字段：program 为包装的子进程路径，args 为其参数向量（'\0' 结尾），
 ///       pty_mode 为伪终端策略，prefix_byte 为本地前缀键，show_version 表示只打印版本，
-///       print_help 表示只打印帮助，clip_action 为内建 clip 子命令（空表示无）。
+///       print_help 表示只打印帮助，clip_action 为内建 clip 子命令（空表示无），
+///       ctrl_v_import 表示 Ctrl-V 时是否先把本机剪贴板图片收进仓库。
 export struct Options {
     program: &const byte,
     args: [&const byte: 64],
@@ -31,6 +32,8 @@ export struct Options {
     clip_action: &const byte,
     clip_operand: &const byte,
     verbose: bool,
+    ctrl_v_import: bool,
+    ctrl_v_import_set: bool,
 }
 
 /// 解析命令行参数。
@@ -48,6 +51,8 @@ export fn parse_args(argc: i32, argv: &(&const byte)) !Options {
         clip_action: null,
         clip_operand: null,
         verbose: false,
+        ctrl_v_import: true,
+        ctrl_v_import_set: false,
     };
     var i: i32 = 1;
     var passthrough: bool = false;
@@ -74,6 +79,12 @@ export fn parse_args(argc: i32, argv: &(&const byte)) !Options {
             opts.verbose = true;
         } else if starts_with(a, "--prefix=") {
             opts.prefix_byte = parse_prefix(a + 9);
+        } else if starts_with(a, "--ctrl-v-import=") {
+            // "--ctrl-v-import=" 共 16 字节，值从下标 16 开始。
+            opts.ctrl_v_import = parse_yes_no(a + 16, true);
+            // 记下"命令行明确说过这件事"：否则配置文件里没提这个键（默认开着）时，
+            // 就会把 --ctrl-v-import=no 悄悄改回 yes。优先级是命令行 > 配置文件。
+            opts.ctrl_v_import_set = true;
         } else if starts_with(a, "--program=") {
             opts.program = a + 10;
         } else if cstr_eq(a, "clip") {
@@ -112,6 +123,26 @@ fn push_arg(opts: &Options, a: &const byte) !void {
     }
     opts.args[opts.arg_count] = a;
     opts.arg_count = opts.arg_count + 1;
+}
+
+/// 解析是/否写法（yes/no/true/false/1/0/on/off）。
+/// 参数：text 为以 '\0' 结尾的值，fallback 为无法识别时的返回值。
+/// 返回值：解析出的布尔值。
+/// 说明：认不出时返回 fallback 而**不是**静默当成 false —— 一个拼错的开关
+///       不应该悄悄把功能关掉（用户会以为它开着）。
+fn parse_yes_no(text: &const byte, fallback: bool) bool {
+    if text == null || text[0] == 0 {
+        return fallback;
+    }
+    if cstr_eq(text, "1" as &const byte) || cstr_eq(text, "yes" as &const byte) ||
+        cstr_eq(text, "true" as &const byte) || cstr_eq(text, "on" as &const byte) {
+        return true;
+    }
+    if cstr_eq(text, "0" as &const byte) || cstr_eq(text, "no" as &const byte) ||
+        cstr_eq(text, "false" as &const byte) || cstr_eq(text, "off" as &const byte) {
+        return false;
+    }
+    return fallback;
 }
 
 /// 判断字符串是否以给定前缀开头。
@@ -187,6 +218,7 @@ export fn print_help(prog: &const byte) void {
     out_str("  --pty               强制使用伪终端（默认）\n");
     out_str("  --program=<路径>    包装的程序（默认 ssh）\n");
     out_str("  --prefix=<键>       本地前缀键，形如 ^] (默认) 或 ^a\n");
+    out_str("  --ctrl-v-import=<y/n> Ctrl-V 时先把本机剪贴板图片收进仓库（默认 yes）\n");
     out_str("  -v, --verbose       打印调试信息到 stderr\n");
     out_str("  --version           打印版本\n");
     out_str("  -h, --help          打印本帮助\n\n");

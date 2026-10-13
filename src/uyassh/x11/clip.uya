@@ -937,7 +937,8 @@ fn x11_wait_property(x: &X11Conn, prop: u32, timeout_ms: i32) bool {
 /// 读一个 target 的完整内容（含 INCR 分段）。
 /// 参数：x 为连接，sel/target 为原子，prop 为本次用的属性，out 为输出。
 /// 返回值：成功返回 true；所有者拒绝返回 false。
-fn x11_read_target(x: &X11Conn, sel: u32, target: u32, prop: u32, incr: u32, out: &Buf) bool {
+fn x11_read_target(x: &X11Conn, sel: u32, target: u32, prop: u32, incr: u32, out: &Buf,
+    incr_budget_ms: i32) bool {
     var ok: bool = false;
     if !x11_convert(x, sel, target, prop, &ok) {
         return false;
@@ -960,9 +961,12 @@ fn x11_read_target(x: &X11Conn, sel: u32, target: u32, prop: u32, incr: u32, out
     // 这里**任何提前收尾都必须报失败**，不能返回半张图：
     // 截断的 PNG 交给下游只会得到一个坏请求，用户看到的是「粘贴了一张损坏的图」，
     // 比明确说「读剪贴板失败」难查得多（半个 PNG 也能过 MIME 嗅探）。
+    //
+    // 预算是**调用方给的**（`incr_budget_ms`）：手动 `clip fetch` 可以慢慢等，
+    // 而 Ctrl-V 的按键路径必须快 —— 用户在等一个按键的回显，不是等一次粘贴。
     var spent: i32 = 0;
-    while spent < INCR_WAIT_MS {
-        if !x11_wait_property(x, prop, INCR_WAIT_MS - spent) {
+    while spent < incr_budget_ms {
+        if !x11_wait_property(x, prop, incr_budget_ms - spent) {
             return false;
         }
         spent = spent + WAIT_MS;
@@ -1076,7 +1080,32 @@ fn target_is_text(idx: usize) bool {
 /// 读本机剪贴板里的最佳内容（图片优先，其次文本）。
 /// 参数：out 为数据输出，mime/mime_cap 为 MIME 输出。
 /// 返回值：拿到内容返回 true；没有可用内容（无 DISPLAY/剪贴板空/全是没用的 target）返回 false。
+/// 说明：INCR 分段预算用默认的 INCR_WAIT_MS（手动路径可以慢慢等）。
 export fn x11_fetch_clipboard(out: &Buf, mime: &byte, mime_cap: usize) bool {
+    return x11_fetch_clipboard_budget(out, mime, mime_cap, INCR_WAIT_MS);
+}
+
+/// 同上，但可指定 INCR 分段的总预算（毫秒）。
+/// 参数：out 为数据输出，mime/mime_cap 为 MIME 输出，incr_budget_ms 为分段等待上限。
+/// 返回值：拿到内容返回 true。
+/// 为什么要这个参数：**按键路径**（Ctrl-V 预取）不能占用十几秒 —— 用户按下 Ctrl-V
+///       期待的是立刻看到回显，而一次粘贴事件最多等 3 秒；反过来，手动 `clip fetch`
+///       面对一张几十 MiB 的大图时又确实需要长一点的预算。同一个实现，两种预算。
+export fn x11_fetch_clipboard_budget(out: &Buf, mime: &byte, mime_cap: usize,
+    incr_budget_ms: i32) bool {
+    return x11_fetch_clipboard_filtered(out, mime, mime_cap, incr_budget_ms, false);
+}
+
+/// 同上，但可以只要图片（image_only）。
+/// 参数：out 为数据输出，mime/mime_cap 为 MIME 输出，incr_budget_ms 为分段等待上限，
+///       image_only 为 true 时，挑中的 target 是文本就直接放弃（不读数据）。
+/// 返回值：拿到内容返回 true。
+/// 为什么要 image_only：Ctrl-V 预取是给「远端应用要图片」这件事铺路的 —— 用户板子里
+///       是一段文本时，把它读进图片仓库毫无意义，而空手而归的代价只是**跳过**（不报错）。
+///       注意这个判断发生在**取数据之前**：拿到 TARGETS 列表就知道该不该继续，不必
+///       为一个用不上的 target 白读一遍数据。
+export fn x11_fetch_clipboard_filtered(out: &Buf, mime: &byte, mime_cap: usize,
+    incr_budget_ms: i32, image_only: bool) bool {
     var x: X11Conn = X11Conn{
         fd: -1, win: 0u32, base: 0u32, mask: 0u32, root: 0u32, seq: 0u32, next_id: 1u32,
         ev_count: 0, ev_queue: [0: 256],
@@ -1117,7 +1146,7 @@ export fn x11_fetch_clipboard(out: &Buf, mime: &byte, mime_cap: usize) bool {
     // 先问 TARGETS，再按优先级挑一个。
     var list: Buf = buf_new();
     defer { buf_free(&list); }
-    if !x11_read_target(&x, sel, targets_atom, prop, incr, &list) {
+    if !x11_read_target(&x, sel, targets_atom, prop, incr, &list, incr_budget_ms) {
         return false;
     }
     const nitems: usize = list.len / 4;
@@ -1147,12 +1176,16 @@ export fn x11_fetch_clipboard(out: &Buf, mime: &byte, mime_cap: usize) bool {
     if best >= target_count() {
         return false;
     }
+    if image_only && target_is_text(best) {
+        // 只要图片：板子里是文本时提前放手（省下一次数据读取与一轮 INCR 等待）。
+        return false;
+    }
     var data_prop: u32 = 0;
     if !x11_intern(&x, "UYASSH_DATA" as &const byte, &data_prop) {
         return false;
     }
     buf_clear(out);
-    if !x11_read_target(&x, sel, best_atom, data_prop, incr, out) {
+    if !x11_read_target(&x, sel, best_atom, data_prop, incr, out, incr_budget_ms) {
         return false;
     }
     if out.len == 0 {

@@ -14,18 +14,21 @@ use util.out.err_str;
 /// 配置项。
 /// 字段：prefix_byte 为本地前缀键；clip_dir 为剪贴板仓库目录（空表示默认）；
 ///       force_serve 表示即使本地终端支持 5522 也自己扮演终端；
-///       verbose 为诊断开关；loaded 表示是否成功读到配置。
+///       verbose 为诊断开关；loaded 表示是否成功读到配置；
+///       ctrl_v_import 为 Ctrl-V 预取开关，ctrl_v_import_set 表示配置文件里**写了**这个键。
 export struct Config {
     prefix_byte: byte,
     clip_dir: [byte: 256],
     force_serve: bool,
     verbose: bool,
     loaded: bool,
+    ctrl_v_import: bool,
+    ctrl_v_import_set: bool,
 }
 
 /// 默认配置。
 /// 参数：无。
-/// 返回值：前缀键为 Ctrl-]、其余为空的配置。
+/// 返回值：前缀键为 Ctrl-]、Ctrl-V 预取默认开、其余为空的配置。
 export fn config_default() Config {
     return Config{
         prefix_byte: 29 as byte,
@@ -33,6 +36,8 @@ export fn config_default() Config {
         force_serve: false,
         verbose: false,
         loaded: false,
+        ctrl_v_import: true,
+        ctrl_v_import_set: false,
     };
 }
 
@@ -187,7 +192,38 @@ fn config_parse_line(line: &const byte, n: usize, cfg: &Config) void {
         cfg.verbose = config_truthy(val, val_len);
         return;
     }
+    if config_key_is(key, key_len, "ctrl-v-import" as &const byte) {
+        // 这个键**默认是开的**，所以不能像上面几个那样直接赋值：
+        // config_truthy 对"没写这个键"（val 为空）返回 false，会把默认值覆盖成关。
+        // 只有写得认得出才覆盖；认不出的写法保留默认并在 stderr 说一声。
+        var recognized: bool = true;
+        const v: bool = config_yes_no(val, val_len, &recognized);
+        if recognized {
+            cfg.ctrl_v_import = v;
+            cfg.ctrl_v_import_set = true;
+        } else {
+            err_str("[uya-ssh] ctrl-v-import 的值无法识别，按默认（开）处理\n");
+        }
+        return;
+    }
     err_str("[uya-ssh] 忽略未知配置项\n");
+}
+
+/// 解析是/否写法，并报告是否认得。
+/// 参数：val/n 为值文本，recognized 为输出（是否认得）。
+/// 返回值：布尔值；认不出时返回 true（本键的默认值）。
+fn config_yes_no(val: &const byte, n: usize, recognized: &bool) bool {
+    recognized[0] = true;
+    if config_key_is(val, n, "1" as &const byte) || config_key_is(val, n, "yes" as &const byte) ||
+        config_key_is(val, n, "true" as &const byte) || config_key_is(val, n, "on" as &const byte) {
+        return true;
+    }
+    if config_key_is(val, n, "0" as &const byte) || config_key_is(val, n, "no" as &const byte) ||
+        config_key_is(val, n, "false" as &const byte) || config_key_is(val, n, "off" as &const byte) {
+        return false;
+    }
+    recognized[0] = false;
+    return true;
 }
 
 /// 去掉尾部空白后的长度（键名）。

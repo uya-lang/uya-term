@@ -7,6 +7,11 @@ use clip.store.ClipEntry;
 use clip.store.clip_get_current;
 use clip.store.clip_current_size;
 use clip.store.clip_list;
+use clip.prefetch.ClipPrefetch;
+use clip.prefetch.prefetch_new;
+use clip.prefetch.prefetch_byte_is_ctrl_v;
+use clip.prefetch.clip_prefetch_local;
+use clip.prefetch.PREFETCH_STORED;
 use osc.handler.ClipMode;
 use osc.handler.OscHandler;
 use osc.handler.handler_new;
@@ -72,22 +77,26 @@ export struct SessionResult {
 }
 
 /// 会话内部状态（代理请求 + 模式）。
-/// 字段：proxy 为向本地终端索取剪贴板的请求器，proxy_active 表示本地终端支持 5522。
+/// 字段：proxy 为向本地终端索取剪贴板的请求器，proxy_active 表示本地终端支持 5522，
+///       prefetch 为 Ctrl-V 预取状态。
 export struct SessionState {
     proxy: ProxyReader,
     proxy_active: bool,
     /// 本地终端的应答是否被我们消费（避免透传给子进程）。
     swallow_next: bool,
+    /// Ctrl-V 预取（把本机剪贴板图片先收进仓库）。
+    prefetch: ClipPrefetch,
 }
 
 /// 创建会话状态。
-/// 参数：proxy_active 表示本地终端是否支持 5522。
+/// 参数：proxy_active 表示本地终端是否支持 5522，prefetch_ctrl_v 表示是否启用 Ctrl-V 预取。
 /// 返回值：会话状态。
-export fn session_state_new(proxy_active: bool) SessionState {
+export fn session_state_new(proxy_active: bool, prefetch_ctrl_v: bool) SessionState {
     return SessionState{
         proxy: proxy_new(),
         proxy_active: proxy_active,
         swallow_next: false,
+        prefetch: prefetch_new(prefetch_ctrl_v),
     };
 }
 
@@ -101,13 +110,14 @@ export fn session_state_free(st: &SessionState) void {
 /// 会话配置。
 /// 字段：local_fd 为本地终端 fd，prefix_byte 为本地前缀键，
 ///       clip_mode 为 5522 工作模式，store 为剪贴板仓库（可为 null），
-///       verbose 为是否打印诊断。
+///       verbose 为是否打印诊断，prefetch_ctrl_v 为是否在 Ctrl-V 时预取本机图片。
 export struct SessionConfig {
     local_fd: i32,
     prefix_byte: byte,
     clip_mode: ClipMode,
     store: &ClipStore,
     verbose: bool,
+    prefetch_ctrl_v: bool,
 }
 
 /// 前缀键之后的动作状态。
@@ -118,10 +128,11 @@ enum PrefixAction {
 
 /// 创建会话配置。
 /// 参数：local_fd 为本地终端 fd，prefix_byte 为前缀键，proxy 为是否代理到本地终端，
-///       store 为剪贴板仓库（可为 null），verbose 为诊断开关。
+///       store 为剪贴板仓库（可为 null），verbose 为诊断开关，
+///       prefetch_ctrl_v 为是否启用 Ctrl-V 预取。
 /// 返回值：配置实例。
 export fn session_config(local_fd: i32, prefix_byte: byte, proxy: bool, store: &ClipStore,
-    verbose: bool) SessionConfig {
+    verbose: bool, prefetch_ctrl_v: bool) SessionConfig {
     if proxy {
         return SessionConfig{
             local_fd: local_fd,
@@ -129,6 +140,7 @@ export fn session_config(local_fd: i32, prefix_byte: byte, proxy: bool, store: &
             clip_mode: ClipMode.proxy,
             store: store,
             verbose: verbose,
+            prefetch_ctrl_v: prefetch_ctrl_v,
         };
     }
     return SessionConfig{
@@ -137,6 +149,7 @@ export fn session_config(local_fd: i32, prefix_byte: byte, proxy: bool, store: &
         clip_mode: ClipMode.serve,
         store: store,
         verbose: verbose,
+        prefetch_ctrl_v: prefetch_ctrl_v,
     };
 }
 
@@ -156,7 +169,8 @@ export fn session_run(session: &PtySession, cfg: &const SessionConfig) SessionRe
     defer { scanner_free(&scanner); }
     var handler: OscHandler = handler_new(cfg.clip_mode, cfg.store);
     defer { handler_free(&handler); }
-    var st: SessionState = session_state_new(cfg.clip_mode == ClipMode.proxy);
+    var st: SessionState = session_state_new(cfg.clip_mode == ClipMode.proxy,
+        cfg.prefetch_ctrl_v);
     defer { session_state_free(&st); }
     var reply: Buf = buf_new();
     defer { buf_free(&reply); }
@@ -390,6 +404,13 @@ fn session_local_bytes(master_fd: i32, handler: &OscHandler, reply: &Buf, st: &S
                 i = i + 1;
                 continue;
             }
+            // Ctrl-V：**先把本机剪贴板的图片收进仓库，再把字节原样交给子进程**。
+            // 顺序是这里的全部要点 —— 远端应用收到 Ctrl-V 后可能立刻就发 5522 read，
+            // 那时图必须在仓库里（而不是等它问了才去读 X11，那样会撞上它的读超时）。
+            // 预取无论成败都**不影响**这次按键：下面照样把 c 转发出去。
+            if cfg.prefetch_ctrl_v && prefetch_byte_is_ctrl_v(c, cfg.prefix_byte) {
+                session_ctrl_v_prefetch(st, cfg);
+            }
             _ = relay_write_child(master_fd, data + i, 1);
             i = i + 1;
             continue;
@@ -414,6 +435,35 @@ fn session_local_bytes(master_fd: i32, handler: &OscHandler, reply: &Buf, st: &S
         }
     }
     return false;
+}
+
+/// Ctrl-V 预取：把本机剪贴板里的图片收进仓库（成功即成为当前项）。
+/// 参数：st 为会话状态，cfg 为配置。
+/// 返回值：无。
+/// 说明：**绝不上屏**。成功时屏幕上一个字都不多（这是包装器，远端 TUI 的画面归它自己）；
+///       失败也不吭声 —— 用户按的是 Ctrl-V，不是"读剪贴板"，一次读不到不该变成一条报错。
+///       原因只在 -v 时进 stderr，供排查。
+fn session_ctrl_v_prefetch(st: &SessionState, cfg: &const SessionConfig) void {
+    if cfg.store == null {
+        return;
+    }
+    // 代理模式下剪贴板由本地终端持有（不是 X11）：通向终端的是异步请求/应答，
+    // 做不到"入库完成后再转发"这个同步顺序，所以预取只管 serve 模式。
+    // 那种终端的用户仍有现成的 Ctrl-] p 热键路径。
+    if st.proxy_active {
+        return;
+    }
+    const code: i32 = clip_prefetch_local(cfg.store, &st.prefetch);
+    if !cfg.verbose {
+        return;
+    }
+    if code == PREFETCH_STORED {
+        err_str("[uya-ssh] Ctrl-V 预取：已入库\n");
+        return;
+    }
+    err_str("[uya-ssh] Ctrl-V 预取跳过：");
+    err_str(&st.prefetch.reason[0]);
+    err_str("\n");
 }
 
 /// 触发粘贴：应用启用了 5522 粘贴事件时推事件，否则注入文本。

@@ -16,6 +16,9 @@ dde-clipboard / klipper 打架，也会把别人的剪贴板内容读出来—�
 
 用法: fake_x11.py <socket 路径> <inline|incr|empty|text> [秒数]
 环境: 打印 READY 到 stdout 后开始服务。
+      FAKE_X11_TRACE=<文件> 时，把「接受了连接」与「剪贴板数据交付完毕」按发生顺序
+      追加到该文件（t13 用它断言"先入库、再把按键交给 ssh"这个顺序）。
+      FAKE_X11_DEBUG=1 时把每个 GetProperty 打到 stderr。
 """
 
 import os
@@ -39,6 +42,23 @@ PNG = b"\x89PNG\r\n\x1a\n"
 
 def u16(v):
     return struct.pack("<H", v)
+
+
+def trace(event):
+    """把一条带时间戳的事件追加进 FAKE_X11_TRACE 指定的文件（未设则什么也不做）。
+
+    用途：t13 要断言的**不是**"最终有没有入库"，而是「X11 数据先交付、之后子进程才
+    收到那个 Ctrl-V 字节」这个**顺序**。顺序只能靠两侧各自打时间戳来证明，所以这里
+    由服务器侧记录交付时刻，假应用侧记录收到按键的时刻。
+    """
+    path = os.environ.get("FAKE_X11_TRACE")
+    if not path:
+        return
+    try:
+        with open(path, "a") as fh:
+            fh.write("%s %.6f\n" % (event, time.time()))
+    except OSError:
+        pass
 
 
 def u32(v):
@@ -223,6 +243,7 @@ class Server:
 
     # ---- 主循环 ----
     def serve(self, conn, seconds):
+        trace("connect")
         self.handshake(conn)
         end = time.time() + seconds
         conn.settimeout(max(0.5, seconds))
@@ -278,6 +299,9 @@ class Server:
                 self.incr_left[prop] = self.payload
                 self.set_prop(requestor, prop, self.atom("INCR"), 32, u32(len(self.payload)))
             self.notify(conn, tm, requestor, selection, target, prop)
+            # inline 模式：数据在这一刻就算交付出去了。
+            if self.mode == "inline":
+                trace("delivered")
             return
         if tname in ("UTF8_STRING", "text/plain") and self.mode == "text":
             self.set_prop(requestor, prop, self.atom("UTF8_STRING"), 8, self.payload)
@@ -317,6 +341,8 @@ class Server:
                 else:
                     del self.incr_left[prop]
                     self.set_prop(window, prop, self.atom("image/png"), 8, b"")
+                    # INCR 的零长结束标记已经写入：这一刻传输完成。
+                    trace("delivered")
                 ev = bytes([EV_PROP_NOTIFY, 0]) + u16(0) + u32(window) + u32(prop) \
                     + u32(0) + bytes([0])
                 # 通知必须排在应答之后（客户端先读应答，再等通知）
