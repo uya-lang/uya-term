@@ -28,6 +28,9 @@ integration: build
 	@set -e; for f in tests/integration/t*.sh; do \
 		if [ -e "$$f" ]; then echo "== $$f"; sh "$$f"; fi; \
 	done
+	@set -e; for f in tests/integration/t*.py; do \
+		if [ -e "$$f" ]; then echo "== $$f"; python3 "$$f"; fi; \
+	done
 
 # 验收命令：类型检查 + 单元测试 + 集成测试
 check: syntax unit integration

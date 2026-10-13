@@ -1,0 +1,372 @@
+// src/uyassh/osc/osc5522.uya - OSC 5522 剪贴板协议（终端侧）
+// 说明：本模块扮演"终端"角色：应答远端应用的 OSC 5522 请求，并支持主动推送粘贴事件
+//       （Private Mode 5522）。依据 kitty 的 clipboard 扩展规范与 rockorager 的
+//       bracketed-paste-mime 补充规范实现。
+//
+// 报文形状（ESC ] 5522 ; metadata [; payload] ESC \）：
+//   请求  type=read[:loc=primary][:pw=<b64>:name=<b64>] ; <b64 MIME 列表|Lg==>
+//   应答  type=read:status=OK|DONE|ENOSYS|EPERM|EBUSY|EINVAL
+//         type=read:status=DATA:mime=<b64 mime> ; <b64 数据>
+//   写入  type=write[:loc=primary] → type=wdata:mime=<b64>;<b64> → 空 type=wdata
+//         type=walias:mime=<b64 目标>;<b64 别名列表>
+//   事件  type=read:status=OK[:loc=primary][:pw=<b64>] / DATA:mime=Lg== ; <b64 列表> / DONE
+//   查询  CSI ? 5522 $ p  →  CSI ? 5522 ; <Ps> $ y
+//   开关  CSI ? 5522 h / l
+
+use osc.b64.b64_encode;
+use osc.b64.b64_decode;
+use osc.b64.b64_encoded_len;
+use osc.b64.b64_decoded_max;
+use osc.scan.osc_encode;
+use osc.scan.csi_encode;
+use util.buf.Buf;
+use util.buf.buf_new;
+use util.buf.buf_free;
+use util.buf.buf_append;
+use util.buf.buf_append_byte;
+use util.buf.buf_reserve;
+use util.buf.cstr_len;
+use util.buf.bytes_eq;
+use util.rand.fill_random;
+
+export error Osc5522BadRequest;
+export error Osc5522TooLarge;
+
+/// 分块大小：规范要求每块编码前不超过 4096 字节。
+export const CHUNK_BYTES: usize = 4096;
+/// MIME 列表探测请求的载荷（base64 的句点）。
+export const DOT_B64: &const byte = "Lg==";
+/// 使用一次性口令时规范建议的应用名（base64 的 "Paste event"）。
+export const PASTE_NAME_B64: &const byte = "UGFzdGUgZXZlbnQ=";
+/// 单一 MIME 字段长度上限。
+const MIME_CAP: usize = 128;
+const PW_CAP: usize = 64;
+
+/// 5522 会话状态。
+/// 字段：paste_mode 表示应用是否启用粘贴事件私有模式；
+///       write_active 表示正在接收一次 write 传输，write_ok 表示该次传输尚未出错，
+///       write_mime 为当前 MIME，alias_* 记录别名（同一份数据的其他 MIME 名）；
+///       paste_pw 为一次性口令文本，paste_pw_active 表示口令是否仍然有效。
+export struct Osc5522State {
+    paste_mode: bool,
+    write_active: bool,
+    write_ok: bool,
+    write_mime: [byte: MIME_CAP],
+    write_alias: [byte: MIME_CAP],
+    write_alias_len: usize,
+    paste_pw: [byte: PW_CAP],
+    paste_pw_active: bool,
+    /// 供测试断言：最近一次应答的状态文本。
+    last_status: [byte: 24],
+}
+
+/// 创建初始状态。
+/// 参数：无。
+/// 返回值：各模式关闭的状态。
+export fn state_new() Osc5522State {
+    return Osc5522State{
+        paste_mode: false,
+        write_active: false,
+        write_ok: true,
+        write_mime: [0: MIME_CAP],
+        write_alias: [0: MIME_CAP],
+        write_alias_len: 0,
+        paste_pw: [0: PW_CAP],
+        paste_pw_active: false,
+        last_status: [0: 24],
+    };
+}
+
+/// 把 C 字符串复制进定长字段。
+/// 参数：dst/cap 为目标，src 为源。
+/// 返回值：写入长度。
+export fn field_set(dst: &byte, cap: usize, src: &const byte) usize {
+    var i: usize = 0;
+    if src != null {
+        while src[i] != 0 && i + 1 < cap {
+            dst[i] = src[i];
+            i = i + 1;
+        }
+    }
+    dst[i] = 0 as byte;
+    return i;
+}
+
+/// 把一段字节复制进定长字段。
+/// 参数：dst/cap 为目标，src/n 为源。
+/// 返回值：写入长度。
+export fn field_set_bytes(dst: &byte, cap: usize, src: &const byte, n: usize) usize {
+    var i: usize = 0;
+    while i < n && i + 1 < cap {
+        dst[i] = src[i];
+        i = i + 1;
+    }
+    dst[i] = 0 as byte;
+    return i;
+}
+
+/// 在 metadata 中查找 key 的值区间。
+/// 参数：meta/n 为元数据，key 为键名；out_off/out_len 为值区间。
+/// 返回值：找到返回 true（值可以为空）。
+export fn meta_lookup(meta: &const byte, n: usize, key: &const byte,
+    out_off: &usize, out_len: &usize) bool {
+    const klen: usize = cstr_len(key);
+    if klen == 0 || n < klen + 1 {
+        return false;
+    }
+    var i: usize = 0;
+    while i + klen + 1 <= n {
+        const at_start: bool = i == 0 || meta[i - 1] == 58 as byte;
+        if at_start && bytes_eq(meta + i, klen, key, klen) && meta[i + klen] == 61 as byte {
+            var end: usize = i + klen + 1;
+            while end < n && meta[end] != 58 as byte {
+                end = end + 1;
+            }
+            out_off[0] = i + klen + 1;
+            out_len[0] = end - (i + klen + 1);
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// 判断 metadata 中 key 的值是否等于 expected。
+/// 参数：meta/n 为元数据，key 为键名，expected 为期望值（C 字符串）。
+/// 返回值：相等返回 true。
+export fn meta_value_is(meta: &const byte, n: usize, key: &const byte, expected: &const byte) bool {
+    var off: usize = 0;
+    var len: usize = 0;
+    if !meta_lookup(meta, n, key, &off, &len) {
+        return false;
+    }
+    return bytes_eq(meta + off, len, expected, cstr_len(expected));
+}
+
+/// 返回 metadata 中 type 键的值区间。
+/// 参数：meta/n 为元数据，off/len 为输出。
+/// 返回值：存在返回 true。
+export fn meta_type_range(meta: &const byte, n: usize, off: &usize, len: &usize) bool {
+    return meta_lookup(meta, n, "type" as &const byte, off, len);
+}
+
+/// 判断 type 值是否等于给定名字。
+/// 参数：meta/n 为元数据，name 为类型名。
+/// 返回值：相等返回 true。
+export fn meta_type_is(meta: &const byte, n: usize, name: &const byte) bool {
+    var off: usize = 0;
+    var len: usize = 0;
+    if !meta_lookup(meta, n, "type" as &const byte, &off, &len) {
+        return false;
+    }
+    const nlen: usize = cstr_len(name);
+    if len != nlen {
+        return false;
+    }
+    var i: usize = 0;
+    while i < len {
+        if meta[off + i] != name[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// 取出 type 值中冒号后的动作名（如 "read" 或 "wdata"）。
+/// 参数：meta/n 为元数据，out/cap 为输出。
+/// 返回值：成功返回 true。
+export fn meta_type_action(meta: &const byte, n: usize, out: &byte, cap: usize) bool {
+    var off: usize = 0;
+    var len: usize = 0;
+    if !meta_lookup(meta, n, "type" as &const byte, &off, &len) {
+        return false;
+    }
+    var end: usize = 0;
+    while end < len && meta[off + end] != 58 as byte {
+        end = end + 1;
+    }
+    _ = field_set_bytes(out, cap, meta + off, end);
+    return true;
+}
+
+/// 生成一个新的单次口令（base64 文本）。
+/// 参数：out/cap 为目标缓冲。
+/// 返回值：写入的字符数；失败返回 0。
+export fn make_paste_password(out: &byte, cap: usize) usize {
+    var raw: [byte: 16] = [0: 16];
+    const filled: !void = fill_random(&raw[0], 16);
+    _ = filled catch { return 0; };
+    const written: usize = b64_encode(&raw[0], 16, out, cap) catch { 0 as usize; };
+    return written;
+}
+
+/// 构造并输出一个 OSC 5522 报文。
+/// 参数：out 为目标缓冲，meta 为元数据文本，payload/payload_len 为可选载荷（可为 null）。
+/// 返回值：无；失败时返回错误。
+export fn emit_packet(out: &Buf, meta: &const byte, payload: &const byte, payload_len: usize) !void {
+    try buf_append_byte(out, 27 as byte);
+    try buf_append_byte(out, 93 as byte);
+    try append_text(out, "5522;" as &const byte);
+    try append_text(out, meta);
+    if payload != null {
+        try buf_append_byte(out, 59 as byte);
+        try buf_append(out, payload, payload_len);
+    }
+    try buf_append_byte(out, 27 as byte);
+    try buf_append_byte(out, 92 as byte);
+}
+
+/// 追加一段 C 字符串。
+/// 参数：out 为目标，text 为源。
+/// 返回值：无；失败时返回错误。
+export fn append_text(out: &Buf, text: &const byte) !void {
+    if text == null {
+        return;
+    }
+    try buf_append(out, text, cstr_len(text));
+}
+
+/// 追加一段字节。
+/// 参数：out 为目标，data/n 为源。
+/// 返回值：无；失败时返回错误。
+export fn append_bytes(out: &Buf, data: &const byte, n: usize) !void {
+    if data == null || n == 0 {
+        return;
+    }
+    try buf_append(out, data, n);
+}
+
+/// 追加 base64 编码后的文本。
+/// 参数：out 为目标，data/n 为源。
+/// 返回值：无；失败时返回错误。
+export fn append_b64(out: &Buf, data: &const byte, n: usize) !void {
+    const need: usize = b64_encoded_len(n);
+    try buf_reserve(out, out.len + need);
+    const written: usize = try b64_encode(data, n, out.data + out.len, out.cap - out.len);
+    out.len = out.len + written;
+}
+
+/// 开始一个报文：写入 "ESC ] 5522;" 前缀。
+/// 参数：out 为目标缓冲。
+/// 返回值：无；失败时返回错误。
+fn packet_begin(out: &Buf) !void {
+    try buf_append_byte(out, 27 as byte);
+    try buf_append_byte(out, 93 as byte);
+    try append_text(out, "5522;" as &const byte);
+}
+
+/// 结束一个报文：写入 ESC 反斜杠。
+/// 参数：out 为目标缓冲。
+/// 返回值：无；失败时返回错误。
+fn packet_end(out: &Buf) !void {
+    try buf_append_byte(out, 27 as byte);
+    try buf_append_byte(out, 92 as byte);
+}
+
+/// 应答一个 read 请求的状态。
+/// 参数：out 为目标，status 为状态文本，id_off/id_len 为可选 id 字段，loc_primary 是否需要 loc。
+/// 返回值：无；失败时返回错误。
+export fn emit_read_status(out: &Buf, status: &const byte, id_off: &const byte, id_len: usize,
+    loc_primary: bool) !void {
+    try packet_begin(out);
+    try append_text(out, "type=read:status=" as &const byte);
+    try append_text(out, status);
+    if id_len > 0 {
+        try append_text(out, ":id=" as &const byte);
+        try append_bytes(out, id_off, id_len);
+    }
+    if loc_primary {
+        try append_text(out, ":loc=primary" as &const byte);
+    }
+    try packet_end(out);
+}
+
+/// 应答 status=DATA 报文。
+/// 参数：out 为目标，mime_b64/mime_len 为 base64 后的 MIME，data/n 为 base64 数据，
+///       id_off/id_len 为可选 id。
+/// 返回值：无；失败时返回错误。
+export fn emit_read_data(out: &Buf, mime_b64: &const byte, mime_len: usize,
+    data: &const byte, n: usize, id_off: &const byte, id_len: usize) !void {
+    try packet_begin(out);
+    try append_text(out, "type=read:status=DATA:mime=" as &const byte);
+    try append_bytes(out, mime_b64, mime_len);
+    if id_len > 0 {
+        try append_text(out, ":id=" as &const byte);
+        try append_bytes(out, id_off, id_len);
+    }
+    try buf_append_byte(out, 59 as byte);
+    try append_bytes(out, data, n);
+    try packet_end(out);
+}
+
+/// 应答 write 请求的状态。
+/// 参数：out 为目标，status 为状态文本。
+/// 返回值：无；失败时返回错误。
+export fn emit_write_status(out: &Buf, status: &const byte) !void {
+    try packet_begin(out);
+    try append_text(out, "type=write:status=" as &const byte);
+    try append_text(out, status);
+    try packet_end(out);
+}
+
+/// 记录最近一次应答状态（便于测试与诊断）。
+/// 参数：state 为会话状态，status 为状态文本。
+/// 返回值：无。
+fn note_status(state: &Osc5522State, status: &const byte) void {
+    _ = field_set(&state.last_status[0], 24, status);
+}
+
+/// 应答 DECRQM 查询（CSI ? 5522 $ p）。
+/// 参数：out 为目标，state 为当前状态。
+/// 返回值：无；失败时返回错误。
+export fn emit_decrpm(out: &Buf, state: &Osc5522State) !void {
+    var body: [byte: 16] = [0: 16];
+    body[0] = 63 as byte;
+    body[1] = 53 as byte;
+    body[2] = 53 as byte;
+    body[3] = 50 as byte;
+    body[4] = 50 as byte;
+    body[5] = 59 as byte;
+    // 1 = 已设置，2 = 已重置（两种都是"支持"）。
+    if state.paste_mode {
+        body[6] = 49 as byte;
+    } else {
+        body[6] = 50 as byte;
+    }
+    body[7] = 36 as byte;
+    try csi_encode(out, &body[0], 8, 121 as byte);
+}
+
+/// 判断 CSI 参数是否为 5522 私有模式的 DECRQM 查询。
+/// 参数：params/n 为 CSI 的参数与中间字节（不含最终字节）。
+/// 返回值：是查询返回 true。
+export fn csi_is_decrqm_5522(params: &const byte, n: usize) bool {
+    // 期待 "?5522$" 形式。
+    if n < 6 {
+        return false;
+    }
+    if params[0] != 63 as byte {
+        return false;
+    }
+    if params[1] != 53 as byte || params[2] != 53 as byte || params[3] != 50 as byte || params[4] != 50 as byte {
+        return false;
+    }
+    return params[5] == 36 as byte || params[5] == 63 as byte;
+}
+
+/// 判断 CSI 是否为 5522 私有模式的 DECSET/DECRST。
+/// 参数：params/n 为 CSI 参数，enable 为输出（true 表示 h）。
+/// 返回值：是模式切换返回 true。
+export fn csi_is_mode_5522(params: &const byte, n: usize, enable: &bool) bool {
+    if n < 5 {
+        return false;
+    }
+    if params[0] != 63 as byte {
+        return false;
+    }
+    if params[1] != 53 as byte || params[2] != 53 as byte || params[3] != 50 as byte || params[4] != 50 as byte {
+        return false;
+    }
+    return true;
+}

@@ -1,0 +1,646 @@
+// src/uyassh/osc/handler.uya - OSC 处理器（把子进程的协议请求接到本地仓库）
+// 说明：输入是扫描器判定出的 OSC/CSI 负载，输出是写回子进程 tty 的应答字节。
+//       两种模式：
+//         serve —— 本地终端不支持 5522，我们自己扮演终端（默认）；
+//         proxy —— 本地终端支持 5522，把请求原样转给真实终端（M4）。
+
+use clip.store.ClipStore;
+use clip.store.clip_get_current;
+use clip.store.clip_put;
+use osc.b64.b64_encode;
+use osc.b64.b64_decode;
+use osc.b64.b64_encoded_len;
+use osc.b64.b64_decoded_max;
+use osc.osc5522.Osc5522State;
+use osc.osc5522.state_new;
+use osc.osc5522.CHUNK_BYTES;
+use osc.osc5522.DOT_B64;
+use osc.osc5522.PASTE_NAME_B64;
+use osc.osc5522.append_b64;
+use osc.osc5522.append_bytes;
+use osc.osc5522.append_text;
+use osc.osc5522.emit_decrpm;
+use osc.osc5522.emit_packet;
+use osc.osc5522.emit_read_data;
+use osc.osc5522.emit_read_status;
+use osc.osc5522.emit_write_status;
+use osc.osc5522.field_set;
+use osc.osc5522.field_set_bytes;
+use osc.osc5522.make_paste_password;
+use osc.osc5522.meta_lookup;
+use osc.osc5522.meta_type_action;
+use osc.osc5522.meta_type_is;
+use osc.osc5522.meta_value_is;
+use osc.osc5522.csi_is_decrqm_5522;
+use osc.osc5522.csi_is_mode_5522;
+use util.buf.Buf;
+use util.buf.buf_new;
+use util.buf.buf_free;
+use util.buf.buf_clear;
+use util.buf.buf_append;
+use util.buf.buf_append_byte;
+use util.buf.buf_reserve;
+use util.buf.cstr_len;
+use util.buf.cstr_eq;
+use util.buf.bytes_eq;
+
+/// 单次读取的数据上限（8 MiB）。
+const DATA_CAP: usize = 8 * 1024 * 1024;
+/// 已注册的 MIME 别名数量上限。
+const ALIAS_CAP: usize = 8;
+
+/// 本地终端对 5522 的支持情况。
+export enum ClipMode {
+    /// 自己扮演终端（本地终端不支持 5522）。
+    serve,
+    /// 转发给真实终端（本地终端支持 5522）。
+    proxy,
+}
+
+/// 处理器状态。
+/// 字段：mode 为工作模式，state 为 5522 协议状态，store 指向仓库（null 表示不可用），
+///       alias_* 记录 walias 声明的别名，local_supported 表示本地终端是否支持 5522，
+///       pending_pw 为待消费的一次性口令。
+export struct OscHandler {
+    mode: ClipMode,
+    state: Osc5522State,
+    store: &ClipStore,
+    alias_mime: [byte: 128],
+    alias_list: [byte: 256],
+    alias_count: usize,
+    local_supported: bool,
+    pending_pw: [byte: 64],
+    pending_pw_active: bool,
+    /// 统计：已处理的 read/write 次数，便于诊断。
+    read_count: u32,
+    write_count: u32,
+    /// write 过程中累积的原始数据。
+    pending: Buf,
+}
+
+/// 创建处理器。
+/// 参数：mode 为模式，store 为仓库指针（可为 null）。
+/// 返回值：处理器实例。
+export fn handler_new(mode: ClipMode, store: &ClipStore) OscHandler {
+    return OscHandler{
+        mode: mode,
+        state: state_new(),
+        store: store,
+        alias_mime: [0: 128],
+        alias_list: [0: 256],
+        alias_count: 0,
+        local_supported: mode == ClipMode.proxy,
+        pending_pw: [0: 64],
+        pending_pw_active: false,
+        read_count: 0,
+        write_count: 0,
+        pending: buf_new(),
+    };
+}
+
+/// 释放处理器持有的内存。
+/// 参数：h 为处理器。
+/// 返回值：无。
+export fn handler_free(h: &OscHandler) void {
+    buf_free(&h.pending);
+}
+
+/// 处理一个 OSC 负载（编号已在 payload 开头）。
+/// 参数：h 为处理器，payload/n 为 OSC 负载，out 为应答缓冲（null 表示不产生应答）。
+/// 返回值：true 表示已被本层消费。
+export fn handler_osc(h: &OscHandler, payload: &const byte, n: usize, out: &Buf) bool {
+    var number: u32 = 0;
+    var off: usize = 0;
+    if !parse_leading_number(payload, n, &number, &off) {
+        return false;
+    }
+    if number != 5522u32 {
+        return false;
+    }
+    // payload[off] 应为 ';'，之后是元数据 [; 载荷]。
+    if off >= n || payload[off] != 59 as byte {
+        return false;
+    }
+    var meta_start: usize = off + 1;
+    var meta_end: usize = n;
+    var semi: usize = n;
+    var i: usize = meta_start;
+    while i < n {
+        if payload[i] == 59 as byte {
+            semi = i;
+            meta_end = i;
+            break;
+        }
+        i = i + 1;
+    }
+    _ = semi;
+    const meta: &const byte = payload + meta_start;
+    const meta_len: usize = meta_end - meta_start;
+    var has_payload: bool = false;
+    var payload_start: usize = 0;
+    if meta_end < n {
+        has_payload = true;
+        payload_start = meta_end + 1;
+    }
+    return dispatch(h, meta, meta_len, has_payload, payload + payload_start, n - payload_start, out);
+}
+
+/// 解析前导十进制数字。
+/// 参数：data/n 为输入，number/off 为输出。
+/// 返回值：成功返回 true。
+fn parse_leading_number(data: &const byte, n: usize, number: &u32, off: &usize) bool {
+    var v: u32 = 0;
+    var i: usize = 0;
+    while i < n {
+        const c: byte = data[i];
+        if c < 48 as byte || c > 57 as byte {
+            break;
+        }
+        v = v * 10u32 + ((c - 48 as byte) as u32);
+        i = i + 1;
+    }
+    if i == 0 {
+        return false;
+    }
+    number[0] = v;
+    off[0] = i;
+    return true;
+}
+
+/// 按 type 分派处理。
+/// 参数：h 为处理器，meta/meta_len 为元数据，has_payload/payload/payload_len 为载荷，
+///       out 为应答缓冲。
+/// 返回值：true 表示已消费。
+fn dispatch(h: &OscHandler, meta: &const byte, meta_len: usize,
+    has_payload: bool, payload: &const byte, payload_len: usize, out: &Buf) bool {
+    var action: [byte: 24] = [0: 24];
+    if !meta_type_action(meta, meta_len, &action[0], 24) {
+        return false;
+    }
+    if cstr_eq(&action[0], "read") {
+        return handle_read(h, meta, meta_len, has_payload, payload, payload_len, out);
+    }
+    if cstr_eq(&action[0], "write") {
+        return handle_write_start(h, meta, meta_len, out);
+    }
+    if cstr_eq(&action[0], "wdata") {
+        return handle_wdata(h, meta, meta_len, has_payload, payload, payload_len, out);
+    }
+    if cstr_eq(&action[0], "walias") {
+        return handle_walias(h, meta, meta_len, has_payload, payload, payload_len, out);
+    }
+    // 不认识的类型：消费掉并回 EINVAL，避免被误当成终端写操作。
+    if out != null {
+        const noted: !void = emit_write_status(out, "EINVAL" as &const byte);
+        _ = noted catch { };
+    }
+    return true;
+}
+
+/// 处理 read 请求。
+/// 参数：h 为处理器，meta/meta_len 为元数据，has_payload/payload/payload_len 为请求载荷（base64 的 MIME 列表），
+///       out 为应答缓冲。
+/// 返回值：true。
+fn handle_read(h: &OscHandler, meta: &const byte, meta_len: usize,
+    has_payload: bool, payload: &const byte, payload_len: usize, out: &Buf) bool {
+    h.read_count = h.read_count + 1u32;
+    if out == null {
+        return true;
+    }
+    const primary: bool = meta_value_is(meta, meta_len, "loc" as &const byte, "primary" as &const byte);
+    // 一次性口令校验：带 pw 时必须是本次粘贴事件的口令，否则按无口令处理（回退到普通策略）。
+    var pw_ok: bool = false;
+    var pw_off: usize = 0;
+    var pw_len: usize = 0;
+    if meta_lookup(meta, meta_len, "pw" as &const byte, &pw_off, &pw_len) && pw_len > 0 {
+        if h.pending_pw_active && bytes_eq(meta + pw_off, pw_len, &h.pending_pw[0], cstr_len(&h.pending_pw[0])) {
+            pw_ok = true;
+        }
+    }
+    if primary && h.store == null {
+        const r: !void = emit_read_status(out, "ENOSYS" as &const byte, null, 0, false);
+        _ = r catch { };
+        return true;
+    }
+    if h.store == null {
+        const r2: !void = emit_read_status(out, "EPERM" as &const byte, null, 0, false);
+        _ = r2 catch { };
+        return true;
+    }
+    // 列出可用 MIME：请求载荷为 Lg==（句点）。
+    if has_payload && payload_len == cstr_len(DOT_B64) && bytes_eq(payload, payload_len, DOT_B64, cstr_len(DOT_B64)) {
+        send_mime_list(h, out, primary, pw_ok);
+        return true;
+    }
+    // 读取实际数据：校验请求的 MIME 与当前项是否匹配。
+    if !has_payload || payload_len == 0 {
+        const r3: !void = emit_read_status(out, "EINVAL" as &const byte, null, 0, false);
+        _ = r3 catch { };
+        return true;
+    }
+    send_current_data(h, out, payload, payload_len, primary, pw_ok);
+    return true;
+}
+
+/// 发送可用 MIME 列表（DATA:mime=Lg==）。
+/// 参数：h 为处理器，out 为应答缓冲，primary 为是否主选区，pw_ok 为口令是否有效。
+/// 返回值：无。
+fn send_mime_list(h: &OscHandler, out: &Buf, primary: bool, pw_ok: bool) void {
+    const opened: !void = emit_read_status(out, "OK" as &const byte, null, 0, primary);
+    _ = opened catch { return; };
+    var list: Buf = buf_new();
+    defer { buf_free(&list); }
+    const built: !void = build_mime_list(h, &list, pw_ok);
+    _ = built catch { return; };
+    const sent: !void = emit_read_data(out, DOT_B64, cstr_len(DOT_B64), list.data, list.len, null, 0);
+    _ = sent catch { return; };
+    const done: !void = emit_read_status(out, "DONE" as &const byte, null, 0, false);
+    _ = done catch { return; };
+}
+
+/// 组装可用 MIME 列表（空格分隔）。
+/// 参数：h 为处理器，list 为输出缓冲，pw_ok 为口令是否有效。
+/// 返回值：无；失败时返回错误。
+fn build_mime_list(h: &OscHandler, list: &Buf, pw_ok: bool) !void {
+    _ = pw_ok;
+    var mime: [byte: 128] = [0: 128];
+    var have: bool = false;
+    if h.store != null {
+        var probe: Buf = buf_new();
+        defer { buf_free(&probe); }
+        const reserved: !void = buf_reserve(&probe, 65536);
+        _ = reserved catch { };
+        if probe.cap > 0 {
+            const got: usize = clip_get_current(h.store, probe.data, probe.cap, &mime[0], 128) catch { 0 as usize; };
+            have = got > 0;
+        }
+    }
+    if have && mime[0] != 0 {
+        try append_text(list, &mime[0]);
+        // 同一数据同时以别名形式提供。
+        var i: usize = 0;
+        while i < h.alias_count {
+            if !bytes_eq(&mime[0], cstr_len(&mime[0]), &h.alias_mime[0], cstr_len(&h.alias_mime[0])) {
+                try buf_append_byte(list, 32 as byte);
+                const alias_ptr: &const byte = &h.alias_list[0];
+                try append_text(list, alias_ptr);
+            }
+            i = i + 1;
+        }
+        return;
+    }
+    // 仓库为空时只报文本能力，避免应用误以为有图。
+    try append_text(list, "text/plain" as &const byte);
+}
+
+/// 发送当前剪贴项的数据（按 4096 字节分块）。
+/// 参数：h 为处理器，out 为应答缓冲，request/n 为请求的 MIME 列表（base64），
+///       primary 为是否主选区，pw_ok 为口令是否有效。
+/// 返回值：无。
+fn send_current_data(h: &OscHandler, out: &Buf, request: &const byte, n: usize, primary: bool, pw_ok: bool) void {
+    var decoded: Buf = buf_new();
+    defer { buf_free(&decoded); }
+    const need: usize = b64_decoded_max(n);
+    const reserved: !void = buf_reserve(&decoded, need);
+    _ = reserved catch {
+        const e: !void = emit_read_status(out, "EINVAL" as &const byte, null, 0, false);
+        _ = e catch { };
+        return;
+    };
+    const decoded_len: usize = b64_decode(request, n, decoded.data, decoded.cap) catch {
+        const e: !void = emit_read_status(out, "EINVAL" as &const byte, null, 0, false);
+        _ = e catch { };
+        return;
+    };
+    decoded.len = decoded_len;
+    // 检查请求的 MIME 与当前项是否相容。
+    var mime: [byte: 128] = [0: 128];
+    var data: Buf = buf_new();
+    defer { buf_free(&data); }
+    const data_reserved: !void = buf_reserve(&data, DATA_CAP);
+    _ = data_reserved catch { };
+    if data.cap == 0 {
+        const e2: !void = emit_read_status(out, "EINVAL" as &const byte, null, 0, false);
+        _ = e2 catch { };
+        return;
+    }
+    const got: usize = clip_get_current(h.store, data.data, data.cap, &mime[0], 128) catch {
+        const e3: !void = emit_read_status(out, "ENOSYS" as &const byte, null, 0, false);
+        _ = e3 catch { };
+        return;
+    };
+    if got == 0 {
+        const e4: !void = emit_read_status(out, "ENOSYS" as &const byte, null, 0, false);
+        _ = e4 catch { };
+        return;
+    }
+    if !mime_matches(&mime[0], decoded.data, decoded.len, h) {
+        const e5: !void = emit_read_status(out, "ENOSYS" as &const byte, null, 0, false);
+        _ = e5 catch { };
+        return;
+    }
+    _ = pw_ok;
+    var mime_b64: [byte: 256] = [0: 256];
+    const mime_b64_len: usize = b64_encode(&mime[0], cstr_len(&mime[0]), &mime_b64[0], 256) catch { 0 as usize; };
+    if mime_b64_len == 0 {
+        const e6: !void = emit_read_status(out, "EINVAL" as &const byte, null, 0, false);
+        _ = e6 catch { };
+        return;
+    }
+    const opened: !void = emit_read_status(out, "OK" as &const byte, null, 0, primary);
+    _ = opened catch { return; };
+    const chunks: usize = (got + CHUNK_BYTES - 1) / CHUNK_BYTES;
+    var c: usize = 0;
+    while c < chunks {
+        const start: usize = c * CHUNK_BYTES;
+        var len: usize = CHUNK_BYTES;
+        if (start + len > got) {
+            len = got - start;
+        }
+        var chunk_b64: Buf = buf_new();
+        defer { buf_free(&chunk_b64); }
+        const enc: !void = append_b64(&chunk_b64, data.data + start, len);
+        _ = enc catch { return; };
+        const sent: !void = emit_read_data(out, &mime_b64[0], mime_b64_len, chunk_b64.data, chunk_b64.len, null, 0);
+        _ = sent catch { return; };
+        c = c + 1;
+    }
+    const done: !void = emit_read_status(out, "DONE" as &const byte, null, 0, false);
+    _ = done catch { return; };
+}
+
+/// 判断请求的 MIME 列表是否与当前项匹配（含别名）。
+/// 参数：mime 为当前项 MIME，request/n 为解码后的请求列表，h 为处理器。
+/// 返回值：匹配返回 true。
+fn mime_matches(mime: &const byte, request: &const byte, n: usize, h: &const OscHandler) bool {
+    if n == 0 {
+        return true;
+    }
+    if list_contains(request, n, mime) {
+        return true;
+    }
+    var i: usize = 0;
+    while i < h.alias_count {
+        const alias_ptr: &const byte = &h.alias_list[0];
+        if list_contains(request, n, alias_ptr) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// 在空格分隔的列表中查找某个词。
+/// 参数：list/n 为列表，word 为待查词。
+/// 返回值：找到返回 true。
+fn list_contains(list: &const byte, n: usize, word: &const byte) bool {
+    const wlen: usize = cstr_len(word);
+    if wlen == 0 {
+        return false;
+    }
+    var i: usize = 0;
+    while i + wlen <= n {
+        const at_start: bool = i == 0 || list[i - 1] == 32 as byte || list[i - 1] == 10 as byte;
+        var at_end: bool = true;
+        if i + wlen < n {
+            const after: byte = list[i + wlen];
+            if after != 32 as byte && after != 10 as byte && after != 9 as byte {
+                at_end = false;
+            }
+        }
+        if at_start && at_end && bytes_eq(list + i, wlen, word, wlen) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// 处理 write 起始包。
+/// 参数：h 为处理器，meta/meta_len 为元数据，out 为应答缓冲。
+/// 返回值：true。
+fn handle_write_start(h: &OscHandler, meta: &const byte, meta_len: usize, out: &Buf) bool {
+    h.write_count = h.write_count + 1u32;
+    h.state.write_active = true;
+    h.state.write_ok = true;
+    h.alias_count = 0;
+    h.state.write_mime[0] = 0 as byte;
+    buf_clear(&h.pending);
+    if meta_value_is(meta, meta_len, "loc" as &const byte, "primary" as &const byte) && h.store == null {
+        h.state.write_ok = false;
+        if out != null {
+            const r: !void = emit_write_status(out, "ENOSYS" as &const byte);
+            _ = r catch { };
+        }
+    }
+    return true;
+}
+
+/// 处理 wdata 数据包（累积 base64 数据；空包表示结束）。
+/// 参数：h 为处理器，meta/meta_len 为元数据，has_payload/payload/payload_len 为数据，
+///       out 为应答缓冲。
+/// 返回值：true。
+fn handle_wdata(h: &OscHandler, meta: &const byte, meta_len: usize,
+    has_payload: bool, payload: &const byte, payload_len: usize, out: &Buf) bool {
+    if !has_payload && meta_len <= cstr_len("type=wdata" as &const byte) {
+        // 结束包：把累积的数据落盘。
+        finish_write(h, out);
+        return true;
+    }
+    if !h.state.write_active {
+        // 没有起始包：按规范忽略。
+        return true;
+    }
+    var mime_off: usize = 0;
+    var mime_len: usize = 0;
+    if meta_lookup(meta, meta_len, "mime" as &const byte, &mime_off, &mime_len) && mime_len > 0 {
+        var decoded_mime: [byte: 128] = [0: 128];
+        const dm: usize = b64_decode(meta + mime_off, mime_len, &decoded_mime[0], 128) catch {
+            h.state.write_ok = false;
+            if out != null {
+                const r: !void = emit_write_status(out, "EINVAL" as &const byte);
+                _ = r catch { };
+            }
+            return true;
+        };
+        _ = field_set_bytes(&h.state.write_mime[0], 128, &decoded_mime[0], dm);
+    }
+    if !has_payload || payload_len == 0 {
+        return true;
+    }
+    if !h.state.write_ok {
+        return true;
+    }
+    var chunk: Buf = buf_new();
+    defer { buf_free(&chunk); }
+    const need: usize = b64_decoded_max(payload_len);
+    const reserved: !void = buf_reserve(&chunk, need);
+    _ = reserved catch {
+        h.state.write_ok = false;
+        return true;
+    };
+    const got: usize = b64_decode(payload, payload_len, chunk.data, chunk.cap) catch {
+        h.state.write_ok = false;
+        if out != null {
+            const r2: !void = emit_write_status(out, "EINVAL" as &const byte);
+            _ = r2 catch { };
+        }
+        return true;
+    };
+    chunk.len = got;
+    append_pending(h, chunk.data, got);
+    return true;
+}
+
+/// 把一段数据追加到 write 累积缓冲。
+/// 参数：h 为处理器，data/n 为数据。
+/// 返回值：无；超限时把本次 write 标记为失败（EFBIG）。
+fn append_pending(h: &OscHandler, data: &const byte, n: usize) void {
+    if h.pending.len + n > DATA_CAP {
+        h.state.write_ok = false;
+        return;
+    }
+    const appended: !void = buf_append(&h.pending, data, n);
+    _ = appended catch { h.state.write_ok = false; };
+}
+
+/// 结束一次 write：把数据写入仓库并回应状态。
+/// 参数：h 为处理器，out 为应答缓冲。
+/// 返回值：无。
+fn finish_write(h: &OscHandler, out: &Buf) void {
+    h.state.write_active = false;
+    if h.store != null && h.state.write_ok && h.pending.len > 0 {
+        var name: [byte: 128] = [0: 128];
+        _ = field_set(&name[0], 128, &h.state.write_mime[0]);
+        const stored: !u32 = clip_put(h.store, h.pending.data, h.pending.len, &name[0]);
+        const id: u32 = stored catch {
+            h.state.write_ok = false;
+            0 as u32;
+        };
+        _ = id;
+    }
+    buf_clear(&h.pending);
+    if out == null {
+        return;
+    }
+    if !h.state.write_ok {
+        const r: !void = emit_write_status(out, "EINVAL" as &const byte);
+        _ = r catch { };
+        return;
+    }
+    const done: !void = emit_write_status(out, "DONE" as &const byte);
+    _ = done catch { };
+}
+
+/// 处理 walias：登记别名。
+/// 参数：h 为处理器，meta/meta_len 为元数据，has_payload/payload/payload_len 为别名列表（base64），
+///       out 为应答缓冲。
+/// 返回值：true。
+fn handle_walias(h: &OscHandler, meta: &const byte, meta_len: usize,
+    has_payload: bool, payload: &const byte, payload_len: usize, out: &Buf) bool {
+    _ = out;
+    if !has_payload || payload_len == 0 {
+        return true;
+    }
+    var mime_off: usize = 0;
+    var mime_len: usize = 0;
+    if meta_lookup(meta, meta_len, "mime" as &const byte, &mime_off, &mime_len) && mime_len > 0 {
+        var decoded_mime: [byte: 128] = [0: 128];
+        const dm: usize = b64_decode(meta + mime_off, mime_len, &decoded_mime[0], 128) catch { 0 as usize; };
+        _ = field_set_bytes(&h.alias_mime[0], 128, &decoded_mime[0], dm);
+    }
+    var aliases: Buf = buf_new();
+    defer { buf_free(&aliases); }
+    const need: usize = b64_decoded_max(payload_len);
+    const reserved: !void = buf_reserve(&aliases, need);
+    _ = reserved catch { return true; };
+    const got: usize = b64_decode(payload, payload_len, aliases.data, aliases.cap) catch { return true; };
+    aliases.len = got;
+    _ = field_set_bytes(&h.alias_list[0], 256, aliases.data, aliases.len);
+    h.alias_count = 1;
+    return true;
+}
+
+/// 处理 CSI 序列（DECRQM 查询与私有模式开关）。
+/// 参数：h 为处理器，params/n 为 CSI 参数（不含最终字节），final_byte 为最终字节，
+///       out 为应答缓冲。
+/// 返回值：true 表示已消费。
+export fn handler_csi(h: &OscHandler, params: &const byte, n: usize, final_byte: byte, out: &Buf) bool {
+    if final_byte == 112 as byte && csi_is_decrqm_5522(params, n) {
+        if out != null {
+            const r: !void = emit_decrpm(out, &h.state);
+            _ = r catch { };
+        }
+        return true;
+    }
+    var enable: bool = false;
+    if (final_byte == 104 as byte || final_byte == 108 as byte) && csi_is_mode_5522(params, n, &enable) {
+        if final_byte == 104 as byte {
+            h.state.paste_mode = true;
+        } else {
+            h.state.paste_mode = false;
+        }
+        return true;
+    }
+    return false;
+}
+
+/// 生成一次性口令并记录，供随后的 read 使用。
+/// 参数：h 为处理器。
+/// 返回值：口令文本（指向内部存储）。
+export fn handler_issue_paste_password(h: &OscHandler) &const byte {
+    const written: usize = make_paste_password(&h.pending_pw[0], 64);
+    if written == 0 {
+        h.pending_pw[0] = 0 as byte;
+        h.pending_pw_active = false;
+        return null;
+    }
+    h.pending_pw_active = true;
+    return &h.pending_pw[0];
+}
+
+/// 消费一次性口令（使用后失效）。
+/// 参数：h 为处理器。
+/// 返回值：无。
+export fn handler_consume_paste_password(h: &OscHandler) void {
+    h.pending_pw_active = false;
+}
+
+/// 发送一次粘贴事件（Private Mode 5522 的未请求通知）。
+/// 参数：h 为处理器，out 为目标缓冲，has_content 表示仓库里是否有内容。
+/// 返回值：无；失败时返回错误。
+export fn handler_emit_paste_event(h: &OscHandler, out: &Buf, has_content: bool) !void {
+    var pw: &const byte = null;
+    if has_content {
+        pw = handler_issue_paste_password(h);
+    }
+    // MIME 列表先备好（生成期间不触碰 out）。
+    var list: Buf = buf_new();
+    defer { buf_free(&list); }
+    if has_content {
+        try build_mime_list(h, &list, true);
+    } else {
+        try append_text(&list, "text/plain" as &const byte);
+    }
+    // 1) OK 包
+    try emit_paste_ok(out, pw);
+    // 2) DATA 包（mime=Lg==，载荷是 MIME 列表）
+    try emit_read_data(out, DOT_B64, cstr_len(DOT_B64), list.data, list.len, null, 0);
+    // 3) DONE 包
+    try emit_read_status(out, "DONE" as &const byte, null, 0, false);
+}
+
+/// 输出粘贴事件的首包（OK，可带一次性口令）。
+/// 参数：out 为目标缓冲，pw 为可选口令文本。
+/// 返回值：无；失败时返回错误。
+fn emit_paste_ok(out: &Buf, pw: &const byte) !void {
+    try buf_append_byte(out, 27 as byte);
+    try buf_append_byte(out, 93 as byte);
+    try append_text(out, "5522;type=read:status=OK" as &const byte);
+    if pw != null {
+        try append_text(out, ":pw=" as &const byte);
+        try append_text(out, pw);
+    }
+    try buf_append_byte(out, 27 as byte);
+    try buf_append_byte(out, 92 as byte);
+}

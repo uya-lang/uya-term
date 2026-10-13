@@ -10,14 +10,22 @@ use pty.spawn.PtySession;
 use pty.spawn.SpawnSpec;
 use pty.spawn.pty_open;
 use pty.spawn.pty_spawn;
-use sess.loop.LoopConfig;
-use sess.loop.LoopResult;
-use sess.loop.loop_run;
+use sess.session.SessionConfig;
+use sess.session.SessionResult;
+use sess.session.session_config;
+use sess.session.session_run;
 use term.termios.Termios;
 use term.termios.term_enter_raw;
 use term.termios.term_restore;
 use term.termios.term_is_tty;
 use util.out.err_str;
+use util.buf.cstr_eq;
+use std.env.get;
+use clip.store.ClipStore;
+use clip.store.clip_store_open;
+use clip.store.clip_store_close;
+use util.buf.cstr_eq;
+use std.env.get;
 
 export error WrapperSpawnFailed;
 export error WrapperFailed;
@@ -35,6 +43,8 @@ export struct WrapperState {
     verbose: bool,
     /// 最近一次收到的本地窗口尺寸变化标记。
     resized: bool,
+    /// 本地终端是否原生支持 OSC 5522（决定 serve/proxy）。
+    local_supports_5522: bool,
 }
 
 /// 运行包装会话。
@@ -52,6 +62,7 @@ export fn wrapper_run(opts: &Options) i32 {
         local_fd: 0,
         verbose: opts.verbose,
         resized: false,
+        local_supports_5522: cli_local_supports_5522(),
     };
     if !wrapper_build_argv(opts, &state) {
         err_str("uya-ssh: 参数过多\n");
@@ -99,8 +110,16 @@ fn wrapper_run_pty(opts: &Options, state: &WrapperState) i32 {
     };
     // master 交还给外部持有的 fd 变量（spawn 只填写 pid）。
     session.master_fd = master;
-    const cfg: LoopConfig = LoopConfig{ local_fd: state.local_fd, watch_resize: true, dump_child: false };
-    const result: LoopResult = loop_run(&session, &cfg);
+    var store: ClipStore = ClipStore{};
+    var store_ready: bool = true;
+    const clip_opened: !void = clip_store_open(&store, null);
+    _ = clip_opened catch { store_ready = false; };
+    const cfg: SessionConfig = session_config(state.local_fd, opts.prefix_byte,
+        state.local_supports_5522, &store, opts.verbose);
+    const result: SessionResult = session_run(&session, &cfg);
+    if store_ready {
+        clip_store_close(&store);
+    }
     if result.exited {
         return result.exit_code;
     }
@@ -131,6 +150,29 @@ fn wrapper_build_argv(opts: &Options, state: &WrapperState) bool {
     }
     state.argv[opts.arg_count + 1] = null;
     return true;
+}
+
+/// 判断本地终端是否原生支持 OSC 5522（依据环境变量）。
+/// 参数：无。
+/// 返回值：支持返回 true（此时改为代理模式）。
+fn cli_local_supports_5522() bool {
+    if get("KITTY_WINDOW_ID" as &const byte) != null {
+        return true;
+    }
+    if get("GHOSTTY_RESOURCES_DIR" as &const byte) != null {
+        return true;
+    }
+    if get("WEZTERM_PANE" as &const byte) != null {
+        return true;
+    }
+    const prog: &const byte = get("TERM_PROGRAM" as &const byte);
+    if prog != null {
+        if cstr_eq(prog, "kitty" as &const byte) || cstr_eq(prog, "ghostty" as &const byte) ||
+            cstr_eq(prog, "WezTerm" as &const byte) {
+            return true;
+        }
+    }
+    return false;
 }
 
 /// 恢复本地终端属性。

@@ -1,0 +1,109 @@
+// tests/unit/test_b64.uya - 严格 Base64 编解码单元测试
+// 说明：向量取自 RFC 4648 §10，并覆盖规范要求的严格校验行为。
+
+use std.testing.assert_eq_i64;
+use std.testing.expect;
+
+use osc.b64.b64_encode;
+use osc.b64.b64_decode;
+use osc.b64.b64_encoded_len;
+use util.buf.cstr_len;
+use util.buf.bytes_eq;
+
+/// 编码 C 字符串并比较结果。
+/// 参数：input 为输入文本，expected 为期望的 Base64 文本。
+/// 返回值：无（断言失败会抛出）。
+fn expect_encode(input: &const byte, expected: &const byte) !void {
+    var out: [byte: 128] = [0: 128];
+    const n: usize = cstr_len(input);
+    const written: usize = b64_encode(input, n, &out[0], 128) catch { 0 as usize; };
+    try assert_eq_i64(written as i64, cstr_len(expected) as i64);
+    try expect(bytes_eq(&out[0], written, expected, cstr_len(expected)));
+}
+
+/// 解码文本并比较结果。
+/// 参数：text 为 Base64 文本，expected 为期望的原始字节。
+/// 返回值：无。
+fn expect_decode(text: &const byte, expected: &const byte) !void {
+    var out: [byte: 128] = [0: 128];
+    const n: usize = cstr_len(text);
+    const written: usize = b64_decode(text, n, &out[0], 128) catch { 9999 as usize; };
+    try assert_eq_i64(written as i64, cstr_len(expected) as i64);
+    try expect(bytes_eq(&out[0], written, expected, cstr_len(expected)));
+}
+
+test "RFC 4648 编码向量" {
+    try assert_eq_i64(b64_encoded_len(0) as i64, 0);
+    try assert_eq_i64(b64_encoded_len(1) as i64, 4);
+    try assert_eq_i64(b64_encoded_len(3) as i64, 4);
+    try assert_eq_i64(b64_encoded_len(4) as i64, 8);
+    try expect_encode("" as &const byte, "" as &const byte);
+    try expect_encode("f" as &const byte, "Zg==" as &const byte);
+    try expect_encode("fo" as &const byte, "Zm8=" as &const byte);
+    try expect_encode("foo" as &const byte, "Zm9v" as &const byte);
+    try expect_encode("foob" as &const byte, "Zm9vYg==" as &const byte);
+    try expect_encode("fooba" as &const byte, "Zm9vYmE=" as &const byte);
+    try expect_encode("foobar" as &const byte, "Zm9vYmFy" as &const byte);
+}
+
+test "RFC 4648 解码向量" {
+    try expect_decode("" as &const byte, "" as &const byte);
+    try expect_decode("Zg==" as &const byte, "f" as &const byte);
+    try expect_decode("Zm8=" as &const byte, "fo" as &const byte);
+    try expect_decode("Zm9v" as &const byte, "foo" as &const byte);
+    try expect_decode("Zm9vYg==" as &const byte, "foob" as &const byte);
+    try expect_decode("Zm9vYmE=" as &const byte, "fooba" as &const byte);
+    try expect_decode("Zm9vYmFy" as &const byte, "foobar" as &const byte);
+}
+
+test "5522 规范用到的值：句点与 MIME 列表" {
+    // 句点的 base64 是 Lg==（规范里作为 MIME 列表请求的载荷）。
+    try expect_encode("." as &const byte, "Lg==" as &const byte);
+    try expect_decode("Lg==" as &const byte, "." as &const byte);
+    // "image/png image/jpeg"
+    try expect_encode("image/png image/jpeg" as &const byte, "aW1hZ2UvcG5nIGltYWdlL2pwZWc=" as &const byte);
+    // "Paste event"
+    try expect_encode("Paste event" as &const byte, "UGFzdGUgZXZlbnQ=" as &const byte);
+    try expect_decode("UGFzdGUgZXZlbnQ=" as &const byte, "Paste event" as &const byte);
+}
+
+test "严格校验：拒绝非法输入" {
+    var out: [byte: 64] = [0: 64];
+    // 长度不是 4 的倍数。
+    var bad1: u32 = 0;
+    const d1: !usize = b64_decode("Zm9" as &const byte, 3, &out[0], 64);
+    _ = d1 catch { bad1 = 1; 0 as usize; };
+    try assert_eq_i64(bad1 as i64, 1);
+    // 含空白。
+    var bad2: u32 = 0;
+    const d2: !usize = b64_decode("Zm 9" as &const byte, 4, &out[0], 64);
+    _ = d2 catch { bad2 = 1; 0 as usize; };
+    try assert_eq_i64(bad2 as i64, 1);
+    // 非法字符。
+    var bad3: u32 = 0;
+    const d3: !usize = b64_decode("Zm9*" as &const byte, 4, &out[0], 64);
+    _ = d3 catch { bad3 = 1; 0 as usize; };
+    try assert_eq_i64(bad3 as i64, 1);
+    // 补齐出现在中间。
+    var bad4: u32 = 0;
+    const d4: !usize = b64_decode("Zg==Zg==" as &const byte, 8, &out[0], 64);
+    _ = d4 catch { bad4 = 1; 0 as usize; };
+    try assert_eq_i64(bad4 as i64, 1);
+    // 缺一字节补齐（"Zm9vYg=" 长度合法但内容非法）。
+    var bad5: u32 = 0;
+    const d5: !usize = b64_decode("Zg=g" as &const byte, 4, &out[0], 64);
+    _ = d5 catch { bad5 = 1; 0 as usize; };
+    try assert_eq_i64(bad5 as i64, 1);
+}
+
+test "缓冲不足时返回错误而不是越界写" {
+    var small: [byte: 2] = [0: 2];
+    var failed: u32 = 0;
+    const e: !usize = b64_encode("foobar" as &const byte, 6, &small[0], 2);
+    _ = e catch { failed = 1; 0 as usize; };
+    try assert_eq_i64(failed as i64, 1);
+    var failed2: u32 = 0;
+    const d: !usize = b64_decode("Zm9vYmFy" as &const byte, 8, &small[0], 2);
+    _ = d catch { failed2 = 1; 0 as usize; };
+    try assert_eq_i64(failed2 as i64, 1);
+}

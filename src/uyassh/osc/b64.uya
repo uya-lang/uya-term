@@ -1,0 +1,212 @@
+// src/uyassh/osc/b64.uya - 严格 Base64（RFC 4648 §4）
+// 说明：OSC 5522 规范要求严格校验：只接受标准字母表、必须正确补齐、不允许空白或换行、
+//       拒绝非法字符而不是静默丢弃。std.encoding.base64 偏宽松且只接受切片，故此处自实现。
+
+use util.buf.Buf;
+use util.buf.buf_append_byte;
+use util.buf.buf_reserve;
+
+export error B64Invalid;
+export error B64TooSmall;
+
+const PAD: byte = 61 as byte;
+
+/// 计算编码 n 字节所需的输出长度（含补齐）。
+/// 参数：n 为原始字节数。
+/// 返回值：Base64 文本长度。
+export fn b64_encoded_len(n: usize) usize {
+    return ((n + 2) / 3) * 4;
+}
+
+/// 计算解码 max_len 个 Base64 字符可能得到的最大字节数。
+/// 参数：max_len 为输入字符数。
+/// 返回值：上界字节数。
+export fn b64_decoded_max(max_len: usize) usize {
+    return ((max_len + 3) / 4) * 3;
+}
+
+fn b64_encode_char(v: u32) byte {
+    if v < 26u32 {
+        return (65u32 + v) as byte;
+    }
+    if v < 52u32 {
+        return (97u32 + (v - 26u32)) as byte;
+    }
+    if v < 62u32 {
+        return (48u32 + (v - 52u32)) as byte;
+    }
+    if v == 62u32 {
+        return 43 as byte;
+    }
+    return 47 as byte;
+}
+
+/// 编码一段字节为 Base64 文本（带补齐）。
+/// 参数：src/n 为输入，out/cap 为目标缓冲。
+/// 返回值：写入的字符数；缓冲不足时返回错误。
+export fn b64_encode(src: &const byte, n: usize, out: &byte, cap: usize) !usize {
+    const need: usize = b64_encoded_len(n);
+    if need > cap {
+        return error.B64TooSmall;
+    }
+    if n == 0 {
+        return 0 as usize;
+    }
+    if src == null {
+        return error.B64Invalid;
+    }
+    var i: usize = 0;
+    var o: usize = 0;
+    while i + 3 <= n {
+        const b0: u32 = src[i] as u32;
+        const b1: u32 = src[i + 1] as u32;
+        const b2: u32 = src[i + 2] as u32;
+        const triple: u32 = (b0 << 16) | (b1 << 8) | b2;
+        out[o] = b64_encode_char((triple >> 18) & 63u32);
+        out[o + 1] = b64_encode_char((triple >> 12) & 63u32);
+        out[o + 2] = b64_encode_char((triple >> 6) & 63u32);
+        out[o + 3] = b64_encode_char(triple & 63u32);
+        o = o + 4;
+        i = i + 3;
+    }
+    const remain: usize = n - i;
+    if remain == 1 {
+        const b0: u32 = src[i] as u32;
+        const triple: u32 = b0 << 16;
+        out[o] = b64_encode_char((triple >> 18) & 63u32);
+        out[o + 1] = b64_encode_char((triple >> 12) & 63u32);
+        out[o + 2] = PAD;
+        out[o + 3] = PAD;
+        o = o + 4;
+    } else if remain == 2 {
+        const b0: u32 = src[i] as u32;
+        const b1: u32 = src[i + 1] as u32;
+        const triple: u32 = (b0 << 16) | (b1 << 8);
+        out[o] = b64_encode_char((triple >> 18) & 63u32);
+        out[o + 1] = b64_encode_char((triple >> 12) & 63u32);
+        out[o + 2] = b64_encode_char((triple >> 6) & 63u32);
+        out[o + 3] = PAD;
+        o = o + 4;
+    }
+    return o;
+}
+
+/// 把单个 Base64 字符转成 6 位值。
+/// 参数：c 为字符。
+/// 返回值：0..63；非法字符返回 -1，补齐符返回 -2。
+fn b64_decode_char(c: byte) i32 {
+    if c >= 65 as byte && c <= 90 as byte {
+        return (c as i32) - 65;
+    }
+    if c >= 97 as byte && c <= 122 as byte {
+        return ((c as i32) - 97) + 26;
+    }
+    if c >= 48 as byte && c <= 57 as byte {
+        return ((c as i32) - 48) + 52;
+    }
+    if c == 43 as byte {
+        return 62;
+    }
+    if c == 47 as byte {
+        return 63;
+    }
+    if c == PAD {
+        return -2;
+    }
+    return -1;
+}
+
+/// 解码 Base64 文本（严格：长度必须为 4 的倍数，补齐必须出现在末尾）。
+/// 参数：src/n 为输入文本，out/cap 为目标缓冲。
+/// 返回值：解码出的字节数；输入非法或缓冲不足时返回错误。
+export fn b64_decode(src: &const byte, n: usize, out: &byte, cap: usize) !usize {
+    if src == null {
+        return error.B64Invalid;
+    }
+    if n == 0 {
+        return 0 as usize;
+    }
+    if n % 4usize != 0 {
+        return error.B64Invalid;
+    }
+    const groups: usize = n / 4usize;
+    if groups * 3usize > cap {
+        return error.B64TooSmall;
+    }
+    var o: usize = 0;
+    var g: usize = 0;
+    while g < groups {
+        const base: usize = g * 4;
+        const v0: i32 = b64_decode_char(src[base]);
+        const v1: i32 = b64_decode_char(src[base + 1]);
+        const v2: i32 = b64_decode_char(src[base + 2]);
+        const v3: i32 = b64_decode_char(src[base + 3]);
+        if v0 < 0 || v1 < 0 {
+            return error.B64Invalid;
+        }
+        const last_group: bool = g + 1 == groups;
+        var pad_count: i32 = 0;
+        if v2 == -2 {
+            pad_count = 2;
+        } else if v2 < 0 {
+            return error.B64Invalid;
+        }
+        if v3 == -2 {
+            pad_count = pad_count + 1;
+        } else if v3 < 0 {
+            return error.B64Invalid;
+        }
+        if pad_count > 0 && !last_group {
+            // 补齐只能出现在最后一组。
+            return error.B64Invalid;
+        }
+        if v2 == -2 && v3 != -2 {
+            return error.B64Invalid;
+        }
+        var v2v: u32 = 0;
+        var v3v: u32 = 0;
+        if v2 > 0 {
+            v2v = v2 as u32;
+        }
+        if v3 > 0 {
+            v3v = v3 as u32;
+        }
+        const triple: u32 = ((v0 as u32) << 18) | ((v1 as u32) << 12) | (v2v << 6) | v3v;
+        out[o] = ((triple >> 16) & 255u32) as byte;
+        o = o + 1;
+        if pad_count < 2 {
+            out[o] = ((triple >> 8) & 255u32) as byte;
+            o = o + 1;
+        }
+        if pad_count < 1 {
+            out[o] = (triple & 255u32) as byte;
+            o = o + 1;
+        }
+        g = g + 1;
+    }
+    return o;
+}
+
+/// 编码一段字节并追加到缓冲。
+/// 参数：out 为目标缓冲，src/n 为输入。
+/// 返回值：无；失败时返回错误。
+export fn b64_encode_into(out: &Buf, src: &const byte, n: usize) !void {
+    const need: usize = b64_encoded_len(n);
+    try buf_reserve(out, out.len + need);
+    const written: usize = try b64_encode(src, n, out.data + out.len, out.cap - out.len);
+    out.len = out.len + written;
+}
+
+/// 编码一段以 '\\0' 结尾的文本并追加到缓冲。
+/// 参数：out 为目标缓冲，text 为 C 字符串。
+/// 返回值：无；失败时返回错误。
+export fn b64_encode_cstr_into(out: &Buf, text: &const byte) !void {
+    if text == null {
+        return;
+    }
+    var n: usize = 0;
+    while text[n] != 0 {
+        n = n + 1;
+    }
+    try b64_encode_into(out, text, n);
+}

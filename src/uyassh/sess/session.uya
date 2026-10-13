@@ -1,0 +1,464 @@
+// src/uyassh/sess/session.uya - 会话：转发 + OSC 拦截 + 前缀键
+// 说明：这是包装器的核心。子进程输出经 OSC 扫描后，5522 请求由本地处理器应答（写回
+//       子进程 tty 的输入流）；本地输入经前缀键处理后写入子进程；热键可触发粘贴事件。
+
+use clip.store.ClipStore;
+use clip.store.ClipEntry;
+use clip.store.clip_get_current;
+use clip.store.clip_list;
+use osc.handler.ClipMode;
+use osc.handler.OscHandler;
+use osc.handler.handler_new;
+use osc.handler.handler_free;
+use osc.handler.handler_osc;
+use osc.handler.handler_csi;
+use osc.handler.handler_emit_paste_event;
+use osc.scan.OscScanner;
+use osc.scan.ScanKind;
+use osc.scan.ScanStep;
+use osc.scan.scanner_consume;
+use osc.scan.scanner_feed;
+use osc.scan.scanner_free;
+use osc.scan.scanner_new;
+use osc.scan.scanner_next;
+use pty.relay.RELAY_CHUNK;
+use pty.relay.RelayReady;
+use pty.relay.relay_wait;
+use pty.relay.relay_read_child;
+use pty.relay.relay_read_local;
+use pty.relay.relay_write_stdout;
+use pty.relay.relay_write_child;
+use pty.relay.relay_child_exited;
+use pty.relay.relay_decode_status;
+use pty.spawn.PtySession;
+use term.termios.WinSize;
+use term.termios.term_winsize_or_default;
+use term.termios.term_set_winsize;
+use util.buf.Buf;
+use util.buf.buf_new;
+use util.buf.buf_free;
+use util.buf.buf_clear;
+use util.buf.buf_append;
+use util.buf.cstr_len;
+use util.buf.buf_reserve;
+use util.out.err_str;
+use util.out.out_str;
+use util.out.out_i64;
+
+/// 单条未终止 OSC 序列的长度上限。
+const MAX_PENDING: usize = 65536;
+
+/// 会话结果。
+/// 字段：exit_code 为子进程退出码，exited 表示子进程已被回收，
+///       local_eof 表示本地输入已关闭，bytes_in/bytes_out 为双向字节计数，
+///       quit_requested 表示用户按了退出热键。
+export struct SessionResult {
+    exit_code: i32,
+    exited: bool,
+    local_eof: bool,
+    quit_requested: bool,
+    bytes_in: u64,
+    bytes_out: u64,
+}
+
+/// 会话配置。
+/// 字段：local_fd 为本地终端 fd，prefix_byte 为本地前缀键，
+///       clip_mode 为 5522 工作模式，store 为剪贴板仓库（可为 null），
+///       verbose 为是否打印诊断。
+export struct SessionConfig {
+    local_fd: i32,
+    prefix_byte: byte,
+    clip_mode: ClipMode,
+    store: &ClipStore,
+    verbose: bool,
+}
+
+/// 前缀键之后的动作状态。
+enum PrefixAction {
+    none,
+    after_prefix,
+}
+
+/// 创建会话配置。
+/// 参数：local_fd 为本地终端 fd，prefix_byte 为前缀键，proxy 为是否代理到本地终端，
+///       store 为剪贴板仓库（可为 null），verbose 为诊断开关。
+/// 返回值：配置实例。
+export fn session_config(local_fd: i32, prefix_byte: byte, proxy: bool, store: &ClipStore,
+    verbose: bool) SessionConfig {
+    if proxy {
+        return SessionConfig{
+            local_fd: local_fd,
+            prefix_byte: prefix_byte,
+            clip_mode: ClipMode.proxy,
+            store: store,
+            verbose: verbose,
+        };
+    }
+    return SessionConfig{
+        local_fd: local_fd,
+        prefix_byte: prefix_byte,
+        clip_mode: ClipMode.serve,
+        store: store,
+        verbose: verbose,
+    };
+}
+
+/// 运行会话循环。
+/// 参数：session 为 PTY 会话，cfg 为配置。
+/// 返回值：会话结果。
+export fn session_run(session: &PtySession, cfg: &const SessionConfig) SessionResult {
+    var result: SessionResult = SessionResult{
+        exit_code: 0,
+        exited: false,
+        local_eof: false,
+        quit_requested: false,
+        bytes_in: 0,
+        bytes_out: 0,
+    };
+    var scanner: OscScanner = scanner_new();
+    defer { scanner_free(&scanner); }
+    var handler: OscHandler = handler_new(cfg.clip_mode, cfg.store);
+    defer { handler_free(&handler); }
+    var reply: Buf = buf_new();
+    defer { buf_free(&reply); }
+    var painted: Buf = buf_new();
+    defer { buf_free(&painted); }
+    var child_buf: [byte: RELAY_CHUNK] = [0: RELAY_CHUNK];
+    var local_buf: [byte: RELAY_CHUNK] = [0: RELAY_CHUNK];
+    var last_ws: WinSize = term_winsize_or_default(cfg.local_fd);
+    session_push_winsize(session.master_fd, &last_ws);
+    var local_open: bool = true;
+    var prefix_armed: bool = false;
+    var running: bool = true;
+    while running {
+        const waited: !RelayReady = relay_wait(session.master_fd, session_local_fd(local_open, cfg.local_fd), 100);
+        const ready: RelayReady = waited catch {
+            running = false;
+            RelayReady{ child_readable: false, local_readable: false, interrupted: true };
+        };
+        const now_ws: WinSize = term_winsize_or_default(cfg.local_fd);
+        if now_ws.ws_row != last_ws.ws_row || now_ws.ws_col != last_ws.ws_col {
+            last_ws.ws_row = now_ws.ws_row;
+            last_ws.ws_col = now_ws.ws_col;
+            last_ws.ws_xpixel = now_ws.ws_xpixel;
+            last_ws.ws_ypixel = now_ws.ws_ypixel;
+            session_push_winsize(session.master_fd, &last_ws);
+        }
+        if ready.child_readable {
+            const got: i32 = relay_read_child(session.master_fd, &child_buf[0], RELAY_CHUNK);
+            if got > 0 {
+                result.bytes_out = result.bytes_out + (got as u64);
+                session_child_bytes(&scanner, &handler, &painted, &reply, session.master_fd,
+                    &child_buf[0], got as usize, cfg);
+            } else if got == 0 {
+                running = false;
+            }
+        }
+        if local_open && ready.local_readable {
+            const got_local: i32 = relay_read_local(cfg.local_fd, &local_buf[0], RELAY_CHUNK);
+            if got_local > 0 {
+                result.bytes_in = result.bytes_in + (got_local as u64);
+                const quit: bool = session_local_bytes(session.master_fd, &handler, &reply,
+                    &local_buf[0], got_local as usize, cfg, &prefix_armed);
+                if quit {
+                    result.quit_requested = true;
+                    running = false;
+                }
+            } else if got_local == 0 {
+                local_open = false;
+                result.local_eof = true;
+            }
+        }
+        var status: i32 = 0;
+        if relay_child_exited(session.child_pid, &status) {
+            result.exit_code = relay_decode_status(status);
+            result.exited = true;
+            running = false;
+        }
+    }
+    session_drain(session.master_fd, &scanner, &handler, &painted, &reply, cfg);
+    return result;
+}
+
+/// 本地 fd 的 poll 参数（EOF 后传 -1）。
+/// 参数：local_open 为是否仍打开，local_fd 为 fd。
+/// 返回值：poll 用的 fd。
+fn session_local_fd(local_open: bool, local_fd: i32) i32 {
+    if !local_open {
+        return -1;
+    }
+    return local_fd;
+}
+
+/// 把窗口尺寸下发到 PTY。
+/// 参数：master_fd 为 PTY master，ws 为尺寸。
+/// 返回值：无。
+fn session_push_winsize(master_fd: i32, ws: &const WinSize) void {
+    if ws.ws_row == 0 || ws.ws_col == 0 {
+        return;
+    }
+    const applied: !void = term_set_winsize(master_fd, ws);
+    _ = applied catch { return; };
+}
+
+/// 处理一段子进程输出：扫描 OSC/CSI，可应答的走处理器，其余原样写本地。
+/// 参数：scanner/handler/painted/reply 为会话内状态，master_fd 用于回写应答，
+///       data/n 为输出字节，cfg 为配置。
+/// 返回值：无。
+fn session_child_bytes(scanner: &OscScanner, handler: &OscHandler, painted: &Buf, reply: &Buf,
+    master_fd: i32, data: &const byte, n: usize, cfg: &const SessionConfig) void {
+    var feed_ok: bool = true;
+    const fed: !void = scanner_feed(scanner, data, n);
+    _ = fed catch { feed_ok = false; };
+    if !feed_ok {
+        _ = relay_write_stdout(data, n);
+        return;
+    }
+    _ = painted;
+    var guard: i32 = 0;
+    while guard < 4096 {
+        var step: ScanStep = ScanStep{};
+        const advanced: !void = scanner_next(scanner, &step, MAX_PENDING);
+        _ = advanced catch {
+            scanner_consume(scanner, scanner.pending.len);
+            return;
+        };
+        if step.kind == ScanKind.incomplete {
+            return;
+        }
+        if step.kind == ScanKind.text {
+            _ = relay_write_stdout(scanner.pending.data + step.text_off, step.text_len);
+            scanner_consume(scanner, step.consumed);
+        } else if step.kind == ScanKind.osc {
+            session_handle_osc(handler, reply, master_fd, scanner, &step, cfg);
+            scanner_consume(scanner, step.consumed);
+        } else if step.kind == ScanKind.csi {
+            session_handle_csi(handler, reply, master_fd, scanner, &step, cfg);
+            scanner_consume(scanner, step.consumed);
+        } else {
+            scanner_consume(scanner, step.consumed);
+        }
+        guard = guard + 1;
+    }
+}
+
+/// 处理一个 OSC 序列。
+/// 参数：handler/reply/master_fd/scanner/step 为会话状态，cfg 为配置。
+/// 返回值：无。
+fn session_handle_osc(handler: &OscHandler, reply: &Buf, master_fd: i32, scanner: &OscScanner,
+    step: &const ScanStep, cfg: &const SessionConfig) void {
+    const payload: &byte = session_at(scanner.pending.data, step.payload_off);
+    // 先按 5522 处理；recognized 为 false 时原样透传给本地终端。
+    buf_clear(reply);
+    var local: Buf = buf_new();
+    defer { buf_free(&local); }
+    const consumed: bool = handler_osc(handler, payload, step.payload_len, reply);
+    if consumed {
+        if reply.len > 0 {
+            _ = relay_write_child(master_fd, reply.data, reply.len);
+        }
+        return;
+    }
+    // 非 5522：原样输出（含定界符）给本地终端。
+    session_replay(scanner, step);
+    if cfg.verbose {
+        err_str("[uya-ssh] 透传 OSC 序列 ");
+        out_i64(step.payload_len as i64, true);
+    }
+}
+
+/// 处理一个 CSI 序列（DECRQM / 私有模式开关）。
+/// 参数：handler/reply/master_fd/scanner/step 为会话状态，cfg 为配置。
+/// 返回值：无。
+fn session_handle_csi(handler: &OscHandler, reply: &Buf, master_fd: i32, scanner: &OscScanner,
+    step: &const ScanStep, cfg: &const SessionConfig) void {
+    _ = cfg;
+    if step.payload_len == 0 {
+        session_replay(scanner, step);
+        return;
+    }
+    const params: &byte = session_at(scanner.pending.data, step.payload_off);
+    buf_clear(reply);
+    const last_off: usize = step.payload_len - 1;
+    const final_byte: byte = params[last_off];
+    const param_len: usize = last_off;
+    const consumed: bool = handler_csi(handler, params, param_len, final_byte, reply);
+    if consumed {
+        if reply.len > 0 {
+            _ = relay_write_child(master_fd, reply.data, reply.len);
+        }
+        return;
+    }
+    session_replay(scanner, step);
+}
+
+/// 计算指针 + 偏移（避免直接对两个指针做加法）。
+/// 参数：base 为基址，off 为字节偏移。
+/// 返回值：新指针。
+fn session_at(base: &byte, off: usize) &byte {
+    return @ptr_from_usize(@usize_from_ptr(base as &void) + off) as &byte;
+}
+
+/// 原样重放一个完整序列（含 ESC 与终止符）。
+/// 参数：scanner 为扫描器，step 为序列。
+/// 返回值：无。
+fn session_replay(scanner: &OscScanner, step: &const ScanStep) void {
+    _ = relay_write_stdout(scanner.pending.data, step.consumed);
+}
+
+/// 处理一段本地输入：前缀键状态机 + 原样转发。
+/// 参数：master_fd 为 PTY master，handler/reply 为会话状态，data/n 为输入，
+///       cfg 为配置，prefix_armed 为前缀状态。
+/// 返回值：true 表示请求退出会话。
+fn session_local_bytes(master_fd: i32, handler: &OscHandler, reply: &Buf,
+    data: &const byte, n: usize, cfg: &const SessionConfig, prefix_armed: &bool) bool {
+    var i: usize = 0;
+    while i < n {
+        const c: byte = data[i];
+        if !prefix_armed[0] {
+            if c == cfg.prefix_byte {
+                prefix_armed[0] = true;
+                i = i + 1;
+                continue;
+            }
+            _ = relay_write_child(master_fd, data + i, 1);
+            i = i + 1;
+            continue;
+        }
+        prefix_armed[0] = false;
+        i = i + 1;
+        if c == 112 as byte {
+            session_paste_action(master_fd, handler, reply, cfg);
+        } else if c == 116 as byte {
+            session_paste_text(master_fd, handler, cfg);
+        } else if c == 108 as byte {
+            session_list_clip(cfg);
+        } else if c == 113 as byte {
+            return true;
+        } else if c == cfg.prefix_byte {
+            // 字面前缀字节。
+            _ = relay_write_child(master_fd, data + i - 1, 1);
+        } else {
+            // 未定义的前缀组合：把两个字节都送过去。
+            var both: [byte: 2] = [cfg.prefix_byte, c];
+            _ = relay_write_child(master_fd, &both[0], 2);
+        }
+    }
+    return false;
+}
+
+/// 触发粘贴：应用启用了 5522 粘贴事件时推事件，否则注入文本。
+/// 参数：master_fd 为 PTY master，handler/reply 为会话状态，cfg 为配置。
+/// 返回值：无。
+fn session_paste_action(master_fd: i32, handler: &OscHandler, reply: &Buf, cfg: &const SessionConfig) void {
+    if cfg.store == null {
+        session_write_notice("剪贴板仓库不可用\r\n");
+        return;
+    }
+    if !handler.state.paste_mode {
+        session_write_notice("远端应用未启用 OSC 5522 粘贴模式，改为注入文本\r\n");
+        session_paste_text(master_fd, handler, cfg);
+        return;
+    }
+    buf_clear(reply);
+    const emitted: !void = handler_emit_paste_event(handler, reply, true);
+    var ok: bool = true;
+    _ = emitted catch { ok = false; };
+    if !ok || reply.len == 0 {
+        session_write_notice("生成粘贴事件失败\r\n");
+        return;
+    }
+    _ = relay_write_child(master_fd, reply.data, reply.len);
+}
+
+/// 以文本形式注入剪贴板内容（退化为 OSC 52 + 直接键入）。
+/// 参数：master_fd 为 PTY master，handler 为会话状态，cfg 为配置。
+/// 返回值：无。
+fn session_paste_text(master_fd: i32, handler: &OscHandler, cfg: &const SessionConfig) void {
+    _ = handler;
+    if cfg.store == null {
+        return;
+    }
+    var data: Buf = buf_new();
+    defer { buf_free(&data); }
+    const reserved: !void = buf_reserve(&data, 65536);
+    _ = reserved catch { };
+    if data.cap == 0 {
+        return;
+    }
+    var mime: [byte: 64] = [0: 64];
+    const got: usize = clip_get_current(cfg.store, data.data, data.cap, &mime[0], 64) catch { 0 as usize; };
+    if got == 0 {
+        session_write_notice("剪贴板为空\r\n");
+        return;
+    }
+    // 直接把内容写进子进程的输入流（等价于用户键入/粘贴）。
+    _ = relay_write_child(master_fd, data.data, got);
+}
+
+/// 在本地终端打印仓库列表。
+/// 参数：cfg 为配置。
+/// 返回值：无。
+fn session_list_clip(cfg: &const SessionConfig) void {
+    if cfg.store == null {
+        return;
+    }
+    var entries: [ClipEntry: 64] = [ClipEntry{}: 64];
+    const count: usize = clip_list(cfg.store, &entries[0], 64);
+    session_write_notice("剪贴板仓库：\r\n");
+    var i: usize = 0;
+    while i < count {
+        var line: [byte: 256] = [0: 256];
+        _ = line;
+        out_str("  #");
+        out_i64(entries[i].id as i64, false);
+        out_str(" ");
+        out_str(&entries[i].mime[0]);
+        out_str(" ");
+        out_i64(entries[i].size as i64, false);
+        out_str(" bytes");
+        if entries[i].id == cfg.store.current_id {
+            out_str(" (当前)");
+        }
+        out_str("\r\n");
+        i = i + 1;
+    }
+}
+
+/// 在本地终端显示提示文本（不发给远端）。
+/// 参数：text 为提示文本。
+/// 返回值：无。
+fn session_write_notice(text: &const byte) void {
+    out_str(text);
+}
+
+/// 子进程退出后读净残留输出并做最后的扫描。
+/// 参数：master_fd/scanner/handler/painted/reply 为会话状态，cfg 为配置。
+/// 返回值：无。
+fn session_drain(master_fd: i32, scanner: &OscScanner, handler: &OscHandler, painted: &Buf,
+    reply: &Buf, cfg: &const SessionConfig) void {
+    var tail: [byte: RELAY_CHUNK] = [0: RELAY_CHUNK];
+    var rounds: i32 = 0;
+    while rounds < 256 {
+        const waited: !RelayReady = relay_wait(master_fd, -1, 20);
+        const ready: RelayReady = waited catch {
+            RelayReady{ child_readable: false, local_readable: false, interrupted: true };
+        };
+        if !ready.child_readable {
+            break;
+        }
+        const got: i32 = relay_read_child(master_fd, &tail[0], RELAY_CHUNK);
+        if got <= 0 {
+            break;
+        }
+        session_child_bytes(scanner, handler, painted, reply, master_fd, &tail[0], got as usize, cfg);
+        rounds = rounds + 1;
+    }
+    // 把扫描器里残余的普通字节吐出去（未完成的序列直接丢弃）。
+    var step: ScanStep = ScanStep{};
+    const advanced: !void = scanner_next(scanner, &step, MAX_PENDING);
+    _ = advanced catch { return; };
+    if step.kind == ScanKind.text && step.text_len > 0 {
+        _ = relay_write_stdout(scanner.pending.data + step.text_off, step.text_len);
+    }
+}

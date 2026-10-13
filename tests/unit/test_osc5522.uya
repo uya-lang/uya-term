@@ -1,0 +1,281 @@
+// tests/unit/test_osc5522.uya - OSC 5522 协议处理器单元测试
+// 说明：以"假应用"的方式直接构造协议报文，断言应答字节与仓库状态。
+
+use std.testing.assert_eq_i64;
+use std.testing.expect;
+
+use clip.store.ClipStore;
+use clip.store.clip_store_open;
+use clip.store.clip_store_close;
+use clip.store.clip_store_reset;
+use clip.store.clip_get_current;
+use clip.store.clip_put;
+use osc.b64.b64_encode;
+use osc.b64.b64_decode;
+use osc.handler.ClipMode;
+use osc.handler.OscHandler;
+use osc.handler.handler_new;
+use osc.handler.handler_free;
+use osc.handler.handler_osc;
+use osc.handler.handler_csi;
+use osc.handler.handler_emit_paste_event;
+use osc.handler.handler_consume_paste_password;
+use osc.osc5522.meta_value_is;
+use osc.osc5522.meta_type_is;
+use util.buf.Buf;
+use util.buf.buf_new;
+use util.buf.buf_free;
+use util.buf.cstr_len;
+use util.buf.bytes_find;
+use util.buf.bytes_eq;
+use util.buf.buf_append;
+
+const TEST_DIR: &const byte = "/tmp/uyassh_5522_test";
+
+/// 把文本编码为 base64（返回写入长度）。
+/// 参数：text 为输入，out/cap 为目标。
+/// 返回值：写入字符数。
+fn b64_of(text: &const byte, out: &byte, cap: usize) usize {
+    return b64_encode(text, cstr_len(text), out, cap) catch { 0 as usize; };
+}
+
+/// 在应答缓冲里查找片段。
+/// 参数：b 为缓冲，needle 为待查文本。
+/// 返回值：找到返回 true。
+fn out_has(b: &const Buf, needle: &const byte) bool {
+    const idx: i64 = bytes_find(b.data, b.len, needle, cstr_len(needle));
+    return idx >= 0;
+}
+
+test "元数据解析：键值、type 动作、loc" {
+    const meta: &const byte = "type=read:status=DATA:mime=YWJj:id=x1";
+    try expect(meta_type_is(meta, cstr_len(meta), "read" as &const byte));
+    try expect(meta_value_is(meta, cstr_len(meta), "mime" as &const byte, "YWJj" as &const byte));
+    try expect(meta_value_is(meta, cstr_len(meta), "id" as &const byte, "x1" as &const byte));
+    try expect(!meta_value_is(meta, cstr_len(meta), "loc" as &const byte, "primary" as &const byte));
+    const with_loc: &const byte = "type=write:loc=primary";
+    try expect(meta_value_is(with_loc, cstr_len(with_loc), "loc" as &const byte, "primary" as &const byte));
+}
+
+test "DECRQM 查询与私有模式开关" {
+    var store: ClipStore = ClipStore{};
+    const opened: !void = clip_store_open(&store, TEST_DIR);
+    _ = opened catch { };
+    var h: OscHandler = handler_new(ClipMode.serve, &store);
+    var out: Buf = buf_new();
+    defer { buf_free(&out); }
+    // CSI ? 5522 $ p → CSI ? 5522 ; 2 $ y（未设置时）
+    var csi_params: [byte: 8] = [0: 8];
+    csi_params[0] = 63 as byte;
+    csi_params[1] = 53 as byte;
+    csi_params[2] = 53 as byte;
+    csi_params[3] = 50 as byte;
+    csi_params[4] = 50 as byte;
+    csi_params[5] = 36 as byte;
+    try expect(handler_csi(&h, &csi_params[0], 6, 112 as byte, &out));
+    try expect(out_has(&out, ";2$y" as &const byte));
+    // CSI ? 5522 h → 打开粘贴事件模式，再查询应为 1
+    try expect(handler_csi(&h, &csi_params[0], 5, 104 as byte, &out));
+    try expect(h.state.paste_mode);
+    buf_free(&out);
+    out = buf_new();
+    try expect(handler_csi(&h, &csi_params[0], 6, 112 as byte, &out));
+    try expect(out_has(&out, ";1$y" as &const byte));
+    handler_free(&h);
+    clip_store_close(&store);
+}
+
+test "粘贴事件 → 口令 → 读回与预置内容完全一致" {
+    var store: ClipStore = ClipStore{};
+    const opened: !void = clip_store_open(&store, TEST_DIR);
+    _ = opened catch { };
+    clip_store_reset(&store);
+
+    // 预置一张伪 PNG（含 NUL，确保二进制安全）。
+    var png: [byte: 32] = [137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 255, 0, 65, 66];
+    const png_len: usize = 16;
+    var put_ok: bool = true;
+    const stored: u32 = clip_put(&store, &png[0], png_len, "shot.png" as &const byte) catch {
+        put_ok = false;
+        0 as u32;
+    };
+    try expect(put_ok);
+    _ = stored;
+    var handler: OscHandler = handler_new(ClipMode.serve, &store);
+    var out: Buf = buf_new();
+    const event: !void = handler_emit_paste_event(&handler, &out, true);
+    var event_ok: bool = true;
+    _ = event catch { event_ok = false; };
+    try expect(event_ok);
+    // 事件三段：OK（带 pw）、DATA:mime=Lg==、DONE
+    try expect(out_has(&out, "type=read:status=OK" as &const byte));
+    try expect(out_has(&out, "type=read:status=DATA:mime=Lg==" as &const byte));
+    try expect(out_has(&out, "type=read:status=DONE" as &const byte));
+    try expect(handler.pending_pw_active);
+    buf_free(&out);
+
+    // 应用依口令发起 read，请求 image/png。
+    var pw_b64: [byte: 64] = [0: 64];
+    const pw_len: usize = b64_of(&handler.pending_pw[0], &pw_b64[0], 64);
+    try expect(pw_len > 0);
+    var mime_b64: [byte: 64] = [0: 64];
+    const mime_len: usize = b64_of("image/png" as &const byte, &mime_b64[0], 64);
+
+    var req: Buf = buf_new();
+    const req_built: !void = build_read_request(&req, &pw_b64[0], pw_len, &mime_b64[0], mime_len);
+    var req_ok: bool = true;
+    _ = req_built catch { req_ok = false; };
+    try expect(req_ok);
+
+    var resp: Buf = buf_new();
+    try expect(handler_osc(&handler, req.data, req.len, &resp));
+    try expect(out_has(&resp, "type=read:status=OK" as &const byte));
+    try expect(out_has(&resp, "type=read:status=DATA:mime=" as &const byte));
+    try expect(out_has(&resp, "type=read:status=DONE" as &const byte));
+
+    // 从应答中解出 base64 数据并逐字节比较。
+    var decoded: [byte: 512] = [0: 512];
+    const decoded_len: usize = extract_data_payload(&resp, &decoded[0], 512);
+    try assert_eq_i64(decoded_len as i64, png_len as i64);
+    try expect(bytes_eq(&decoded[0], decoded_len, &png[0], png_len));
+
+    handler_consume_paste_password(&handler);
+    handler_free(&handler);
+    buf_free(&resp);
+    buf_free(&req);
+    clip_store_close(&store);
+}
+
+test "应用写入剪贴板：write/wdata/结束包与 walias" {
+    var store: ClipStore = ClipStore{};
+    const opened: !void = clip_store_open(&store, TEST_DIR);
+    _ = opened catch { };
+    clip_store_reset(&store);
+    var handler: OscHandler = handler_new(ClipMode.serve, &store);
+
+    // type=write
+    var req: Buf = buf_new();
+    try buf_append(&req, "5522;type=write" as &const byte, cstr_len("5522;type=write" as &const byte));
+    var resp: Buf = buf_new();
+    try expect(handler_osc(&handler, req.data, req.len, &resp));
+    try assert_eq_i64(resp.len as i64, 0);
+    try expect(handler.state.write_active);
+
+    // type=wdata:mime=<b64 png>;<b64 数据>
+    var mime_b64: [byte: 64] = [0: 64];
+    const mime_len: usize = b64_of("image/png" as &const byte, &mime_b64[0], 64);
+    var raw: [byte: 8] = [137, 80, 78, 71, 13, 10, 26, 10];
+    var data_b64: [byte: 64] = [0: 64];
+    const data_b64_len: usize = b64_encode(&raw[0], 8, &data_b64[0], 64) catch { 0 as usize; };
+    try expect(data_b64_len > 0);
+    buf_free(&req);
+    req = buf_new();
+    const w1: &const byte = "5522;type=wdata:mime=";
+    try buf_append(&req, w1, cstr_len(w1));
+    try buf_append(&req, &mime_b64[0], mime_len);
+    try buf_append_byte(&req, 59 as byte);
+    try buf_append(&req, &data_b64[0], data_b64_len);
+    buf_free(&resp);
+    resp = buf_new();
+    try expect(handler_osc(&handler, req.data, req.len, &resp));
+
+    // 结束包：type=wdata（无 mime 无数据）
+    buf_free(&req);
+    req = buf_new();
+    const end_pkt: &const byte = "5522;type=wdata";
+    try buf_append(&req, end_pkt, cstr_len(end_pkt));
+    buf_free(&resp);
+    resp = buf_new();
+    try expect(handler_osc(&handler, req.data, req.len, &resp));
+    try expect(out_has(&resp, "type=write:status=DONE" as &const byte));
+
+    // 数据应已进入仓库，且内容与写入一致。
+    var check: [byte: 64] = [0: 64];
+    var check_mime: [byte: 64] = [0: 64];
+    const got: usize = clip_get_current(&store, &check[0], 64, &check_mime[0], 64) catch { 0 as usize; };
+    try assert_eq_i64(got as i64, 8);
+    try expect(bytes_eq(&check[0], got, &raw[0], 8));
+    try expect(bytes_eq(&check_mime[0], cstr_len(&check_mime[0]), "image/png" as &const byte, cstr_len("image/png" as &const byte)));
+    handler_free(&handler);
+    buf_free(&req);
+    buf_free(&resp);
+    clip_store_close(&store);
+}
+
+test "无效 base64 的 wdata 会以 EINVAL 中止本次写" {
+    var store: ClipStore = ClipStore{};
+    const opened: !void = clip_store_open(&store, TEST_DIR);
+    _ = opened catch { };
+    clip_store_reset(&store);
+    var handler: OscHandler = handler_new(ClipMode.serve, &store);
+    var req: Buf = buf_new();
+    const w: &const byte = "5522;type=write";
+    try buf_append(&req, w, cstr_len(w));
+    var resp: Buf = buf_new();
+    try expect(handler_osc(&handler, req.data, req.len, &resp));
+    buf_free(&req);
+    req = buf_new();
+    const bad: &const byte = "5522;type=wdata:mime=***;####";
+    try buf_append(&req, bad, cstr_len(bad));
+    buf_free(&resp);
+    resp = buf_new();
+    try expect(handler_osc(&handler, req.data, req.len, &resp));
+    try expect(!handler.state.write_ok);
+    buf_free(&req);
+    req = buf_new();
+    const end_pkt: &const byte = "5522;type=wdata";
+    try buf_append(&req, end_pkt, cstr_len(end_pkt));
+    buf_free(&resp);
+    resp = buf_new();
+    try expect(handler_osc(&handler, req.data, req.len, &resp));
+    try expect(out_has(&resp, "type=write:status=EINVAL" as &const byte));
+    handler_free(&handler);
+    buf_free(&req);
+    buf_free(&resp);
+    clip_store_close(&store);
+}
+
+/// 构造 read 请求报文（不带 ESC 定界，直接是 OSC 负载）。
+/// 参数：out 为目标缓冲，pw/pw_len 为 base64 口令，mime/mime_len 为 base64 MIME 列表。
+/// 返回值：无；失败时返回错误。
+fn build_read_request(out: &Buf, pw: &const byte, pw_len: usize, mime: &const byte, mime_len: usize) !void {
+    try buf_append(out, "5522;type=read:pw=" as &const byte, cstr_len("5522;type=read:pw=" as &const byte));
+    try buf_append(out, pw, pw_len);
+    const mid: &const byte = ":name=UGFzdGUgZXZlbnQ=;";
+    try buf_append(out, mid, cstr_len(mid));
+    try buf_append(out, mime, mime_len);
+}
+
+/// 从应答缓冲中提取第一个 DATA 包的 base64 数据并解码。
+/// 参数：resp 为应答，out/cap 为输出。
+/// 返回值：解码长度；未找到返回 0。
+fn extract_data_payload(resp: &const Buf, out: &byte, cap: usize) usize {
+    const marker: &const byte = "status=DATA:mime=";
+    const at: i64 = bytes_find(resp.data, resp.len, marker, cstr_len(marker));
+    if at < 0 {
+        return 0;
+    }
+    var i: usize = at as usize + cstr_len(marker);
+    // 跳过 mime（到 ';' 或 ESC 为止）。
+    while i < resp.len && resp.data[i] != 59 as byte {
+        if resp.data[i] == 27 as byte {
+            return 0;
+        }
+        i = i + 1;
+    }
+    if i >= resp.len || resp.data[i] != 59 as byte {
+        return 0;
+    }
+    i = i + 1;
+    var end: usize = i;
+    while end < resp.len && resp.data[end] != 27 as byte {
+        end = end + 1;
+    }
+    const payload: &const byte = resp.data + i;
+    const payload_len: usize = end - i;
+    return osc_decode(payload, payload_len, out, cap);
+}
+
+fn osc_decode(src: &const byte, n: usize, out: &byte, cap: usize) usize {
+    return b64_decode(src, n, out, cap) catch { 0 as usize; };
+}

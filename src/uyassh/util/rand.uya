@@ -1,0 +1,57 @@
+// src/uyassh/util/rand.uya - 随机字节（用于一次性口令等）
+// 说明：Linux 下读 /dev/urandom；失败时退回基于时间的混合，绝不返回全零。
+
+use libc.sys_open;
+use libc.sys_read;
+use libc.sys_close;
+use libc.sys_clock_gettime;
+use libc.TimeSpec;
+use libc.O_RDONLY;
+
+export error RandUnavailable;
+
+/// 生成口令用的随机程度。
+/// 参数：buf 为目标缓冲，n 为字节数。
+/// 返回值：无；无法取得任何熵时返回错误。
+export fn fill_random(buf: &byte, n: usize) !void {
+    if buf == null && n > 0 {
+        return error.RandUnavailable;
+    }
+    if n == 0 {
+        return;
+    }
+    var path: [byte: 12] = [47, 100, 101, 118, 47, 117, 114, 97, 110, 100, 111, 109];
+    const fd: i32 = sys_open(&path[0], O_RDONLY as i32, 0) catch {
+        return fill_random_fallback(buf, n);
+    };
+    var total: usize = 0;
+    while total < n {
+        const got: isize = sys_read(fd, buf + total, n - total) catch { 0 as isize; };
+        if got <= 0 {
+            break;
+        }
+        total = total + (got as usize);
+    }
+    _ = sys_close(fd) catch { 0 as i32; };
+    if total < n {
+        fill_random_fallback(buf + total, n - total);
+    }
+}
+
+/// 退化随机源：把纳秒时间与地址等混合后填充。
+/// 参数：buf 为目标，n 为字节数。
+/// 返回值：无。
+fn fill_random_fallback(buf: &byte, n: usize) void {
+    var ts: TimeSpec = TimeSpec{ tv_sec: 0, tv_nsec: 0 };
+    const got: i32 = sys_clock_gettime(1, &ts) catch { 0 as i32; };
+    _ = got;
+    var state: u64 = (ts.tv_nsec as u64) ^ ((ts.tv_sec as u64) << 21) ^ 0x9e3779b97f4a7c15u64;
+    var i: usize = 0;
+    while i < n {
+        state = state ^ (state << 13);
+        state = state ^ (state >> 7);
+        state = state ^ (state << 17);
+        buf[i] = (state & 255u64) as byte;
+        i = i + 1;
+    }
+}
