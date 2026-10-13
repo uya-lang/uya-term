@@ -58,9 +58,36 @@ OSC 52，图片无从谈起。
 ```
 
 - 应用发出的 OSC 5522 请求被本层截获，由**本地**剪贴板仓库应答；
+  仓库为空时，`uya-ssh` 自己走 X11 协议去读**本机的**剪贴板（见下）；
 - 用户按前缀键触发"粘贴事件"，应用据此取回 PNG/JPEG 原始字节；
 - 本机终端若本身支持 5522（kitty、ghostty、wezterm），改走**代理模式**，
   由 `uya-ssh` 反向向终端索取剪贴板再转交应用。
+
+## 不支持 5522 的终端也能贴图
+
+这是最要紧的一条：**终端不支持 OSC 5522 并不等于贴不了图**。
+
+远端应用问"剪贴板里有什么"，请求会一路传到本机；此时若仓库是空的，
+`uya-ssh` 就自己按 X11 协议去读**本机**剪贴板（`$DISPLAY` 指向的那台 X 服务器），
+把图片字节取回来再交给远端应用。于是 deepin-terminal、xterm、GNOME Terminal
+这些只支持 OSC 52 的终端同样能贴图——**不需要装 `xclip`/`xsel`/`wl-paste`**，
+也不需要为此换终端。
+
+```sh
+bin/uya-ssh clip fetch     # 手动把本机剪贴板收进仓库（会话中也会自动发生）
+bin/uya-ssh clip list      # 确认读到了什么
+```
+
+实现要点（`src/uyassh/x11/clip.uya`，手写 X11 协议的最小读取路径，纯 Uya）：
+
+- 只做「读」：`InternAtom` → `GetSelectionOwner` → `ConvertSelection(TARGETS)`
+  → 按优先级挑一个 target（图片优先，其次文本）→ `GetProperty` 取数据；
+- 支持 **INCR** 分段传输：大图（>64 KiB）由所有者分块推送，逐段收齐；
+  任一段超时或超限都**明确失败**，绝不返回半张 PNG（半张图同样能过 MIME 嗅探，
+  交给下游只会变成一次莫名其妙的「坏请求」）；
+- 结果缓存 3 秒：远端应用通常先问 MIME 列表再取数据，避免重复连服务器；
+- `DISPLAY` 指向远程主机（`host:0`）时直接放弃——那读的是**别的机器**的剪贴板，
+  不是用户眼前的。
 
 ## 前缀键
 
@@ -83,6 +110,7 @@ OSC 52，图片无从谈起。
 ```sh
 bin/uya-ssh clip add shot.png    # 放入仓库并设为当前项
 printf 'hi' | bin/uya-ssh clip add    # 也可以从 stdin 读（文本粘贴）
+bin/uya-ssh clip fetch           # 从本机 X11 剪贴板取回内容并设为当前项
 bin/uya-ssh clip list
 bin/uya-ssh clip use 2
 bin/uya-ssh clip mime            # 打印当前项 MIME
@@ -140,6 +168,10 @@ verbose = no
   子进程 `stty size` 立刻可见。
 - **静态链接**：`uya build` 的链接步骤走内部 `make`，需要 `-static` 时通过环境变量
   `LDFLAGS=-static` 透传（`--nostdlib` 路线冲突，见下）。
+- **X11 读取的坑**（详见 `src/uyassh/x11/clip.uya` 文件头）：Xauthority 文件是**大端**
+  而协议是小端；应答的额外长度在 **u32@4**（不是 u16@6）；`XSendEvent` 送来的事件
+  type 带 **0x80** 位（`SelectionNotify` 是 159 而非 31）；INCR 只认
+  `PropertyNewValue` 通知，且等应答期间必须**把事件排队**而不是丢掉——否则大图会被截断。
 - **不用 `--nostdlib`**：该路线会 `-nostdlib -static -lgcc` 并禁用宿主头文件，
   实测本程序的 `WNOHANG` 等 libc 常量在无头文件时不可见，且 `posix_spawnp` 等
   glibc 扩展不会被隐式声明；因此走"照常用 libc，但整程序静态链接"的路线。
@@ -152,6 +184,7 @@ tests/unit/        协议编解码与状态机（uya test）
   test_osc_scan.uya   OSC/CSI 增量扫描（跨分片、终止符、超长丢弃）
   test_clip_store.uya 剪贴板仓库（往返、MIME 嗅探、当前项切换）
   test_osc5522.uya    5522 状态机（事件+口令读回、write 落盘、EINVAL）
+  test_x11_display.uya X11 前置解析（DISPLAY→套接字、字节序、XAUTHORITY 记录）
 
 tests/integration/ 伪终端端到端（python 驱动）
   t01 透传/尺寸/退出码    t02 运行中改尺寸      t03 raw 模式恢复
@@ -162,7 +195,13 @@ tests/integration/ 伪终端端到端（python 驱动）
   t09 代理模式（假 5522 终端）
   t10 配置文件前缀键生效
   t11 零依赖静态产物（无 INTERP/NEEDED、env -i 可运行、clip 往返、PTY 端到端）
+  t12 本机 X11 剪贴板读取（文本 / 内联 PNG / 300 KiB INCR 大图 / 空板 / PTY 端到端）
 ```
+
+t12 用 `tests/integration/fake_x11.py`——一个只应答剪贴板协议的**假 X 服务器**。
+为什么不连真 `:0`：真 CLIPBOARD 属于用户的桌面会话（dde-clipboard / klipper 正持有它），
+测试去抢所有权既会读走用户自己的剪贴板内容，也会和桌面组件打架，而且不可重复；
+假服务器还能稳定造出 >64 KiB 的图，把真机上难以复现的 **INCR 分段**路径测到。
 
 ## 状态与路线图
 
@@ -175,13 +214,16 @@ tests/integration/ 伪终端端到端（python 驱动）
 | M4 | 代理模式 + OSC 52 透传 | ✅ |
 | M5 | 配置、文档、测试收口 | ✅ 已交付 |
 | M6 | 零依赖静态构建（`-static`，无 INTERP/NEEDED） | ✅ 已交付 |
+| M7 | 本机 X11 剪贴板读取（不支持 5522 的终端也能贴图） | ✅ 已交付 |
 | P2 | 纯 Uya 的 SSH-2 协议客户端（curve25519/ed25519/bigint…） | 规划中 |
 
 ## 已知限制
 
 - SSH 协议本身仍由系统 `ssh` 完成；纯 Uya 的协议实现见路线图 P2。
 - 仅 Linux 已验证（termios/PTY 走 libc）；macOS 分支未测试。
-- 剪贴板仓库为单机本地存储，未实现 X11/Wayland 剪贴板对接（代理模式下由终端提供）。
+- 本机剪贴板读取目前只覆盖 **X11**（`$DISPLAY` + `XAUTHORITY`）；Wayland 原生会话下
+  没有 XWayland 时读不到，仍需靠终端支持 5522 或外部 helper。
+- X11 读取只认 `CLIPBOARD`（空则回退 `PRIMARY`），且只做一次性快照，不监听变更。
 - 全屏程序交互依赖真实终端，自动化测试只断言关键序列。
 - 静态产物只覆盖自身；被包装的 `ssh` 仍需目标机上有可用的 libc 与 PATH。
 

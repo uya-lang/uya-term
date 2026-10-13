@@ -1,0 +1,1209 @@
+// src/uyassh/x11/clip.uya - 本机 X11 剪贴板读取（纯 Uya，不依赖 xclip/xsel）
+// 说明：远端应用要「用户眼前的剪贴板」时，数据其实躺在**本机**的 X11 里。
+//       uya-ssh 自己实现 X11 协议的最小读取路径，把图片取回来——这样在
+//       deepin-terminal、xterm 这类不支持 OSC 5522 的终端下也能粘贴图片。
+//
+// 设计：只读、一次性、超时收敛。不做事件驱动、不常驻，一个请求一条连接，
+//       拿完就关（剪贴板是「用户按一下才看」的东西，见 readme 的取舍说明）。
+//
+// 线格式（全部按 X11 协议，小端）：
+//   握手  "l\0" + u16(11) + u16(0) + u16(len(name)) + u16(len(data)) + 2 字节填充
+//         + name + data + 4 字节对齐填充
+//   应答  首 8 字节里 status@0（1=成功）、additional_length@6（4 字节单位）
+//   请求  首字节为 opcode，@2 为长度（4 字节单位）
+//   事件  固定 32 字节；应答 32 字节 + additional_length*4 字节
+//
+// 踩过的坑（都写在这里，别再踩第二次）：
+//   * **Xauthority 文件是大端**，X 协议本身是小端：文件里的长度字段用 >u16 读，
+//     线上的长度字段用 <u16 读。混用会得到「握手成功、之后全是莫名超时」。
+//   * **应答的额外长度在 @4（u32）**，不是 @6（u16）。小长度应答的高字节恒为 0，
+//     按 u16@6 读会把**所有**小应答的数据整段丢掉（表现：TARGETS 列表永远是空的）。
+//   * **XSendEvent 送来事件的 type 带 0x80 位**：所有者按 ICCCM 用 XSendEvent 回
+//     SelectionNotify，于是它的 type 是 159（0x9F）而不是 31。不屏蔽 0x80 位就永远
+//     等不到通知（表现：转圈到超时）。
+//   * **requestor 必须是真窗口**：ConvertSelection 的 requestor 传 0（None）时服务器
+//     直接 BadValue，且窗口不能只 Create 了事——所有者要把 property 写在它上面。
+//   * **property 变更通知要自己收**：INCR 传输靠 PropertyChangeMask
+//     （value_mask=CWEventMask(0x800)，值=PropertyChangeMask(0x400000)）推进。
+//   * 资源 id 不能从 1 开始硬编：要用握手应答里的 base/mask 拼，
+//     否则 CreateWindow 直接 BadIDChoice。
+
+use libc.sys_socket;
+use libc.sys_connect;
+use libc.sys_read;
+use libc.sys_write;
+use libc.sys_close;
+use libc.sys_poll;
+use libc.sys_open;
+use libc.PollFd;
+use libc.POLLIN;
+use libc.SOCK_STREAM;
+use libc.O_RDONLY;
+use std.env.get;
+use util.buf.Buf;
+use util.buf.buf_new;
+use util.buf.buf_free;
+use util.buf.buf_append;
+use util.buf.buf_clear;
+use util.buf.buf_reserve;
+use util.buf.cstr_len;
+use util.buf.bytes_eq;
+
+export error X11NoDisplay;
+export error X11ConnectFailed;
+export error X11ProtocolError;
+export error X11NoData;
+
+/// AF_UNIX（libc 模块只导出了 AF_INET，这里补一个）。
+const AF_UNIX: i32 = 1;
+/// sun_path 上限（Linux）。
+const SUN_PATH_CAP: usize = 108;
+/// 单个请求/应答包的长度。
+const PKT: usize = 32;
+/// 单次读取上限：24 MiB（一张 4K 截图 PNG 约 2–8 MiB）。
+export const X11_MAX_BYTES: usize = 24 * 1024 * 1024;
+/// 每次等对端的超时（毫秒）。剪贴板读取是交互路径，慢就等于卡住用户的粘贴。
+const WAIT_MS: i32 = 1200;
+/// INCR 分段传输的总超时（毫秒）：大图要分几十段，给宽一点。
+const INCR_WAIT_MS: i32 = 15000;
+
+/// 请求 opcode。
+const OP_CREATE_WINDOW: byte = 1 as byte;
+const OP_CHANGE_WINDOW_ATTRIBUTES: byte = 2 as byte;
+const OP_INTERN_ATOM: byte = 16 as byte;
+const OP_GET_PROPERTY: byte = 20 as byte;
+const OP_GET_SELECTION_OWNER: byte = 23 as byte;
+const OP_CONVERT_SELECTION: byte = 24 as byte;
+/// 事件 type。
+const EV_REPLY: byte = 1 as byte;
+const EV_PROPERTY_NOTIFY: byte = 28 as byte;
+const EV_SELECTION_NOTIFY: byte = 31 as byte;
+/// 事件 type 上的「XSendEvent 送来」位。
+const SENT_EVENT_BIT: byte = 128 as byte;
+/// ChangeWindowAttributes 的 value_mask 与事件掩码。
+const CW_EVENT_MASK: u32 = 2048u32;
+const PROPERTY_CHANGE_MASK: u32 = 4194304u32;
+/// 已知原子 id（预定义，无需 InternAtom）。
+const ATOM_ATOM: u32 = 4u32;
+/// 文本类 target（按优先级）。
+const TEXT_TARGETS: usize = 3;
+
+/// X11 连接（一次读取用完即关）。
+/// 字段：fd 为套接字，win 为本次用的 requestor 窗口，base/mask 为资源 id 规则，
+///       root 为根窗口，seq 为已发请求数（用于配对原子应答），
+///       ev_count/ev_queue 为暂存的事件（见下）。
+export struct X11Conn {
+    fd: i32,
+    win: u32,
+    base: u32,
+    mask: u32,
+    root: u32,
+    seq: u32,
+    next_id: u32,
+    /// 等应答期间收到的事件必须**存下来**，不能丢。
+    /// 为什么：INCR 传输的推进信号就是 PropertyNotify。我们取完一段数据（GetProperty）
+    /// 之后要么已经收到、要么马上收到下一条通知；如果在等某条应答时把它丢掉，
+    /// 那一段数据就永远等不到了 —— 症状是大图被**截断**（拿到第一段就结束）。
+    ev_count: usize,
+    ev_queue: [byte: 256],
+}
+
+/// 一次 GetProperty 的结果。
+/// 字段：typ 为属性类型原子，fmt 为 8/16/32，n 为单元数，after 非 0 表示 INCR 还有后续。
+export struct X11Prop {
+    typ: u32,
+    fmt: u32,
+    n: u32,
+    after: u32,
+}
+
+/// 读小端 u16。
+/// 参数：p 为至少 2 字节。
+/// 返回值：数值。
+fn rd16(p: &const byte) u32 {
+    const b0: u32 = p[0] as u32;
+    const b1: u32 = p[1] as u32;
+    return b0 | (b1 << 8);
+}
+
+/// 读小端 u32。
+/// 参数：p 为至少 4 字节。
+/// 返回值：数值。
+fn rd32(p: &const byte) u32 {
+    const b0: u32 = p[0] as u32;
+    const b1: u32 = p[1] as u32;
+    const b2: u32 = p[2] as u32;
+    const b3: u32 = p[3] as u32;
+    return b0 | (b1 << 8) | (b2 << 16) | (b3 << 24);
+}
+
+/// 写小端 u16。
+/// 参数：p 为目标，v 为数值。
+/// 返回值：无。
+fn wr16(p: &byte, v: u32) void {
+    p[0] = (v & 255u32) as byte;
+    p[1] = ((v >> 8) & 255u32) as byte;
+}
+
+/// 写小端 u32。
+/// 参数：p 为目标，v 为数值。
+/// 返回值：无。
+fn wr32(p: &byte, v: u32) void {
+    p[0] = (v & 255u32) as byte;
+    p[1] = ((v >> 8) & 255u32) as byte;
+    p[2] = ((v >> 16) & 255u32) as byte;
+    p[3] = ((v >> 24) & 255u32) as byte;
+}
+
+/// 读**大端** u16（Xauthority 文件用大端）。
+/// 参数：p 为至少 2 字节。
+/// 返回值：数值。
+fn rd16_be(p: &const byte) u32 {
+    const b0: u32 = p[0] as u32;
+    const b1: u32 = p[1] as u32;
+    return (b0 << 8) | b1;
+}
+
+/// 在 data[off..off+n) 里找子串。
+/// 参数：data/n 为被搜索区间，needle/nlen 为子串。
+/// 返回值：偏移；未找到返回 -1。
+fn find_sub(data: &const byte, n: usize, needle: &const byte, nlen: usize) i64 {
+    if nlen == 0 || nlen > n {
+        return -1 as i64;
+    }
+    var i: usize = 0;
+    while i + nlen <= n {
+        if bytes_eq(data + i, nlen, needle, nlen) {
+            return i as i64;
+        }
+        i = i + 1;
+    }
+    return -1 as i64;
+}
+
+/// 解析 DISPLAY，拼出 unix 套接字路径。
+/// 支持 ":0"、":0.0"、"unix:0" 与 "host:0"（后者走 TCP，本模块不支持，返回 false）。
+/// 参数：disp 为 DISPLAY 值，out/cap 为目标缓冲。
+/// 返回值：成功返回 true。
+fn display_socket(disp: &const byte, out: &byte, cap: usize) bool {
+    if disp == null || disp[0] == 0 {
+        return false;
+    }
+    const n: usize = cstr_len(disp);
+    // 找 ':'；它前面若还有内容（host 名），说明不是本机 unix 套接字。
+    var colon: i64 = -1 as i64;
+    var i: usize = 0;
+    while i < n {
+        if disp[i] == 58 as byte {
+            colon = i as i64;
+            break;
+        }
+        i = i + 1;
+    }
+    if colon < 0 {
+        return false;
+    }
+    const host_len: usize = colon as usize;
+    if host_len > 0 {
+        // "unix:0" 是本机；其余（host:0）要连 TCP，这里不支持。
+        if !(host_len == 4 && disp[0] == 117 as byte && disp[1] == 110 as byte &&
+            disp[2] == 105 as byte && disp[3] == 120 as byte) {
+            return false;
+        }
+    }
+    // 显示号：':' 之后到 '.' 之前。
+    var j: usize = host_len + 1;
+    var num: usize = 0;
+    var digits: usize = 0;
+    while j < n && disp[j] >= 48 as byte && disp[j] <= 57 as byte {
+        num = num * 10 + ((disp[j] - 48 as byte) as usize);
+        digits = digits + 1;
+        if digits > 6 {
+            return false;
+        }
+        j = j + 1;
+    }
+    if digits == 0 {
+        return false;
+    }
+    const prefix: &const byte = "/tmp/.X11-unix/X";
+    const plen: usize = cstr_len(prefix);
+    if plen + 6 + 1 > cap {
+        return false;
+    }
+    var k: usize = 0;
+    while k < plen {
+        out[k] = prefix[k];
+        k = k + 1;
+    }
+    // 十进制显示号（去前导零）。
+    var tmp: [byte: 8] = [0: 8];
+    var digits_n: usize = 0;
+    if num == 0 {
+        tmp[0] = 48 as byte;
+        digits_n = 1;
+    }
+    while num > 0 {
+        tmp[digits_n] = (48 as usize + (num % 10 as usize)) as byte;
+        digits_n = digits_n + 1;
+        num = num / (10 as usize);
+    }
+    var d: usize = 0;
+    while d < digits_n {
+        out[k] = tmp[digits_n - 1 - d];
+        k = k + 1;
+        d = d + 1;
+    }
+    out[k] = 0 as byte;
+    return true;
+}
+
+/// 从 XAUTHORITY 文件里取指定 display 的认证信息。
+/// 参数：path 为文件路径，want_num 为显示号文本，name_out/cap 与 data_out/cap 为输出。
+/// 返回值：成功返回 true。
+fn xauth_read(path: &const byte, want_num: &const byte, name_out: &byte, name_cap: usize,
+    data_out: &byte, data_cap: usize, name_len: &usize, data_len: &usize) bool {
+    const fd: i32 = sys_open(path, O_RDONLY as i32, 0) catch { return false; };
+    defer { _ = sys_close(fd) catch { 0 as i32; }; }
+    var raw: [byte: 8192] = [0: 8192];
+    var total: usize = 0;
+    while total < 8192 {
+        const got: isize = sys_read(fd, &raw[total], 8192 - total) catch { -1 as isize; };
+        if got <= 0 {
+            break;
+        }
+        total = total + (got as usize);
+    }
+    var off: usize = 0;
+    while off + 4 <= total {
+        // 记录布局（全大端）：family、addr_len、addr、num_len、num、name_len、name、data_len、data。
+        const addr_len: usize = rd16_be(raw + off + 2) as usize;
+        off = off + 4;
+        if off + addr_len + 2 > total {
+            return false;
+        }
+        off = off + addr_len;
+        const num_len: usize = rd16_be(raw + off) as usize;
+        off = off + 2;
+        if off + num_len + 2 > total {
+            return false;
+        }
+        const num: &const byte = raw + off;
+        off = off + num_len;
+        const nlen: usize = rd16_be(raw + off) as usize;
+        off = off + 2;
+        if off + nlen + 2 > total {
+            return false;
+        }
+        const nm: &const byte = raw + off;
+        off = off + nlen;
+        const dlen: usize = rd16_be(raw + off) as usize;
+        off = off + 2;
+        if off + dlen > total {
+            return false;
+        }
+        const dt: &const byte = raw + off;
+        off = off + dlen;
+        if bytes_eq(num, num_len, want_num, cstr_len(want_num)) {
+            if nlen + 1 > name_cap || dlen + 1 > data_cap {
+                return false;
+            }
+            var i: usize = 0;
+            while i < nlen {
+                name_out[i] = nm[i];
+                i = i + 1;
+            }
+            name_out[nlen] = 0 as byte;
+            var j: usize = 0;
+            while j < dlen {
+                data_out[j] = dt[j];
+                j = j + 1;
+            }
+            data_out[dlen] = 0 as byte;
+            name_len[0] = nlen;
+            data_len[0] = dlen;
+            return true;
+        }
+    }
+    return false;
+}
+
+/// 等待 fd 可读。
+/// 参数：fd 为套接字，timeout_ms 为毫秒。
+/// 返回值：可读返回 true。
+fn wait_readable(fd: i32, timeout_ms: i32) bool {
+    var fds: [PollFd: 1] = [PollFd{}: 1];
+    fds[0].fd = fd;
+    fds[0].events = POLLIN;
+    const n: i32 = sys_poll(&fds[0], 1, timeout_ms) catch { -1 as i32; };
+    if n <= 0 {
+        return false;
+    }
+    return (fds[0].revents as i32 & (POLLIN as i32)) != 0;
+}
+
+/// 精确读 n 字节（带超时）。
+/// 参数：fd 为套接字，out 为目标，n 为字节数，timeout_ms 为超时。
+/// 返回值：读满返回 true。
+fn read_exact(fd: i32, out: &byte, n: usize, timeout_ms: i32) bool {
+    var total: usize = 0;
+    while total < n {
+        if !wait_readable(fd, timeout_ms) {
+            return false;
+        }
+        const got: isize = sys_read(fd, out + total, n - total) catch { -1 as isize; };
+        if got <= 0 {
+            return false;
+        }
+        total = total + (got as usize);
+    }
+    return true;
+}
+
+/// 写满 n 字节。
+/// 参数：fd 为套接字，data/n 为内容。
+/// 返回值：写满返回 true。
+fn write_all(fd: i32, data: &const byte, n: usize) bool {
+    var total: usize = 0;
+    while total < n {
+        const put: isize = sys_write(fd, data + total, n - total) catch { -1 as isize; };
+        if put <= 0 {
+            return false;
+        }
+        total = total + (put as usize);
+    }
+    return true;
+}
+
+/// 连接本机 X 服务器并完成握手。
+/// 参数：x 为输出连接。
+/// 返回值：成功返回 true。
+fn x11_connect(x: &X11Conn) bool {
+    const disp: &const byte = get("DISPLAY" as &const byte);
+    if disp == null || disp[0] == 0 {
+        return false;
+    }
+    var sock: [byte: 256] = [0: 256];
+    if !display_socket(disp, &sock[0], 256) {
+        return false;
+    }
+    // 认证：XAUTHORITY 优先，其次 ~/.Xauthority。
+    var path: [byte: 512] = [0: 512];
+    const env_auth: &const byte = get("XAUTHORITY" as &const byte);
+    if env_auth != null && env_auth[0] != 0 {
+        if !copy_str(&path[0], 512, env_auth) {
+            return false;
+        }
+    } else {
+        const home: &const byte = get("HOME" as &const byte);
+        if home == null || home[0] == 0 {
+            return false;
+        }
+        if !join_str(&path[0], 512, home, "/.Xauthority") {
+            return false;
+        }
+    }
+    // 显示号文本（套接字路径里 'X' 之后的部分）。
+    const sock_len: usize = cstr_len(&sock[0]);
+    const num: &const byte = &sock[0] + (sock_len - 1);
+    var name: [byte: 256] = [0: 256];
+    var data: [byte: 512] = [0: 512];
+    var name_len: usize = 0;
+    var data_len: usize = 0;
+    const have_auth: bool = xauth_read(&path[0], num, &name[0], 256, &data[0], 512,
+        &name_len, &data_len);
+    const fd: i32 = sys_socket(AF_UNIX, SOCK_STREAM, 0) catch { return false; };
+    // sun_path 之后按 C 字符串给足长度（含结尾 0）。
+    var addr: [byte: 128] = [0: 128];
+    wr16(&addr[0], AF_UNIX as u32);
+    var sp: usize = 0;
+    while sp < sock_len && sp + 1 < SUN_PATH_CAP {
+        addr[2 + sp] = sock[sp];
+        sp = sp + 1;
+    }
+    addr[2 + sp] = 0 as byte;
+    const alen: u32 = (sp + 3) as u32;
+    const connected: i32 = sys_connect(fd, &addr[0] as &void, alen) catch { -1 as i32; };
+    if connected != 0 {
+        _ = sys_close(fd) catch { 0 as i32; };
+        return false;
+    }
+    // 握手包。
+    var req: [byte: 512] = [0: 512];
+    var n: usize = 0;
+    req[n] = 108 as byte;      // 'l' = 小端
+    n = n + 1;
+    req[n] = 0 as byte;
+    n = n + 1;
+    wr16(req + n, 11u32);      // 协议主版本
+    n = n + 2;
+    wr16(req + n, 0u32);
+    n = n + 2;
+    wr16(req + n, name_len as u32);
+    n = n + 2;
+    wr16(req + n, data_len as u32);
+    n = n + 2;
+    req[n] = 0 as byte;
+    n = n + 1;
+    req[n] = 0 as byte;
+    n = n + 1;
+    var i: usize = 0;
+    while i < name_len {
+        req[n] = name[i];
+        n = n + 1;
+        i = i + 1;
+    }
+    var j: usize = 0;
+    while j < data_len {
+        req[n] = data[j];
+        n = n + 1;
+        j = j + 1;
+    }
+    while (n % (4 as usize)) != 0 {
+        req[n] = 0 as byte;
+        n = n + 1;
+    }
+    if !write_all(fd, &req[0], n) {
+        _ = sys_close(fd) catch { 0 as i32; };
+        return false;
+    }
+    if !have_auth {
+        // 没读到 cookie（例如 X 服务器未开认证）：空认证仍可能被接受。
+        _ = name_len;
+    }
+    // 应答：8 字节头 + additional_length*4。
+    var head: [byte: 8] = [0: 8];
+    if !read_exact(fd, &head[0], 8, WAIT_MS) {
+        _ = sys_close(fd) catch { 0 as i32; };
+        return false;
+    }
+    if head[0] != 1 as byte {
+        _ = sys_close(fd) catch { 0 as i32; };
+        return false;
+    }
+    const extra_len: usize = (rd16(&head[6]) as usize) * 4;
+    if extra_len < 40 + 8 {
+        _ = sys_close(fd) catch { 0 as i32; };
+        return false;
+    }
+    var body: [byte: 4096] = [0: 4096];
+    var got_body: usize = extra_len;
+    if got_body > 4096 {
+        got_body = 4096;
+    }
+    if !read_exact(fd, &body[0], got_body, WAIT_MS) {
+        _ = sys_close(fd) catch { 0 as i32; };
+        return false;
+    }
+    // 多出来的部分必须读掉：留在套接字里会把后续每一个应答都顶偏
+    // （症状：握手"成功"，之后所有请求都拿到上一次的应答）。
+    if extra_len > got_body {
+        var left: usize = extra_len - got_body;
+        var drop: [byte: 512] = [0: 512];
+        while left > 0 {
+            const chunk: usize = if left > 512 { 512 as usize } else { left };
+            if !read_exact(fd, &drop[0], chunk, WAIT_MS) {
+                _ = sys_close(fd) catch { 0 as i32; };
+                return false;
+            }
+            left = left - chunk;
+        }
+    }
+    // setup：release@0、resource_id_base@4、resource_id_mask@8、vendor_len@16、
+    //        format 数量@21、vendor 之后是对齐填充、随后是 format 表与屏幕。
+    x.base = rd32(&body[4]);
+    x.mask = rd32(&body[8]);
+    const vlen: usize = rd16(&body[16]) as usize;
+    const nfmt: usize = body[21] as usize;
+    var off: usize = 32 + vlen;
+    while (off % (4 as usize)) != 0 {
+        off = off + 1;
+    }
+    off = off + nfmt * (8 as usize);
+    if off + 4 > got_body || off + 4 > 4096 {
+        _ = sys_close(fd) catch { 0 as i32; };
+        return false;
+    }
+    x.root = rd32(&body[off]);
+    x.fd = fd;
+    x.seq = 0;
+    x.next_id = 1;
+    x.win = 0;
+    // 建一个 requestor 窗口（SelectionNotify 的 property 要写在它上面）。
+    x.win = x11_new_id(x);
+    var cw: [byte: 32] = [0: 32];
+    cw[0] = OP_CREATE_WINDOW;
+    wr16(cw + 2, 8u32);
+    wr32(cw + 4, x.win);
+    wr32(cw + 8, x.root);
+    wr16(cw + 12, 0u32);
+    wr16(cw + 14, 0u32);
+    wr16(cw + 16, 1u32);       // width
+    wr16(cw + 18, 1u32);       // height
+    wr16(cw + 20, 0u32);       // border
+    wr16(cw + 22, 1u32);       // class = InputOutput
+    wr32(cw + 24, 0u32);       // visual = CopyFromParent
+    wr32(cw + 28, 0u32);       // value_mask = 0
+    if !write_all(fd, &cw[0], 32) {
+        x11_close(x);
+        return false;
+    }
+    x.seq = x.seq + 1u32;
+    // 订阅 PropertyChangeMask：INCR 分段全靠它推进。
+    var ca: [byte: 16] = [0: 16];
+    ca[0] = OP_CHANGE_WINDOW_ATTRIBUTES;
+    wr16(ca + 2, 4u32);
+    wr32(ca + 4, x.win);
+    wr32(ca + 8, CW_EVENT_MASK);
+    wr32(ca + 12, PROPERTY_CHANGE_MASK);
+    if !write_all(fd, &ca[0], 16) {
+        x11_close(x);
+        return false;
+    }
+    x.seq = x.seq + 1u32;
+    return true;
+}
+
+/// 分配一个客户端资源 id。
+/// 参数：x 为连接。
+/// 返回值：新 id。
+fn x11_new_id(x: &X11Conn) u32 {
+    // shift = mask 低位 0 的个数。
+    var shift: u32 = 0;
+    var m: u32 = x.mask;
+    while (m & 1u32) == 0u32 && shift < 31u32 {
+        m = m >> (1 as i32);
+        shift = shift + 1u32;
+    }
+    const rid: u32 = x.base | ((x.next_id << (shift as i32)) & x.mask);
+    x.next_id = x.next_id + 1u32;
+    return rid;
+}
+
+/// 关闭连接。
+/// 参数：x 为连接。
+/// 返回值：无。
+export fn x11_close(x: &X11Conn) void {
+    if x.fd > 0 {
+        _ = sys_close(x.fd) catch { 0 as i32; };
+    }
+    x.fd = -1;
+}
+
+/// 把一个事件压进队列（满了就丢最老的，宁可丢事件也不能丢同步）。
+/// 参数：x 为连接，pkt 为 32 字节事件包。
+/// 返回值：无。
+fn x11_push_event(x: &X11Conn, pkt: &const byte) void {
+    const cap: usize = 8;      // 队列按 32 字节一条存，最多 8 条
+    if x.ev_count >= cap {
+        // 队列满：整体前移一格，丢掉最老的一条。
+        var k: usize = 0;
+        while k + 1 < cap {
+            var j: usize = 0;
+            while j < PKT {
+                x.ev_queue[k * PKT + j] = x.ev_queue[(k + 1) * PKT + j];
+                j = j + 1;
+            }
+            k = k + 1;
+        }
+        x.ev_count = cap - 1;
+    }
+    var i: usize = 0;
+    while i < PKT {
+        x.ev_queue[x.ev_count * PKT + i] = pkt[i];
+        i = i + 1;
+    }
+    x.ev_count = x.ev_count + 1;
+}
+
+/// 从队列里取一条事件（先进先出）。
+/// 参数：x 为连接，pkt 为 32 字节输出。
+/// 返回值：取到返回 true。
+fn x11_pop_event(x: &X11Conn, pkt: &byte) bool {
+    if x.ev_count == 0 {
+        return false;
+    }
+    var i: usize = 0;
+    while i < PKT {
+        pkt[i] = x.ev_queue[i];
+        i = i + 1;
+    }
+    var k: usize = 0;
+    while k + 1 < x.ev_count {
+        var j: usize = 0;
+        while j < PKT {
+            x.ev_queue[k * PKT + j] = x.ev_queue[(k + 1) * PKT + j];
+            j = j + 1;
+        }
+        k = k + 1;
+    }
+    x.ev_count = x.ev_count - 1;
+    return true;
+}
+
+/// 读一个 32 字节包；若是应答则读掉额外数据。
+/// 参数：x 为连接，pkt 为 32 字节输出，extra/extra_cap 为额外数据输出，
+///       extra_len 为实际额外长度，timeout_ms 为超时。
+/// 返回值：成功返回 true。
+/// 说明：这里**只从套接字读**，不碰事件队列；等事件的函数（x11_wait_*）会先查队列。
+fn x11_packet(x: &X11Conn, pkt: &byte, extra: &byte, extra_cap: usize,
+    extra_len: &usize, timeout_ms: i32) bool {
+    if !read_exact(x.fd, pkt, PKT, timeout_ms) {
+        return false;
+    }
+    extra_len[0] = 0;
+    if pkt[0] == EV_REPLY {
+        // 额外长度是 **u32 @4**（见文件头的坑）。
+        const full: usize = (rd32(pkt + 4) as usize) * 4;
+        var want: usize = full;
+        if want > extra_cap {
+            want = extra_cap;
+        }
+        if want > 0 {
+            if !read_exact(x.fd, extra, want, timeout_ms) {
+                return false;
+            }
+        }
+        // 超出缓冲的部分读掉丢弃（保持流同步）。
+        if full > want {
+            var drop: [byte: 512] = [0: 512];
+            var left: usize = full - want;
+            while left > 0 {
+                const chunk: usize = if left > 512 { 512 as usize } else { left };
+                if !read_exact(x.fd, &drop[0], chunk, timeout_ms) {
+                    return false;
+                }
+                left = left - chunk;
+            }
+        }
+        extra_len[0] = full;
+    }
+    return true;
+}
+
+/// 等到序号为 want_seq 的应答（事件被丢弃，错误被跳过）。
+/// 参数：x 为连接，want_seq 为目标序号，hdr 为 32 字节应答头输出，
+///       extra/extra_cap 为应答的额外数据，extra_len 为额外数据长度。
+/// 返回值：成功返回 true。
+/// 说明：**固定字段在头里**（atom@8、owner@8、property type@8、nitems@16 等），
+///       额外数据只是变长部分。把这两者搞混的典型症状是「InternAtom 永远失败」。
+fn x11_reply(x: &X11Conn, want_seq: u32, hdr: &byte, extra: &byte, extra_cap: usize,
+    extra_len: &usize) bool {
+    var guard: i32 = 0;
+    while guard < 256 {
+        var pkt: [byte: 32] = [0: 32];
+        var elen: usize = 0;
+        if !x11_packet(x, &pkt[0], extra, extra_cap, &elen, WAIT_MS) {
+            return false;
+        }
+        if pkt[0] == EV_REPLY {
+            if rd16(&pkt[2]) == want_seq {
+                var i: usize = 0;
+                while i < PKT {
+                    hdr[i] = pkt[i];
+                    i = i + 1;
+                }
+                extra_len[0] = elen;
+                return true;
+            }
+            continue;
+        }
+        if pkt[0] == 0 as byte {
+            // 错误：不该发生，但跳过继续等（例如无关请求的迟到错误）。
+            guard = guard + 1;
+            continue;
+        }
+        // 事件（PropertyNotify 等）：**压进队列**，不要丢 —— INCR 的推进信号就是它。
+        x11_push_event(x, &pkt[0]);
+        guard = guard + 1;
+    }
+    return false;
+}
+
+/// InternAtom。
+/// 参数：x 为连接，name 为原子名，atom 为输出。
+/// 返回值：成功返回 true。
+fn x11_intern(x: &X11Conn, name: &const byte, atom: &u32) bool {
+    const nlen: usize = cstr_len(name);
+    var body: [byte: 512] = [0: 512];
+    const units: usize = (2 + (nlen + 3) / 4) * 4;
+    body[0] = OP_INTERN_ATOM;
+    wr16(body + 2, (units / 4) as u32);
+    wr16(body + 4, nlen as u32);
+    var i: usize = 0;
+    while i < nlen {
+        body[8 + i] = name[i];
+        i = i + 1;
+    }
+    _ = write_all(x.fd, &body[0], units);
+    x.seq = x.seq + 1u32;
+    var hdr: [byte: 32] = [0: 32];
+    var extra: [byte: 64] = [0: 64];
+    var elen: usize = 0;
+    if !x11_reply(x, x.seq, &hdr[0], &extra[0], 64, &elen) {
+        return false;
+    }
+    atom[0] = rd32(&hdr[8]);
+    return true;
+}
+
+/// GetSelectionOwner。
+/// 参数：x 为连接，sel 为选择原子，owner 为输出。
+/// 返回值：成功返回 true。
+fn x11_selection_owner(x: &X11Conn, sel: u32, owner: &u32) bool {
+    var body: [byte: 8] = [0: 8];
+    body[0] = OP_GET_SELECTION_OWNER;
+    wr16(body + 2, 2u32);
+    wr32(body + 4, sel);
+    _ = write_all(x.fd, &body[0], 8);
+    x.seq = x.seq + 1u32;
+    var hdr: [byte: 32] = [0: 32];
+    var extra: [byte: 64] = [0: 64];
+    var elen: usize = 0;
+    if !x11_reply(x, x.seq, &hdr[0], &extra[0], 64, &elen) {
+        return false;
+    }
+    owner[0] = rd32(&hdr[8]);
+    return true;
+}
+
+/// GetProperty（delete=true，取走即清）。
+/// 参数：x 为连接，prop 为属性原子，out 为数据输出，meta 为结果元信息。
+/// 返回值：成功返回 true。
+fn x11_get_property(x: &X11Conn, prop: u32, out: &Buf, meta: &X11Prop) bool {
+    // 请求字段顺序：window@4、property@8、**type@12**、long-offset@16、long-length@20。
+    // type 写错（比如把长度写进 type）会被服务器判 BadValue，症状是「一次 read 都没有应答」。
+    var body: [byte: 24] = [0: 24];
+    body[0] = OP_GET_PROPERTY;
+    body[1] = 1 as byte;          // delete = true
+    wr16(body + 2, 6u32);
+    wr32(body + 4, x.win);
+    wr32(body + 8, prop);
+    wr32(body + 12, 0u32);        // type = AnyPropertyType
+    wr32(body + 16, 0u32);        // long-offset
+    wr32(body + 20, X11_MAX_BYTES as u32);
+    _ = write_all(x.fd, &body[0], 24);
+    x.seq = x.seq + 1u32;
+    // 等到序号匹配的应答。**途中会有事件**（我们自己订了 PropertyChangeMask，
+    // 所有者写属性时就会来一条 PropertyNotify），必须跳过它们继续等 ——
+    // 只读一包就要求是应答，会在owner写属性的那一刻永久错位。
+    var pkt: [byte: 32] = [0: 32];
+    var guard: i32 = 0;
+    var got: bool = false;
+    while guard < 256 {
+        if !read_exact(x.fd, &pkt[0], PKT, WAIT_MS) {
+            return false;
+        }
+        if pkt[0] == EV_REPLY && rd16(&pkt[2]) == x.seq {
+            got = true;
+            break;
+        }
+        if pkt[0] == EV_REPLY {
+            // 别的应答：把它的额外数据读掉，保持流同步。
+            const other: usize = (rd32(&pkt[4]) as usize) * 4;
+            var left: usize = other;
+            var drop: [byte: 256] = [0: 256];
+            while left > 0 {
+                const chunk: usize = if left > 256 { 256 as usize } else { left };
+                if !read_exact(x.fd, &drop[0], chunk, WAIT_MS) {
+                    return false;
+                }
+                left = left - chunk;
+            }
+            guard = guard + 1;
+            continue;
+        }
+        // 事件（PropertyNotify 等）：压进队列，别丢（INCR 靠它推进）。
+        x11_push_event(x, &pkt[0]);
+        guard = guard + 1;
+    }
+    if !got {
+        return false;
+    }
+    _ = guard;
+    meta.fmt = pkt[1] as u32;
+    meta.typ = rd32(&pkt[8]);
+    meta.n = rd32(&pkt[16]);
+    meta.after = rd32(&pkt[12]);
+    var nbytes: usize = ((meta.n as usize) * (meta.fmt as usize)) / 8;
+    if nbytes > X11_MAX_BYTES {
+        nbytes = X11_MAX_BYTES;
+    }
+    buf_clear(out);
+    const reserved: !void = buf_reserve(out, nbytes + 4);
+    _ = reserved catch { return false; };
+    if nbytes > 0 {
+        if !read_exact(x.fd, out.data, nbytes, WAIT_MS) {
+            return false;
+        }
+        out.len = nbytes;
+    }
+    // 对齐填充读掉。
+    const rem4: usize = nbytes % (4 as usize);
+    var pad: usize = 0;
+    if rem4 != 0 {
+        pad = (4 as usize) - rem4;
+    }
+    if pad > 0 {
+        var tail: [byte: 4] = [0: 4];
+        if !read_exact(x.fd, &tail[0], pad, WAIT_MS) {
+            return false;
+        }
+    }
+    return true;
+}
+
+/// ConvertSelection 并等 SelectionNotify。
+/// 参数：x 为连接，sel/target/prop 为原子，ok 为输出（所有者是否应答）。
+/// 返回值：成功返回 true。
+fn x11_convert(x: &X11Conn, sel: u32, target: u32, prop: u32, ok: &bool) bool {
+    var body: [byte: 24] = [0: 24];
+    body[0] = OP_CONVERT_SELECTION;
+    wr16(body + 2, 6u32);
+    wr32(body + 4, x.win);
+    wr32(body + 8, sel);
+    wr32(body + 12, target);
+    wr32(body + 16, prop);
+    wr32(body + 20, 0u32);        // time = CurrentTime
+    if !write_all(x.fd, &body[0], 24) {
+        return false;
+    }
+    x.seq = x.seq + 1u32;
+    ok[0] = false;
+    var guard: i32 = 0;
+    while guard < 64 {
+        var pkt: [byte: 32] = [0: 32];
+        // 先看队列：ConvertSelection 与应答之间可能夹着别的事件，
+        // 而我们等应答时已经把事件攒下来了。
+        if !x11_pop_event(x, &pkt[0]) {
+            var extra: [byte: 32] = [0: 32];
+            var elen: usize = 0;
+            if !x11_packet(x, &pkt[0], &extra[0], 32, &elen, WAIT_MS) {
+                return false;
+            }
+            if pkt[0] != 0 as byte && ((pkt[0] & 127 as byte) != EV_SELECTION_NOTIFY) {
+                x11_push_event(x, &pkt[0]);
+                guard = guard + 1;
+                continue;
+            }
+        }
+        // 事件码要屏蔽 XSendEvent 位（见文件头的坑）。
+        const kind: byte = (pkt[0] & 127 as byte) as byte;
+        if kind == EV_SELECTION_NOTIFY {
+            // SelectionNotify 的字段：time@4、requestor@8、selection@12、target@16、property@20。
+            // property == 0 表示所有者拒绝了这次请求。
+            if rd32(&pkt[20]) == prop {
+                ok[0] = true;
+            }
+            return true;
+        }
+        if pkt[0] == 0 as byte {
+            return false;
+        }
+        guard = guard + 1;
+    }
+    return false;
+}
+
+/// 等一条指定属性上的 PropertyNotify「新值已就绪」（INCR 用）。
+/// 参数：x 为连接，prop 为属性原子，timeout_ms 为总超时。
+/// 返回值：收到返回 true。
+/// 说明：**必须只认 state == PropertyNewValue(0)**。我们自己 GetProperty(delete=true)
+///       取走数据时，服务器也会发一条 state == PropertyDelete(1) 的通知；把它也当成
+///       「下一段到了」会让循环空转并提前收尾，症状是大图被**截断**（前几段就结束）。
+fn x11_wait_property(x: &X11Conn, prop: u32, timeout_ms: i32) bool {
+    var spent: i32 = 0;
+    while spent < timeout_ms {
+        var pkt: [byte: 32] = [0: 32];
+        if !x11_pop_event(x, &pkt[0]) {
+            var extra: [byte: 32] = [0: 32];
+            var elen: usize = 0;
+            if !x11_packet(x, &pkt[0], &extra[0], 32, &elen, WAIT_MS) {
+                return false;
+            }
+            spent = spent + WAIT_MS;
+        }
+        // PropertyNotify 的字段：window@4、atom@8、time@12、state@16。
+        const kind: byte = (pkt[0] & 127 as byte) as byte;
+        if kind == EV_PROPERTY_NOTIFY && rd32(&pkt[8]) == prop {
+            if pkt[16] == 0 as byte {
+                return true;
+            }
+        }
+    }
+    return false;
+}
+
+/// 读一个 target 的完整内容（含 INCR 分段）。
+/// 参数：x 为连接，sel/target 为原子，prop 为本次用的属性，out 为输出。
+/// 返回值：成功返回 true；所有者拒绝返回 false。
+fn x11_read_target(x: &X11Conn, sel: u32, target: u32, prop: u32, incr: u32, out: &Buf) bool {
+    var ok: bool = false;
+    if !x11_convert(x, sel, target, prop, &ok) {
+        return false;
+    }
+    if !ok {
+        return false;
+    }
+    var meta: X11Prop = X11Prop{ typ: 0u32, fmt: 0u32, n: 0u32, after: 0u32 };
+    var first: Buf = buf_new();
+    defer { buf_free(&first); }
+    if !x11_get_property(x, prop, &first, &meta) {
+        return false;
+    }
+    if meta.typ != incr {
+        _ = buf_append(out, first.data, first.len);
+        return true;
+    }
+    // INCR：逐段取，直到长度 0 的结束包。
+    //
+    // 这里**任何提前收尾都必须报失败**，不能返回半张图：
+    // 截断的 PNG 交给下游只会得到一个坏请求，用户看到的是「粘贴了一张损坏的图」，
+    // 比明确说「读剪贴板失败」难查得多（半个 PNG 也能过 MIME 嗅探）。
+    var spent: i32 = 0;
+    while spent < INCR_WAIT_MS {
+        if !x11_wait_property(x, prop, INCR_WAIT_MS - spent) {
+            return false;
+        }
+        spent = spent + WAIT_MS;
+        var chunk: Buf = buf_new();
+        defer { buf_free(&chunk); }
+        var cm: X11Prop = X11Prop{ typ: 0u32, fmt: 0u32, n: 0u32, after: 0u32 };
+        if !x11_get_property(x, prop, &chunk, &cm) {
+            return false;
+        }
+        if chunk.len == 0 {
+            // 零长 = 所有者宣告传输结束。
+            return true;
+        }
+        if out.len + chunk.len > X11_MAX_BYTES {
+            return false;      // 超限：明确失败，不返回被截断的数据
+        }
+        const appended: !void = buf_append(out, chunk.data, chunk.len);
+        _ = appended catch { return false; };
+    }
+    return false;              // 超时：同上，宁可失败也不要半张图
+}
+
+/// 复制 C 字符串。
+/// 参数：dst/cap 为目标，src 为源。
+/// 返回值：放得下返回 true。
+fn copy_str(dst: &byte, cap: usize, src: &const byte) bool {
+    const n: usize = cstr_len(src);
+    if n + 1 > cap {
+        return false;
+    }
+    var i: usize = 0;
+    while i < n {
+        dst[i] = src[i];
+        i = i + 1;
+    }
+    dst[n] = 0 as byte;
+    return true;
+}
+
+/// 拼接两个 C 字符串。
+/// 参数：dst/cap 为目标，a/b 为两段。
+/// 返回值：放得下返回 true。
+fn join_str(dst: &byte, cap: usize, a: &const byte, b: &const byte) bool {
+    const an: usize = cstr_len(a);
+    const bn: usize = cstr_len(b);
+    if an + bn + 1 > cap {
+        return false;
+    }
+    var i: usize = 0;
+    while i < an {
+        dst[i] = a[i];
+        i = i + 1;
+    }
+    var j: usize = 0;
+    while j < bn {
+        dst[an + j] = b[j];
+        j = j + 1;
+    }
+    dst[an + bn] = 0 as byte;
+    return true;
+}
+
+/// 第 idx 个优先的 target 名（图片优先，其次文本）。
+/// 参数：idx 为序号。
+/// 返回值：名字（C 字符串）；越界返回 null。
+fn target_name(idx: usize) &const byte {
+    if idx == 0 {
+        return "image/png" as &const byte;
+    }
+    if idx == 1 {
+        return "image/jpeg" as &const byte;
+    }
+    if idx == 2 {
+        return "image/gif" as &const byte;
+    }
+    if idx == 3 {
+        return "image/webp" as &const byte;
+    }
+    if idx == 4 {
+        return "image/bmp" as &const byte;
+    }
+    if idx == 5 {
+        return "text/plain;charset=utf-8" as &const byte;
+    }
+    if idx == 6 {
+        return "UTF8_STRING" as &const byte;
+    }
+    if idx == 7 {
+        return "text/plain" as &const byte;
+    }
+    if idx == 8 {
+        return "STRING" as &const byte;
+    }
+    return null;
+}
+
+/// target 总数。
+/// 参数：无。
+/// 返回值：可选 target 个数。
+fn target_count() usize {
+    return 9;
+}
+
+/// 文本类 target 的起止（用于统一 MIME）。
+/// 参数：idx 为序号。
+/// 返回值：是文本返回 true。
+fn target_is_text(idx: usize) bool {
+    return idx >= 5;
+}
+
+/// 读本机剪贴板里的最佳内容（图片优先，其次文本）。
+/// 参数：out 为数据输出，mime/mime_cap 为 MIME 输出。
+/// 返回值：拿到内容返回 true；没有可用内容（无 DISPLAY/剪贴板空/全是没用的 target）返回 false。
+export fn x11_fetch_clipboard(out: &Buf, mime: &byte, mime_cap: usize) bool {
+    var x: X11Conn = X11Conn{
+        fd: -1, win: 0u32, base: 0u32, mask: 0u32, root: 0u32, seq: 0u32, next_id: 1u32,
+        ev_count: 0, ev_queue: [0: 256],
+    };
+    if !x11_connect(&x) {
+        return false;
+    }
+    defer { x11_close(&x); }
+    var sel: u32 = 0;
+    if !x11_intern(&x, "CLIPBOARD" as &const byte, &sel) {
+        return false;
+    }
+    var owner: u32 = 0;
+    if !x11_selection_owner(&x, sel, &owner) {
+        return false;
+    }
+    if owner == 0u32 {
+        // 没有所有者：退回 PRIMARY（有些老程序只设它）。
+        if !x11_intern(&x, "PRIMARY" as &const byte, &sel) {
+            return false;
+        }
+        if !x11_selection_owner(&x, sel, &owner) || owner == 0u32 {
+            return false;
+        }
+    }
+    var targets_atom: u32 = 0;
+    var incr: u32 = 0;
+    if !x11_intern(&x, "TARGETS" as &const byte, &targets_atom) {
+        return false;
+    }
+    if !x11_intern(&x, "INCR" as &const byte, &incr) {
+        return false;
+    }
+    var prop: u32 = 0;
+    if !x11_intern(&x, "UYASSH_TARGETS" as &const byte, &prop) {
+        return false;
+    }
+    // 先问 TARGETS，再按优先级挑一个。
+    var list: Buf = buf_new();
+    defer { buf_free(&list); }
+    if !x11_read_target(&x, sel, targets_atom, prop, incr, &list) {
+        return false;
+    }
+    const nitems: usize = list.len / 4;
+    var best: usize = target_count();
+    var best_atom: u32 = 0;
+    var idx: usize = 0;
+    while idx < target_count() {
+        const name: &const byte = target_name(idx);
+        if name != null {
+            var atom: u32 = 0;
+            if x11_intern(&x, name, &atom) {
+                var k: usize = 0;
+                while k < nitems {
+                    if rd32(list.data + k * 4) == atom {
+                        if idx < best {
+                            best = idx;
+                            best_atom = atom;
+                        }
+                        break;
+                    }
+                    k = k + 1;
+                }
+            }
+        }
+        idx = idx + 1;
+    }
+    if best >= target_count() {
+        return false;
+    }
+    var data_prop: u32 = 0;
+    if !x11_intern(&x, "UYASSH_DATA" as &const byte, &data_prop) {
+        return false;
+    }
+    buf_clear(out);
+    if !x11_read_target(&x, sel, best_atom, data_prop, incr, out) {
+        return false;
+    }
+    if out.len == 0 {
+        return false;
+    }
+    // 文本统一报 text/plain（下游按魔数还会再嗅一次）。
+    if target_is_text(best) {
+        _ = copy_str(mime, mime_cap, "text/plain" as &const byte);
+        return true;
+    }
+    _ = copy_str(mime, mime_cap, target_name(best));
+    return true;
+}
+
+/// 本机是否可能有可读的 X11 剪贴板（只做环境判断，不连服务器）。
+/// 参数：无。
+/// 返回值：DISPLAY 指向本机 unix 套接字时返回 true。
+export fn x11_maybe_available() bool {
+    const disp: &const byte = get("DISPLAY" as &const byte);
+    if disp == null || disp[0] == 0 {
+        return false;
+    }
+    var sock: [byte: 256] = [0: 256];
+    return display_socket(disp, &sock[0], 256);
+}
+
+/// 供测试：解析 DISPLAY 为套接字路径。
+/// 参数：disp 为 DISPLAY 值，out/cap 为目标。
+/// 返回值：成功返回 true。
+export fn x11_display_socket(disp: &const byte, out: &byte, cap: usize) bool {
+    return display_socket(disp, out, cap);
+}
+
+/// 供测试：读 XAUTHORITY 里某个 display 的 cookie。
+/// 参数：path/want_num 为输入，name_out/data_out 等为输出。
+/// 返回值：成功返回 true。
+export fn x11_xauth_read(path: &const byte, want_num: &const byte, name_out: &byte, name_cap: usize,
+    data_out: &byte, data_cap: usize, name_len: &usize, data_len: &usize) bool {
+    return xauth_read(path, want_num, name_out, name_cap, data_out, data_cap, name_len, data_len);
+}
+
+/// 供测试：读小端 u16/u32。
+/// 参数：p 为源。
+/// 返回值：数值。
+export fn x11_rd16(p: &const byte) u32 {
+    return rd16(p);
+}
+
+/// 供测试：读小端 u32。
+/// 参数：p 为源。
+/// 返回值：数值。
+export fn x11_rd32(p: &const byte) u32 {
+    return rd32(p);
+}

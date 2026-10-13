@@ -3,3 +3,4 @@ build/
 .uyacache/
 *.o
 tests/tmp/
+__pycache__/

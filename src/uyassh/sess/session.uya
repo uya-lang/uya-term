@@ -5,6 +5,7 @@
 use clip.store.ClipStore;
 use clip.store.ClipEntry;
 use clip.store.clip_get_current;
+use clip.store.clip_current_size;
 use clip.store.clip_list;
 use osc.handler.ClipMode;
 use osc.handler.OscHandler;
@@ -522,14 +523,28 @@ fn session_paste_text(master_fd: i32, handler: &OscHandler, cfg: &const SessionC
     if cfg.store == null {
         return;
     }
+    // 容量按当前条目实际大小来：写死常数会把大段文本静默截断，
+    // 而截断后的内容看起来完全正常（用户以为粘全了）。
+    const want: usize = clip_current_size(cfg.store);
+    if want == 0 {
+        session_write_notice("剪贴板为空\r\n");
+        return;
+    }
     var data: Buf = buf_new();
     defer { buf_free(&data); }
-    const reserved: !void = buf_reserve(&data, 65536);
+    const reserved: !void = buf_reserve(&data, want);
     _ = reserved catch { };
     if data.cap == 0 {
+        session_write_notice("内存不足，无法粘贴\r\n");
         return;
     }
     var mime: [byte: 64] = [0: 64];
+    // 文本粘贴是有上限的：这个上限是**用户可见行为**的一部分（粘一半的文本
+    // 比不粘更糟），所以这里明确拒绝而不是截断。
+    if want > 4 * 1024 * 1024 {
+        session_write_notice("剪贴项过大（>4 MiB），文本粘贴已跳过\r\n");
+        return;
+    }
     const got: usize = clip_get_current(cfg.store, data.data, data.cap, &mime[0], 64) catch { 0 as usize; };
     if got == 0 {
         session_write_notice("剪贴板为空\r\n");

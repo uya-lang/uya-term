@@ -18,6 +18,7 @@ use clip.store.clip_list;
 use clip.store.clip_set_current;
 use clip.store.clip_clear_current;
 use clip.store.clip_get_current;
+use clip.store.clip_current_size;
 use util.buf.Buf;
 use util.buf.buf_new;
 use util.buf.buf_free;
@@ -28,6 +29,9 @@ use util.out.buf_append_u64;
 use util.out.out_str;
 use util.out.out_bytes;
 use util.out.out_i64;
+
+use x11.clip.x11_fetch_clipboard;
+use x11.clip.x11_maybe_available;
 use util.out.err_str;
 
 /// 单次读取上限（8 MiB，够放下普通截图）。
@@ -55,10 +59,57 @@ export fn clip_run(opts: &Options) i32 {
     if cstr_eq(opts.clip_action, "mime") {
         return clip_cmd_mime(opts);
     }
+    if cstr_eq(opts.clip_action, "fetch") {
+        return clip_cmd_fetch(opts);
+    }
     err_str("uya-ssh: 未知 clip 动作: ");
     err_str(opts.clip_action);
-    err_str("\n可用: add <文件> | list | use <序号> | get | mime | clear\n");
+    err_str("\n可用: add <文件> | fetch | list | use <序号> | get | mime | clear\n");
     return 2;
+}
+
+/// clip fetch：把**本机 X11 剪贴板**的当前内容收进仓库，并设为当前项。
+/// 参数：opts 为选项（未使用）。
+/// 返回值：进程退出码。
+/// 说明：这是给「终端不支持 5522 时仍要贴图」准备的手动入口，也是 X11 读取路径的
+///       独立测试入口（不需要起 ssh 会话就能验证读到的字节）。
+fn clip_cmd_fetch(opts: &Options) i32 {
+    _ = opts;
+    var data: Buf = buf_new();
+    defer { buf_free(&data); }
+    var mime: [byte: 128] = [0: 128];
+    if !x11_maybe_available() {
+        err_str("uya-ssh: DISPLAY 未指向本机 X 服务器，无法读取本机剪贴板\n");
+        return 4;
+    }
+    const ok: bool = x11_fetch_clipboard(&data, &mime[0], 128);
+    if !ok || data.len == 0 {
+        err_str("uya-ssh: 未能从本机剪贴板读到内容（空、超时或没有支持的格式）\n");
+        return 4;
+    }
+    var store: ClipStore = ClipStore{};
+    if !clip_open_or_report(&store) {
+        return 4;
+    }
+    var put_ok: bool = true;
+    const id: u32 = clip_put(&store, data.data, data.len, "x11-clipboard") catch {
+        put_ok = false;
+        0 as u32;
+    };
+    if !put_ok {
+        err_str("uya-ssh: 写入仓库失败\n");
+        clip_store_close(&store);
+        return 4;
+    }
+    out_str("已从本机剪贴板取回: id=");
+    out_i64(id as i64, false);
+    out_str(" bytes=");
+    out_i64(data.len as i64, false);
+    out_str(" mime=");
+    out_str(&mime[0]);
+    out_str("\n");
+    clip_store_close(&store);
+    return 0;
 }
 
 /// 打开仓库（失败时打印错误）。
@@ -230,7 +281,17 @@ fn clip_cmd_get(opts: &Options) i32 {
     }
     var data: Buf = buf_new();
     defer { buf_free(&data); }
-    const reserved: !void = buf_reserve(&data, 65536);
+    // 容量按**实际条目大小**来，不能写死一个常数：
+    // 写死 65536 时，任何大于它的条目（比如一张 300 KiB 的截图）都会被静默截断成
+    // 前 64 KiB —— 而前 64 KiB 仍然过 MIME 嗅探，于是用户看到的是一张「坏图」，
+    // 而不是一条错误信息。仓库里存得下多大，这里就要能导出多大。
+    const want: usize = clip_current_size(&store);
+    if want == 0 {
+        clip_store_close(&store);
+        err_str("uya-ssh: 剪贴板为空（先执行 clip add）\n");
+        return 4;
+    }
+    const reserved: !void = buf_reserve(&data, want);
     _ = reserved catch { };
     if data.cap == 0 {
         clip_store_close(&store);

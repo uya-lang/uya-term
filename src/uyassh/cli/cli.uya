@@ -192,6 +192,7 @@ export fn print_help(prog: &const byte) void {
     out_str("  -h, --help          打印本帮助\n\n");
     out_str("内建剪贴板命令:\n");
     out_str("  clip add <文件>     把图片/文本放入剪贴板仓库\n");
+    out_str("  clip fetch          取回本机 X11 剪贴板内容（图片/文本）并设为当前项\n");
     out_str("  clip list           列出仓库内容\n");
     out_str("  clip use <序号>     选择当前剪贴项\n");
     out_str("  clip clear          清空当前剪贴项\n\n");
