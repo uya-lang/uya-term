@@ -1,0 +1,223 @@
+// src/uyassh/clip/prefetch.uya - Ctrl-V 预取：把本机剪贴板的图片先收进仓库
+// 说明：这是**推前置**。原来的流程是拉模式：用户按 Ctrl-V → 字节原样透传给远端应用
+//       → 应用发 OSC 5522 read → 我们才去翻仓库或读本机 X11。问题是那次读取发生在
+//       **应用的读超时窗口里**（远端应用等不了十几秒），而且结果只活在内存里。
+//
+//       现在：Ctrl-V 在包装层先被拦一下，把本机 X11 剪贴板里的图片读进仓库（成为当前项），
+//       然后把 Ctrl-V **原样**交给 ssh。远端应用随后自己发起的 read 请求直接从仓库里
+//       立刻拿到那张图 —— 读取那几百毫秒到几秒的停顿挪到了「用户刚按下键」这个预期
+//       停顿点上，而且图是持久的（clip list / clip use 都看得见）。
+//
+// 不变量（三条都不能违反）：
+//   ① **永不吞键**：无论预取成功、失败还是被跳过，Ctrl-V 字节都必须原样转发给子进程。
+//      预取是"顺手多做的事"，不是按键的替代品 —— 吃掉用户的按键是比贴不上图严重得多的故障。
+//   ② **失败静默**：屏幕上不许多打一个字。这是包装器，远端 TUI 的画面由它自己掌控，
+//      我们插一行提示就会毁掉整屏（成功时尤其要安静）。诊断走 -v 的 stderr。
+//   ③ **有界**：去抖窗口 + X11 预算 + 仓库护栏，保证连按 Ctrl-V 不会把按键路径拖成
+//      一次几十秒的卡顿，也不会把仓库撑爆。
+//
+// 只做图片：用户板子里是文本时直接跳过（`image_only`），文本有 OSC 52 那条现成的路。
+
+use clip.store.ClipStore;
+use clip.store.ClipEntry;
+use clip.store.clip_list;
+use clip.store.clip_put;
+use clip.store.clip_current_size;
+use clip.store.clip_get_current;
+use util.buf.Buf;
+use util.buf.buf_new;
+use util.buf.buf_free;
+use util.buf.buf_reserve;
+use util.buf.bytes_eq;
+use std.time.now_ms;
+use x11.clip.x11_fetch_clipboard_filtered;
+use x11.clip.x11_maybe_available;
+
+/// 两次预取之间的最短间隔（毫秒）。
+/// 按键重复（按住 Ctrl-V）会以几十毫秒的间隔连发同一个字节；不去抖的话每次都要连
+/// 一次 X 服务器（握手 + TARGETS + 取数），按键路径会被拖垮。
+export const PREFETCH_DEBOUNCE_MS: u64 = 250;
+
+/// 按键路径上读 X11 的 INCR 分段预算（毫秒）。
+/// 比手动 `clip fetch` 的 15 秒短得多：用户在等一个按键的**回显**，不是在等一次粘贴。
+/// 一张几 MiB 的截图通常一两段就传完，3 秒足够；传不完就放弃这次预取（下次按键再来），
+/// 而不是让整个终端卡住。
+export const PREFETCH_X11_BUDGET_MS: i32 = 3000;
+
+/// 仓库里可见条目数的护栏。
+/// `clip_list` 的读窗口是 64 条 / 16 KiB（index 文本），满了之后再写只会让 id 重复、
+/// 静默覆盖老条目 —— 那是比"这次没入库"严重得多的故障。所以宁可跳过并记原因。
+const PREFETCH_MAX_ENTRIES: usize = 64;
+
+/// 预取结果（供诊断与测试断言）。
+export const PREFETCH_STORED: i32 = 1;
+export const PREFETCH_EMPTY: i32 = 0;
+export const PREFETCH_SKIPPED: i32 = 2;
+export const PREFETCH_FAILED: i32 = 3;
+
+/// 预取器状态。
+/// 字段：last_try_ms 为上次尝试的时刻（0 表示从未试过），enabled 为开关，
+///       reason 为最近一次未入库的原因（诊断用）。
+export struct ClipPrefetch {
+    last_try_ms: u64,
+    enabled: bool,
+    reason: [byte: 64],
+}
+
+/// 创建预取状态。
+/// 参数：enabled 为是否启用预取。
+/// 返回值：空状态。
+export fn prefetch_new(enabled: bool) ClipPrefetch {
+    return ClipPrefetch{
+        last_try_ms: 0u64,
+        enabled: enabled,
+        reason: [0: 64],
+    };
+}
+
+/// 判断此刻是否该真的去读一次剪贴板（纯函数，便于测试边界）。
+/// 参数：st 为状态，now_ms 为当前毫秒时间戳。
+/// 返回值：该跑返回 true。
+/// 说明：**成功与失败都记时间**（调用方负责写 last_try_ms）。坏掉的 X 连接不能让
+///       每一次按键都白等一个完整的超时——失败也要进冷却。
+export fn prefetch_should_run(st: &const ClipPrefetch, now_ms: u64) bool {
+    if !st.enabled {
+        return false;
+    }
+    if st.last_try_ms == 0u64 {
+        return true;
+    }
+    // 时钟回拨（或同一毫秒内的连击）时 now < last，同样按"太近"处理。
+    if now_ms < st.last_try_ms {
+        return false;
+    }
+    return now_ms - st.last_try_ms >= PREFETCH_DEBOUNCE_MS;
+}
+
+/// 判断一个输入字节是不是触发预取的 Ctrl-V（0x16 = SYN）。
+/// 参数：c 为输入字节，prefix_byte 为当前前缀键。
+/// 返回值：是则返回 true。
+/// 说明：`c == prefix_byte` 时返回 false —— 那时这个字节是**前缀键**，由 session 的前缀
+///       状态机处理（用户把前缀改成 ^v 是他的明确选择，不能被我们的预取抢走）。
+export fn prefetch_byte_is_ctrl_v(c: byte, prefix_byte: byte) bool {
+    if c == prefix_byte {
+        return false;
+    }
+    return c == 22 as byte;
+}
+
+/// 取当前毫秒时间；取不到时返回 1（保证非 0，让去抖逻辑照常工作）。
+/// 参数：无。
+/// 返回值：毫秒时间戳。
+export fn prefetch_now_ms() u64 {
+    const got: !u64 = now_ms();
+    const v: u64 = got catch { 1 as u64; };
+    if v == 0u64 {
+        return 1 as u64;
+    }
+    return v;
+}
+
+/// 记下失败原因（诊断用，只进 -v 的 stderr 与测试断言，绝不上屏）。
+/// 参数：st 为状态，text 为原因文本。
+/// 返回值：无。
+fn prefetch_set_reason(st: &ClipPrefetch, text: &const byte) void {
+    var i: usize = 0;
+    while text[i] != 0 && i + 1 < 64 {
+        st.reason[i] = text[i];
+        i = i + 1;
+    }
+    st.reason[i] = 0 as byte;
+}
+
+/// 预取一次本机剪贴板图片到仓库。
+/// 参数：store 为仓库句柄（可为 null），st 为预取状态。
+/// 返回值：PREFETCH_STORED / EMPTY / SKIPPED / FAILED。
+/// 说明：任何失败都不抛出——这是一个"顺手为之"的动作，调用方（按键路径）必须能无条件继续。
+export fn clip_prefetch_local(store: &ClipStore, st: &ClipPrefetch) i32 {
+    if !st.enabled {
+        return PREFETCH_SKIPPED;
+    }
+    if store == null {
+        prefetch_set_reason(st, "仓库不可用");
+        return PREFETCH_SKIPPED;
+    }
+    const now: u64 = prefetch_now_ms();
+    if !prefetch_should_run(st, now) {
+        st.last_try_ms = now;
+        prefetch_set_reason(st, "去抖窗口内");
+        return PREFETCH_SKIPPED;
+    }
+    // 先记时间：下面任何一条提前返回都算"尝试过了"，都要进冷却。
+    st.last_try_ms = now;
+
+    // 仓库满了就跳过：再写会让 id 重复并覆盖老条目（见 PREFETCH_MAX_ENTRIES）。
+    var entries: [ClipEntry: 64] = [ClipEntry{}: 64];
+    const count: usize = clip_list(store, &entries[0], 64);
+    if count >= PREFETCH_MAX_ENTRIES {
+        prefetch_set_reason(st, "仓库条目已满");
+        return PREFETCH_SKIPPED;
+    }
+
+    if !x11_maybe_available() {
+        // DISPLAY 没设、指向远程主机、或（Wayland 会话）压根不是 X11：
+        // 这不是错误，只是这条路走不通，安静跳过。
+        prefetch_set_reason(st, "本机无 X11 剪贴板");
+        return PREFETCH_SKIPPED;
+    }
+
+    var data: Buf = buf_new();
+    defer { buf_free(&data); }
+    var mime: [byte: 128] = [0: 128];
+    const ok: bool = x11_fetch_clipboard_filtered(&data, &mime[0], 128,
+        PREFETCH_X11_BUDGET_MS, true);
+    if !ok || data.len == 0 {
+        prefetch_set_reason(st, "剪贴板里没有图片");
+        return PREFETCH_EMPTY;
+    }
+
+    // 去重：板子里的图通常几秒内不变，而用户可能连按好几次 Ctrl-V。
+    // 数据相同就只把它设为当前项，**不**新建条目——否则每按一次就是一份新的几 MiB 文件。
+    if prefetch_same_as_current(store, data.data, data.len) {
+        prefetch_set_reason(st, "与当前项相同");
+        return PREFETCH_EMPTY;
+    }
+
+    const stored: !u32 = clip_put(store, data.data, data.len, "x11-clipboard" as &const byte);
+    var put_ok: bool = true;
+    const id: u32 = stored catch {
+        put_ok = false;
+        0 as u32;
+    };
+    _ = id;
+    if !put_ok {
+        prefetch_set_reason(st, "写入仓库失败");
+        return PREFETCH_FAILED;
+    }
+    prefetch_set_reason(st, "");
+    return PREFETCH_STORED;
+}
+
+/// 判断一段数据是否与仓库当前项完全相同（先比长度，再比字节）。
+/// 参数：store 为句柄，data/n 为候选数据。
+/// 返回值：相同返回 true。
+/// 说明：先比长度是省钱的——长度不同时连读都不用读（常见情况一次即否）。
+fn prefetch_same_as_current(store: &ClipStore, data: &const byte, n: usize) bool {
+    const cur: usize = clip_current_size(store);
+    if cur == 0 || cur != n {
+        return false;
+    }
+    var buf: Buf = buf_new();
+    defer { buf_free(&buf); }
+    const reserved: !void = buf_reserve(&buf, cur);
+    _ = reserved catch { return false; };
+    if buf.cap < cur {
+        return false;
+    }
+    var mime: [byte: 64] = [0: 64];
+    const got: usize = clip_get_current(store, buf.data, buf.cap, &mime[0], 64) catch { 0 as usize; };
+    if got != n {
+        return false;
+    }
+    return bytes_eq(buf.data, got, data, n);
+}

@@ -575,6 +575,30 @@ export fn clip_item_path(store: &ClipStore, id: u32, out: &byte, cap: usize) usi
     return join_path(out, cap, store.dir, &suffix[0]);
 }
 
+/// 当前条目的大小（字节）。
+/// 参数：store 为句柄。
+/// 返回值：字节数；没有当前项或查不到时返回 0。
+/// 说明：调用方据此给读取缓冲定容量。**不能用固定常数**：条目多大就要读多大，
+///       截断出来的内容照样能过 MIME 嗅探，用户只会看到「图坏了」而不是一条错误。
+export fn clip_current_size(store: &ClipStore) usize {
+    if store.current_id == 0 {
+        return 0;
+    }
+    var entries: [ClipEntry: 64] = [ClipEntry{}: 64];
+    const count: usize = clip_list(store, &entries[0], 64);
+    var i: usize = 0;
+    while i < count {
+        if entries[i].id == store.current_id {
+            if entries[i].size > (24 as u64) * (1024 as u64) * (1024 as u64) {
+                return 0;
+            }
+            return entries[i].size as usize;
+        }
+        i = i + 1;
+    }
+    return 0;
+}
+
 /// 读取当前条目的内容。
 /// 参数：store 为句柄，out/cap 为目标缓冲，mime/mime_cap 为可选 MIME 输出。
 /// 返回值：实际读取字节数；失败时返回错误。

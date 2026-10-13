@@ -43,11 +43,18 @@ use util.buf.buf_reserve;
 use util.buf.cstr_len;
 use util.buf.cstr_eq;
 use util.buf.bytes_eq;
+use std.time.now_ms;
+use x11.clip.x11_fetch_clipboard;
+use x11.clip.x11_maybe_available;
 
 /// 单次读取的数据上限（8 MiB）。
 const DATA_CAP: usize = 8 * 1024 * 1024;
 /// 已注册的 MIME 别名数量上限。
 const ALIAS_CAP: usize = 8;
+/// 本机 X11 剪贴板结果的缓存时长（毫秒）。
+/// 为什么需要它：远端应用通常先问 MIME 列表、再发 read 取数据，两次都要用到同一份
+/// 剪贴板；不缓存就会取两遍（每遍都要连服务器、握手、等所有者）。
+const X11_TTL_MS: u64 = 3000;
 
 /// 本地终端对 5522 的支持情况。
 export enum ClipMode {
@@ -74,6 +81,12 @@ export struct OscHandler {
     /// 统计：已处理的 read/write 次数，便于诊断。
     read_count: u32,
     write_count: u32,
+    /// 从本机 X11 剪贴板取回的缓存（仓库里没有可用内容时的第二来源）。
+    x11_data: Buf,
+    x11_mime: [byte: 128],
+    /// 最近一次取数的时间（毫秒）与是否取到过内容。
+    x11_at_ms: u64,
+    x11_have: bool,
     /// write 过程中累积的原始数据。
     pending: Buf,
 }
@@ -94,6 +107,10 @@ export fn handler_new(mode: ClipMode, store: &ClipStore) OscHandler {
         pending_pw_active: false,
         read_count: 0,
         write_count: 0,
+        x11_data: buf_new(),
+        x11_mime: [0: 128],
+        x11_at_ms: 0u64,
+        x11_have: false,
         pending: buf_new(),
     };
 }
@@ -103,6 +120,7 @@ export fn handler_new(mode: ClipMode, store: &ClipStore) OscHandler {
 /// 返回值：无。
 export fn handler_free(h: &OscHandler) void {
     buf_free(&h.pending);
+    buf_free(&h.x11_data);
 }
 
 /// 处理一个 OSC 负载（编号已在 payload 开头）。
@@ -268,7 +286,9 @@ fn build_mime_list(h: &OscHandler, list: &Buf, pw_ok: bool) !void {
     if h.store != null {
         var probe: Buf = buf_new();
         defer { buf_free(&probe); }
-        const reserved: !void = buf_reserve(&probe, 65536);
+        // 只要判断「有没有内容 + MIME 是什么」，不需要把图整个读进来；
+        // 但也不能小到读不出元信息 —— 这里读前 4 KiB 足够嗅探魔数。
+        const reserved: !void = buf_reserve(&probe, 4096);
         _ = reserved catch { };
         if probe.cap > 0 {
             const got: usize = clip_get_current(h.store, probe.data, probe.cap, &mime[0], 128) catch { 0 as usize; };
@@ -289,8 +309,81 @@ fn build_mime_list(h: &OscHandler, list: &Buf, pw_ok: bool) !void {
         }
         return;
     }
-    // 仓库为空时只报文本能力，避免应用误以为有图。
+    // 仓库里没有内容：向**本机**剪贴板取一次（用户眼前的板子，往往正是远端应用要的）。
+    // 取到了就报它的 MIME —— 这一步很关键：远端应用靠这里的列表决定「值不值得发 read」，
+    // 只报 text/plain 会让它在有空图片时依然走文本路径。
+    var local: Buf = buf_new();
+    defer { buf_free(&local); }
+    var local_mime: [byte: 128] = [0: 128];
+    const got_local: usize = local_clip(h, &local, &local_mime[0], 128);
+    if got_local > 0 && local_mime[0] != 0 {
+        try append_text(list, &local_mime[0]);
+        return;
+    }
+    // 仓库为空且本机也没有可用内容时只报文本能力，避免应用误以为有图。
     try append_text(list, "text/plain" as &const byte);
+}
+
+/// 取「用户眼前的剪贴板」的内容：先看本地仓库，再看本机 X11 剪贴板。
+/// 参数：h 为处理器，data 为数据输出，mime/mime_cap 为 MIME 输出。
+/// 返回值：字节数；0 表示没有任何内容。
+///
+/// 缓存策略（X11 取数要连服务器 + 握手 + 等所有者，不能每次 read 都来一遍）：
+///   * 仓库里有内容就直接用（用户显式 clip add 的东西优先级最高）；
+///   * 否则用 X11 缓存，超过 X11_TTL_MS 才重取一次 —— 远端应用常常先要 MIME 列表、
+///     再要数据，这两步之间不能重复取；
+///   * 失败也记时间：坏掉的 X 连接不会让每一次 read 都白等一个超时。
+fn local_clip(h: &OscHandler, data: &Buf, mime: &byte, mime_cap: usize) usize {
+    buf_clear(data);
+    if h.store != null {
+        const reserved: !void = buf_reserve(data, DATA_CAP);
+        _ = reserved catch { };
+        if data.cap > 0 {
+            var stored_mime: [byte: 128] = [0: 128];
+            const got: usize = clip_get_current(h.store, data.data, data.cap,
+                &stored_mime[0], 128) catch { 0 as usize; };
+            if got > 0 {
+                data.len = got;
+                if mime != null && mime_cap > 0 {
+                    _ = field_set(mime, mime_cap, &stored_mime[0]);
+                }
+                return got;
+            }
+        }
+    }
+    const fresh: bool = h.x11_at_ms > 0u64 && now_ms_best() - h.x11_at_ms < X11_TTL_MS;
+    if !fresh {
+        h.x11_at_ms = now_ms_best();
+        buf_clear(&h.x11_data);
+        var got_mime: [byte: 128] = [0: 128];
+        const ok: bool = x11_maybe_available() &&
+            x11_fetch_clipboard(&h.x11_data, &got_mime[0], 128);
+        h.x11_have = ok && h.x11_data.len > 0;
+        if h.x11_have {
+            _ = field_set(&h.x11_mime[0], 128, &got_mime[0]);
+        }
+    }
+    if !h.x11_have || h.x11_data.len == 0 {
+        return 0;
+    }
+    const copied: !void = buf_append(data, h.x11_data.data, h.x11_data.len);
+    _ = copied catch { return 0; };
+    if mime != null && mime_cap > 0 {
+        _ = field_set(mime, mime_cap, &h.x11_mime[0]);
+    }
+    return h.x11_data.len;
+}
+
+/// 当前时间（毫秒）；取不到时退回 1（保证 x11_at_ms 非 0，缓存逻辑照常工作）。
+/// 参数：无。
+/// 返回值：毫秒时间戳。
+fn now_ms_best() u64 {
+    const got: !u64 = now_ms();
+    const v: u64 = got catch { 1 as u64; };
+    if v == 0u64 {
+        return 1 as u64;
+    }
+    return v;
 }
 
 /// 发送当前剪贴项的数据（按 4096 字节分块）。
@@ -324,19 +417,15 @@ fn send_current_data(h: &OscHandler, out: &Buf, request: &const byte, n: usize, 
         _ = e2 catch { };
         return;
     }
-    const got: usize = clip_get_current(h.store, data.data, data.cap, &mime[0], 128) catch {
+    const got: usize = local_clip(h, &data, &mime[0], 128);
+    if got == 0 {
         const e3: !void = emit_read_status(out, "ENOSYS" as &const byte, null, 0, false);
         _ = e3 catch { };
         return;
-    };
-    if got == 0 {
-        const e4: !void = emit_read_status(out, "ENOSYS" as &const byte, null, 0, false);
-        _ = e4 catch { };
-        return;
     }
     if !mime_matches(&mime[0], decoded.data, decoded.len, h) {
-        const e5: !void = emit_read_status(out, "ENOSYS" as &const byte, null, 0, false);
-        _ = e5 catch { };
+        const e4: !void = emit_read_status(out, "ENOSYS" as &const byte, null, 0, false);
+        _ = e4 catch { };
         return;
     }
     _ = pw_ok;

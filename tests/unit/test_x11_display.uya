@@ -1,0 +1,170 @@
+// tests/unit/test_x11_display.uya - X11 剪贴板读取里的纯函数单元测试
+// 说明：这里只测不碰网络的解析逻辑（DISPLAY → 套接字路径、大小端读写、XAUTHORITY
+//       记录解析）。真正的协议交互在 tests/integration/t12 里用假 X 服务器端到端验证
+//       —— 单元测试看不到「事件码带 0x80 位」这类线上细节，所以两者都要有。
+
+use std.testing.assert_eq_i64;
+use std.testing.expect;
+
+use x11.clip.x11_display_socket;
+use x11.clip.x11_rd16;
+use x11.clip.x11_rd32;
+use x11.clip.x11_xauth_read;
+use util.buf.cstr_len;
+
+test "DISPLAY 解析：常见写法都指向 /tmp/.X11-unix/X<n>" {
+    var out: [byte: 256] = [0: 256];
+    try expect(x11_display_socket(":0" as &const byte, &out[0], 256));
+    try expect(cstr_eq(&out[0], "/tmp/.X11-unix/X0" as &const byte));
+
+    try expect(x11_display_socket(":1" as &const byte, &out[0], 256));
+    try expect(cstr_eq(&out[0], "/tmp/.X11-unix/X1" as &const byte));
+
+    // 带屏幕号（:0.0）与显式 unix: 前缀都应得到同一个套接字。
+    try expect(x11_display_socket(":0.0" as &const byte, &out[0], 256));
+    try expect(cstr_eq(&out[0], "/tmp/.X11-unix/X0" as &const byte));
+    try expect(x11_display_socket("unix:0" as &const byte, &out[0], 256));
+    try expect(cstr_eq(&out[0], "/tmp/.X11-unix/X0" as &const byte));
+}
+
+test "DISPLAY 解析：两位以上显示号去前导零" {
+    var out: [byte: 256] = [0: 256];
+    try expect(x11_display_socket(":10" as &const byte, &out[0], 256));
+    try expect(cstr_eq(&out[0], "/tmp/.X11-unix/X10" as &const byte));
+}
+
+test "DISPLAY 解析：远程主机一律拒绝（本机剪贴板必须在本机）" {
+    var out: [byte: 256] = [0: 256];
+    // host:0 要走 TCP；连过去读的是**那台机器**的剪贴板，不是用户眼前的，
+    // 所以必须拒绝而不是"尽力而为"。
+    try expect(!x11_display_socket("somewhere:0" as &const byte, &out[0], 256));
+    try expect(!x11_display_socket("localhost:0" as &const byte, &out[0], 256));
+}
+
+test "DISPLAY 解析：畸形输入不崩且返回 false" {
+    var out: [byte: 256] = [0: 256];
+    try expect(!x11_display_socket("" as &const byte, &out[0], 256));
+    try expect(!x11_display_socket(":abc" as &const byte, &out[0], 256));
+    try expect(!x11_display_socket("nocolon" as &const byte, &out[0], 256));
+    // 目标缓冲太小：拒绝而不是截断出一个错路径
+    var small: [byte: 8] = [0: 8];
+    try expect(!x11_display_socket(":0" as &const byte, &small[0], 8));
+}
+
+test "字节序：X 协议是小端（与 Xauthority 文件的大端相反）" {
+    const le16: [byte: 2] = [0x34, 0x12];
+    try assert_eq_i64(x11_rd16(&le16[0]) as i64, 0x1234);
+    const le32: [byte: 4] = [0x78, 0x56, 0x34, 0x12];
+    try assert_eq_i64(x11_rd32(&le32[0]) as i64, 0x12345678);
+    // 0x80 的位移：靠它区分「应答长度」这种小值
+    const le32b: [byte: 4] = [0x00, 0x01, 0x00, 0x00];
+    try assert_eq_i64(x11_rd32(&le32b[0]) as i64, 256);
+}
+
+/// 比较 C 字符串。
+/// 参数：a/b 为待比较字符串。
+/// 返回值：相等返回 true。
+fn cstr_eq(a: &const byte, b: &const byte) bool {
+    if cstr_len(a) != cstr_len(b) {
+        return false;
+    }
+    var i: usize = 0;
+    while a[i] != 0 {
+        if a[i] != b[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+test "XAUTHORITY 解析：只挑 display 匹配的那条记录" {
+    // 构造一个两条记录的 Xauthority 文件（**大端**长度字段）。
+    // 记录 = family(2) addr_len(2) addr num_len(2) num name_len(2) name data_len(2) data
+    var raw: [byte: 256] = [0: 256];
+    var n: usize = 0;
+    // 记录 1：display "0"，cookie 0xAA
+    n = put_be16_v(&raw[0], n, 1);
+    n = put_be16_v(&raw[0], n, 1);
+    raw[n] = 65 as byte;      // addr "A"
+    n = n + 1;
+    n = put_be16_v(&raw[0], n, 1);   // num_len
+    raw[n] = 48 as byte;           // "0"
+    n = n + 1;
+    n = put_be16_v(&raw[0], n, 18);  // name_len "MIT-MAGIC-COOKIE-1"
+    n = put_str(&raw[0], n, "MIT-MAGIC-COOKIE-1");
+    n = put_be16_v(&raw[0], n, 1);   // data_len
+    raw[n] = 0xAA as byte;
+    n = n + 1;
+    // 记录 2：display "1"，cookie 0xBB
+    n = put_be16_v(&raw[0], n, 1);
+    n = put_be16_v(&raw[0], n, 1);
+    raw[n] = 66 as byte;
+    n = n + 1;
+    n = put_be16_v(&raw[0], n, 1);
+    raw[n] = 49 as byte;           // "1"
+    n = n + 1;
+    n = put_be16_v(&raw[0], n, 18);
+    n = put_str(&raw[0], n, "MIT-MAGIC-COOKIE-1");
+    n = put_be16_v(&raw[0], n, 1);
+    raw[n] = 0xBB as byte;
+    n = n + 1;
+
+    const path: &const byte = "/tmp/uyassh_xauth_test";
+    write_file(path, &raw[0], n);
+
+    var name: [byte: 256] = [0: 256];
+    var data: [byte: 64] = [0: 64];
+    var name_len: usize = 0;
+    var data_len: usize = 0;
+    // display 1 → 拿到第二条（0xBB）
+    try expect(x11_xauth_read(path, "1" as &const byte, &name[0], 256, &data[0], 64,
+        &name_len, &data_len));
+    try assert_eq_i64(data_len as i64, 1);
+    try assert_eq_i64(data[0] as i64, 0xBB);
+    try expect(cstr_eq(&name[0], "MIT-MAGIC-COOKIE-1" as &const byte));
+    // display 0 → 第一条（0xAA）
+    try expect(x11_xauth_read(path, "0" as &const byte, &name[0], 256, &data[0], 64,
+        &name_len, &data_len));
+    try assert_eq_i64(data[0] as i64, 0xAA);
+    // 没有的 display → false（不是「随便给一条」）
+    try expect(!x11_xauth_read(path, "7" as &const byte, &name[0], 256, &data[0], 64,
+        &name_len, &data_len));
+}
+
+/// 写大端 u16（**Xauthority 文件用大端**，写错就一条记录都读不出来）。
+/// 参数：p 为目标，off 为偏移，v 为值。
+/// 返回值：新偏移。
+fn put_be16_v(p: &byte, off: usize, v: u32) usize {
+    p[off] = ((v >> 8) & 255u32) as byte;
+    p[off + 1] = (v & 255u32) as byte;
+    return off + 2;
+}
+
+/// 写字符串。
+/// 参数：p 为目标，off 为偏移，s 为内容。
+/// 返回值：新偏移。
+fn put_str(p: &byte, off: usize, s: &const byte) usize {
+    var i: usize = 0;
+    while s[i] != 0 {
+        p[off + i] = s[i];
+        i = i + 1;
+    }
+    return off + i;
+}
+
+/// 写文件（测试夹具）。
+/// 参数：path 为路径，data/n 为内容。
+/// 返回值：无。
+fn write_file(path: &const byte, data: &const byte, n: usize) void {
+    const fd: i32 = sys_open(path, (O_WRONLY | O_CREAT | O_TRUNC) as i32, 420) catch { return; };
+    var written: usize = 0;
+    while written < n {
+        const put: isize = sys_write(fd, data + written, n - written) catch { return; };
+        if put <= 0 {
+            break;
+        }
+        written = written + (put as usize);
+    }
+    _ = sys_close(fd) catch { 0 as i32; };
+}

@@ -52,6 +52,8 @@ export struct WrapperState {
     prefix_byte: byte,
     /// 配置文件指定的剪贴板目录（空表示默认）。
     clip_dir: [byte: 256],
+    /// 是否在 Ctrl-V 时预取本机剪贴板图片（命令行优先，其次配置文件）。
+    ctrl_v_import: bool,
 }
 
 /// 运行包装会话。
@@ -72,6 +74,7 @@ export fn wrapper_run(opts: &Options) i32 {
         local_supports_5522: cli_local_supports_5522(),
         prefix_byte: opts.prefix_byte,
         clip_dir: [0: 256],
+        ctrl_v_import: opts.ctrl_v_import,
     };
     const cfg_file: Config = config_load();
     if cfg_file.loaded {
@@ -83,6 +86,11 @@ export fn wrapper_run(opts: &Options) i32 {
         }
         if state.prefix_byte == 29 as byte && cfg_file.prefix_byte != 29 as byte {
             state.prefix_byte = cfg_file.prefix_byte;
+        }
+        // 配置文件的这个键默认是开的，所以只有它**被显式写过**、且命令行没说这件事时
+        // 才生效：优先级是命令行 > 配置文件（与 --prefix 等选项一致）。
+        if cfg_file.ctrl_v_import_set && !opts.ctrl_v_import_set {
+            state.ctrl_v_import = cfg_file.ctrl_v_import;
         }
         var ci: usize = 0;
         while cfg_file.clip_dir[ci] != 0 && ci + 1 < 256 {
@@ -146,7 +154,7 @@ fn wrapper_run_pty(opts: &Options, state: &WrapperState) i32 {
     const clip_opened: !void = clip_store_open(&store, clip_base);
     _ = clip_opened catch { store_ready = false; };
     const cfg: SessionConfig = session_config(state.local_fd, state.prefix_byte,
-        state.local_supports_5522, &store, opts.verbose);
+        state.local_supports_5522, &store, opts.verbose, state.ctrl_v_import);
     const result: SessionResult = session_run(&session, &cfg);
     if store_ready {
         clip_store_close(&store);
