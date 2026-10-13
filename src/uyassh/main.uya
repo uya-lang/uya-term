@@ -1,0 +1,60 @@
+// src/uyassh/main.uya - uya-ssh 入口
+// 说明：解析命令行后分发到内建剪贴板子命令或 PTY 透传包装器。
+
+use std.runtime.get_argc;
+use std.runtime.saved_argv;
+
+use cli.cli.Options;
+use cli.cli.parse_args;
+use cli.cli.print_help;
+use cli.cli.is_clip_invocation;
+use util.out.out_str;
+
+const VERSION: &const byte = "uya-ssh 0.1.0 (uya-term)\n";
+
+/// 程序入口。
+/// 参数：无（参数通过 std.runtime 的 saved_argc/saved_argv 获取）。
+/// 返回值：进程退出码。
+export fn main() i32 {
+    const argc: i32 = get_argc();
+    const argv: &(&const byte) = saved_argv as &(&const byte);
+    var prog: &const byte = "uya-ssh";
+    if argv != null && argc > 0 {
+        prog = argv[0];
+    }
+    var opts: Options = parse_args(argc, argv) catch {
+        out_str("uya-ssh: 参数错误\n");
+        print_help(prog);
+        return 2;
+    };
+    if opts.print_help {
+        print_help(prog);
+        return 0;
+    }
+    if opts.show_version {
+        out_str(VERSION);
+        return 0;
+    }
+    if is_clip_invocation(&opts) {
+        return run_clip(&opts);
+    }
+    return run_wrapper(&opts);
+}
+
+/// 执行内建 clip 子命令（M2 实现）。
+/// 参数：opts 为解析后的选项。
+/// 返回值：进程退出码。
+fn run_clip(opts: &Options) i32 {
+    _ = opts;
+    out_str("uya-ssh: clip 子命令尚未实现\n");
+    return 3;
+}
+
+/// 执行 PTY 包装透传（M1 实现）。
+/// 参数：opts 为解析后的选项。
+/// 返回值：子进程退出码或包装器错误码。
+fn run_wrapper(opts: &Options) i32 {
+    _ = opts;
+    out_str("uya-ssh: 包装器尚未实现\n");
+    return 3;
+}

@@ -1,0 +1,262 @@
+// src/uyassh/util/buf.uya - 动态字节缓冲与基础字节工具
+// 说明：本模块是所有解析/编解码路径的基础设施；缓冲基于 std.mem.heap 分配器，
+//       所有函数均不 panic，容量不足时返回错误。
+
+use std.mem.heap.get_heap_allocator;
+use std.mem.allocator.IAllocator;
+use std.mem.mem.mem_copy;
+use std.mem.mem.mem_set;
+
+export error BufOutOfMemory;
+export error BufTooSmall;
+export error BufInvalid;
+
+/// 可增长字节缓冲。
+/// 字段：data 为堆缓冲指针，len 为已用字节数，cap 为容量（字节）。
+export struct Buf {
+    data: &byte,
+    len: usize,
+    cap: usize,
+}
+
+/// 创建一个空缓冲。
+/// 参数：无。
+/// 返回值：len=0、cap=0 的缓冲；使用前需保证容量或调用 buf_reserve。
+export fn buf_new() Buf {
+    return Buf{ data: null, len: 0, cap: 0 };
+}
+
+/// 确保缓冲容量至少为 needed 字节。
+/// 参数：b 为目标缓冲，needed 为期望容量的最小值。
+/// 返回值：无；失败时返回错误（分配失败）。
+export fn buf_reserve(b: &Buf, needed: usize) !void {
+    if needed <= b.cap {
+        return;
+    }
+    var want: usize = b.cap;
+    if want == 0 {
+        want = 64;
+    }
+    while want < needed {
+        want = want * 2;
+    }
+    const allocator: &IAllocator = get_heap_allocator() as &IAllocator;
+    const fresh: &byte = try allocator.alloc(want);
+    if b.len > 0 && b.data != null {
+        mem_copy(fresh, b.data, b.len);
+    }
+    if b.data != null {
+        allocator.dealloc(b.data);
+    }
+    b.data = fresh;
+    b.cap = want;
+}
+
+/// 释放缓冲持有的内存并复位。
+/// 参数：b 为目标缓冲。
+/// 返回值：无。释放后缓冲处于 buf_new 状态，可再次使用。
+export fn buf_free(b: &Buf) void {
+    if b.data != null {
+        const allocator: &IAllocator = get_heap_allocator() as &IAllocator;
+        allocator.dealloc(b.data);
+    }
+    b.data = null;
+    b.len = 0;
+    b.cap = 0;
+}
+
+/// 清空缓冲内容但保留容量。
+/// 参数：b 为目标缓冲。
+/// 返回值：无。
+export fn buf_clear(b: &Buf) void {
+    b.len = 0;
+}
+
+/// 追加一段字节。
+/// 参数：b 为目标缓冲，src 为源字节指针，n 为源字节数。
+/// 返回值：无；分配失败时返回错误。
+export fn buf_append(b: &Buf, src: &const byte, n: usize) !void {
+    if n == 0 {
+        return;
+    }
+    if src == null {
+        return error.BufInvalid;
+    }
+    try buf_reserve(b, b.len + n);
+    mem_copy(b.data + b.len, src, n);
+    b.len = b.len + n;
+}
+
+/// 追加一个字节。
+/// 参数：b 为目标缓冲，v 为要追加的字节。
+/// 返回值：无；分配失败时返回错误。
+export fn buf_append_byte(b: &Buf, v: byte) !void {
+    try buf_reserve(b, b.len + 1);
+    b.data[b.len] = v;
+    b.len = b.len + 1;
+}
+
+/// 追加一个以 '\0' 结尾字符串（不含结尾 '\0'）。
+/// 参数：b 为目标缓冲，s 为 C 字符串指针。
+/// 返回值：无；分配失败时返回错误。
+export fn buf_append_cstr(b: &Buf, s: &const byte) !void {
+    if s == null {
+        return;
+    }
+    var n: usize = 0;
+    while s[n] != 0 {
+        n = n + 1;
+    }
+    try buf_append(b, s, n);
+}
+
+/// 从缓冲尾部删除 n 个字节。
+/// 参数：b 为目标缓冲，n 为删除字节数。
+/// 返回值：无；n 超过已用长度时清空缓冲。
+export fn buf_truncate_tail(b: &Buf, n: usize) void {
+    if n >= b.len {
+        b.len = 0;
+        return;
+    }
+    b.len = b.len - n;
+}
+
+/// 丢弃缓冲前 n 个字节，其余字节前移。
+/// 参数：b 为目标缓冲，n 为丢弃字节数。
+/// 返回值：无；n 超过已用长度时清空缓冲。
+export fn buf_drop_prefix(b: &Buf, n: usize) void {
+    if n == 0 {
+        return;
+    }
+    if n >= b.len {
+        b.len = 0;
+        return;
+    }
+    const remain: usize = b.len - n;
+    mem_copy(b.data, b.data + n, remain);
+    b.len = remain;
+}
+
+/// 读取大端 u32。
+/// 参数：p 为至少 4 字节的源指针。
+/// 返回值：按大端解析出的 u32。
+export fn read_be_u32(p: &const byte) u32 {
+    const b0: u32 = p[0] as u32;
+    const b1: u32 = p[1] as u32;
+    const b2: u32 = p[2] as u32;
+    const b3: u32 = p[3] as u32;
+    return (b0 << 24) | (b1 << 16) | (b2 << 8) | b3;
+}
+
+/// 写入大端 u32。
+/// 参数：p 为至少 4 字节的目标指针，v 为待写值。
+/// 返回值：无。
+export fn write_be_u32(p: &byte, v: u32) void {
+    p[0] = ((v >> 24) & 255u32) as byte;
+    p[1] = ((v >> 16) & 255u32) as byte;
+    p[2] = ((v >> 8) & 255u32) as byte;
+    p[3] = (v & 255u32) as byte;
+}
+
+/// 计算以 '\0' 结尾字符串长度（不含结尾）。
+/// 参数：s 为 C 字符串指针。
+/// 返回值：字节长度；s 为空指针时返回 0。
+export fn cstr_len(s: &const byte) usize {
+    if s == null {
+        return 0;
+    }
+    var n: usize = 0;
+    while s[n] != 0 {
+        n = n + 1;
+    }
+    return n;
+}
+
+/// 判断两个以 '\0' 结尾字符串是否相等。
+/// 参数：a、b 为待比较的 C 字符串。
+/// 返回值：相等返回 true，否则返回 false。
+export fn cstr_eq(a: &const byte, b: &const byte) bool {
+    if a == null || b == null {
+        return false;
+    }
+    var i: usize = 0;
+    while true {
+        if a[i] != b[i] {
+            return false;
+        }
+        if a[i] == 0 {
+            return true;
+        }
+        i = i + 1;
+    }
+}
+
+/// 判断字节切片与 C 字符串是否相等。
+/// 参数：data 为字节指针，n 为字节数，s 为 C 字符串。
+/// 返回值：相等返回 true，否则返回 false。
+export fn bytes_eq_cstr(data: &const byte, n: usize, s: &const byte) bool {
+    if data == null || s == null {
+        return false;
+    }
+    if cstr_len(s) != n {
+        return false;
+    }
+    var i: usize = 0;
+    while i < n {
+        if data[i] != s[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// 判断两段字节是否相等。
+/// 参数：a/an 与 b/bn 分别为两段字节与长度。
+/// 返回值：相等返回 true，否则返回 false。
+export fn bytes_eq(a: &const byte, an: usize, b: &const byte, bn: usize) bool {
+    if an != bn {
+        return false;
+    }
+    if an == 0 {
+        return true;
+    }
+    if a == null || b == null {
+        return false;
+    }
+    var i: usize = 0;
+    while i < an {
+        if a[i] != b[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// 在 [data, data+n) 中查找子串首次出现的位置。
+/// 参数：data/n 为被搜索字节，needle/nlen 为待搜索子串。
+/// 返回值：找到时返回下标，未找到返回 -1。
+export fn bytes_find(data: &const byte, n: usize, needle: &const byte, nlen: usize) i64 {
+    if needle == null || nlen == 0 || nlen > n {
+        return -1 as i64;
+    }
+    var i: usize = 0;
+    while i + nlen <= n {
+        if bytes_eq(data + i, nlen, needle, nlen) {
+            return i as i64;
+        }
+        i = i + 1;
+    }
+    return -1 as i64;
+}
+
+/// 把字节缓冲区清零（用于擦除敏感数据）。
+/// 参数：p 为起始指针，n 为字节数。
+/// 返回值：无。
+export fn zero_bytes(p: &byte, n: usize) void {
+    if p == null || n == 0 {
+        return;
+    }
+    mem_set(p, 0, n);
+}

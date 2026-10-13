@@ -1,0 +1,204 @@
+// src/uyassh/cli/cli.uya - 命令行解析
+// 说明：uya-ssh 的包装器选项在这里解析；无法识别的参数原样保留、按顺序追加到
+//       子进程（默认 ssh）的参数向量尾部，不做 shell 拼接。
+
+use util.buf.cstr_eq;
+use util.buf.cstr_len;
+use util.buf.bytes_eq_cstr;
+use util.out.out_str;
+
+export error CliNoCommand;
+export error CliMissingValue;
+
+/// 透传模式：子进程是否使用伪终端。
+export enum PtyMode {
+    always,
+    never,
+}
+
+/// 解析后的命令行。
+/// 字段：program 为包装的子进程路径，args 为其参数向量（'\0' 结尾），
+///       pty_mode 为伪终端策略，prefix_byte 为本地前缀键，show_version 表示只打印版本，
+///       print_help 表示只打印帮助，clip_action 为内建 clip 子命令（空表示无）。
+export struct Options {
+    program: &const byte,
+    args: [&const byte: 64],
+    arg_count: usize,
+    pty_mode: PtyMode,
+    prefix_byte: byte,
+    show_version: bool,
+    print_help: bool,
+    clip_action: &const byte,
+    clip_operand: &const byte,
+    verbose: bool,
+}
+
+/// 解析命令行参数。
+/// 参数：argc/argv 为进程参数（来自 std.runtime.entry）。
+/// 返回值：解析结果；参数非法时返回错误。
+export fn parse_args(argc: i32, argv: &(&const byte)) !Options {
+    var opts: Options = Options{
+        program: "ssh",
+        args: [null: 64],
+        arg_count: 0,
+        pty_mode: PtyMode.always,
+        prefix_byte: 29 as byte,
+        show_version: false,
+        print_help: false,
+        clip_action: null,
+        clip_operand: null,
+        verbose: false,
+    };
+    var i: i32 = 1;
+    var passthrough: bool = false;
+    while i < argc {
+        const a: &const byte = argv[i as usize] as &const byte;
+        if passthrough {
+            try push_arg(&opts, a);
+            i = i + 1;
+            continue;
+        }
+        if cstr_eq(a, "--") {
+            passthrough = true;
+            i = i + 1;
+            continue;
+        } else if cstr_eq(a, "--no-pty") {
+            opts.pty_mode = PtyMode.never;
+        } else if cstr_eq(a, "--pty") {
+            opts.pty_mode = PtyMode.always;
+        } else if cstr_eq(a, "-h") || cstr_eq(a, "--help") {
+            opts.print_help = true;
+        } else if cstr_eq(a, "--version") {
+            opts.show_version = true;
+        } else if cstr_eq(a, "-v") || cstr_eq(a, "--verbose") {
+            opts.verbose = true;
+        } else if starts_with(a, "--prefix=") {
+            opts.prefix_byte = parse_prefix(a + 9);
+        } else if starts_with(a, "--program=") {
+            opts.program = a + 10;
+        } else if cstr_eq(a, "clip") {
+            return parse_clip(opts, argc, argv, i);
+        } else if cstr_eq(a, "ssh") {
+            // 显式指明走透传（默认行为），忽略该词。
+        } else {
+            try push_arg(&opts, a);
+        }
+        i = i + 1;
+    }
+    return opts;
+}
+
+/// 解析 clip 子命令。
+/// 参数：opts 为已解析前缀，argc/argv 为进程参数，pos 为 "clip" 所在下标。
+/// 返回值：填好 clip_action/clip_operand 的选项；缺少动作时返回错误。
+fn parse_clip(opts: Options, argc: i32, argv: &(&const byte), pos: i32) !Options {
+    var out: Options = opts;
+    if pos + 1 >= argc {
+        return error.CliNoCommand;
+    }
+    out.clip_action = argv[(pos + 1) as usize] as &const byte;
+    if pos + 2 < argc {
+        out.clip_operand = argv[(pos + 2) as usize] as &const byte;
+    }
+    return out;
+}
+
+/// 追加一个透传参数。
+/// 参数：opts 为目标选项，a 为参数（'\0' 结尾）。
+/// 返回值：无；参数过多时返回错误。
+fn push_arg(opts: &Options, a: &const byte) !void {
+    if opts.arg_count >= 64 {
+        return error.CliNoCommand;
+    }
+    opts.args[opts.arg_count] = a;
+    opts.arg_count = opts.arg_count + 1;
+}
+
+/// 判断字符串是否以给定前缀开头。
+/// 参数：s 为待检查字符串，prefix 为前缀（均 '\0' 结尾）。
+/// 返回值：是则返回 true。
+fn starts_with(s: &const byte, prefix: &const byte) bool {
+    const plen: usize = cstr_len(prefix);
+    if cstr_len(s) < plen {
+        return false;
+    }
+    var i: usize = 0;
+    while i < plen {
+        if s[i] != prefix[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// 解析前缀键写法（单字符，或 ^X / C-x 形式）。
+/// 参数：text 为以 '\0' 结尾的写法文本。
+/// 返回值：对应的控制字节；无法识别时返回 29（Ctrl-]）。
+fn parse_prefix(text: &const byte) byte {
+    if text == null || text[0] == 0 {
+        return 29 as byte;
+    }
+    if text[0] == 94 as byte && text[1] != 0 {
+        // "^X"：大写字母转控制码，'?' 为 DEL。
+        if text[1] == 63 as byte {
+            return 127 as byte;
+        }
+        var c: byte = text[1];
+        if c >= 97 as byte && c <= 122 as byte {
+            c = (c - 32 as byte) as! byte catch { 29 as byte; };
+        }
+        if c >= 64 as byte && c <= 95 as byte {
+            return (c - 64 as byte) as! byte catch { 29 as byte; };
+        }
+        return 29 as byte;
+    }
+    return text[0];
+}
+
+/// 判断是否是内建 clip 调用。
+/// 参数：opts 为解析结果。
+/// 返回值：clip_action 非空时返回 true。
+export fn is_clip_invocation(opts: &Options) bool {
+    return opts.clip_action != null;
+}
+
+/// 判断动作名是否等于给定名字。
+/// 参数：opts 为解析结果，name 为待比较动作名（'\0' 结尾）。
+/// 返回值：相等返回 true。
+export fn clip_action_is(opts: &Options, name: &const byte) bool {
+    if opts.clip_action == null {
+        return false;
+    }
+    return cstr_eq(opts.clip_action, name);
+}
+
+/// 打印帮助文本到标准输出。
+/// 参数：prog 为程序名（'\0' 结尾）。
+/// 返回值：无。
+export fn print_help(prog: &const byte) void {
+    out_str("用法: ");
+    out_str(prog);
+    out_str(" [选项] [--] <ssh 参数...>\n\n");
+    out_str("说明: 用本机伪终端包住 ssh（或任意程序）并在本地实现 OSC 5522/52 剪贴板协议，\n");
+    out_str("      使远端 TUI 应用可以粘贴图片。非本程序选项的参数原样转交给子进程。\n\n");
+    out_str("选项:\n");
+    out_str("  --no-pty            不使用伪终端（stdout 走管道；不做 OSC 拦截）\n");
+    out_str("  --pty               强制使用伪终端（默认）\n");
+    out_str("  --program=<路径>    包装的程序（默认 ssh）\n");
+    out_str("  --prefix=<键>       本地前缀键，形如 ^] (默认) 或 ^a\n");
+    out_str("  -v, --verbose       打印调试信息到 stderr\n");
+    out_str("  --version           打印版本\n");
+    out_str("  -h, --help          打印本帮助\n\n");
+    out_str("内建剪贴板命令:\n");
+    out_str("  clip add <文件>     把图片/文本放入剪贴板仓库\n");
+    out_str("  clip list           列出仓库内容\n");
+    out_str("  clip use <序号>     选择当前剪贴项\n");
+    out_str("  clip clear          清空当前剪贴项\n\n");
+    out_str("前缀键（默认 ^]）后接:\n");
+    out_str("  p   向远端应用发送一次粘贴事件（5522 模式）；若不支持则注入 OSC 52 文本\n");
+    out_str("  t   以文本形式粘贴当前剪贴项\n");
+    out_str("  l   在本地列出剪贴板仓库\n");
+    out_str("  q   断开连接\n");
+    out_str("  ^]  发送一个字面前缀字节\n");
+}

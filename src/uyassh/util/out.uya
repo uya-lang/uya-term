@@ -1,0 +1,167 @@
+// src/uyassh/util/out.uya - 标准输出/错误输出辅助
+// 说明：编译器的 @print 对 &const byte 变量会走整数格式（只对字面量正确），
+//       因此本模块统一用 libc 写接口输出动态字符串与数字。
+
+use std.mem.mem.mem_set;
+
+use util.buf.cstr_len;
+use util.buf.Buf;
+use util.buf.buf_new;
+use util.buf.buf_append_byte;
+use util.buf.buf_free;
+use util.buf.buf_reserve;
+
+extern "libc" fn write(fd: i32, buf: &const byte, count: usize) isize;
+
+const OUT_FD: i32 = 1;
+const ERR_FD: i32 = 2;
+
+/// 向标准输出写入一段字节。
+/// 参数：data 为源指针，n 为字节数。
+/// 返回值：实际写入的字节数；出错时返回 -1。
+export fn out_bytes(data: &const byte, n: usize) isize {
+    if data == null || n == 0 {
+        return 0 as isize;
+    }
+    return write(OUT_FD, data, n);
+}
+
+/// 向标准输出写入以 '\0' 结尾字符串。
+/// 参数：s 为 C 字符串。
+/// 返回值：实际写入的字节数；出错时返回 -1。
+export fn out_str(s: &const byte) isize {
+    if s == null {
+        return 0 as isize;
+    }
+    return write(OUT_FD, s, cstr_len(s));
+}
+
+/// 向标准错误写入以 '\0' 结尾字符串。
+/// 参数：s 为 C 字符串。
+/// 返回值：实际写入的字节数；出错时返回 -1。
+export fn err_str(s: &const byte) isize {
+    if s == null {
+        return 0 as isize;
+    }
+    return write(ERR_FD, s, cstr_len(s));
+}
+
+/// 向标准错误写入一段字节。
+/// 参数：data 为源指针，n 为字节数。
+/// 返回值：实际写入的字节数；出错时返回 -1。
+export fn err_bytes(data: &const byte, n: usize) isize {
+    if data == null || n == 0 {
+        return 0 as isize;
+    }
+    return write(ERR_FD, data, n);
+}
+
+/// 把有符号整数格式化为十进制文本。
+/// 参数：buf 为输出缓冲，value 为待格式化数值。
+/// 返回值：写入 buf 的字节数。
+export fn format_i64(buf: &byte, cap: usize, value: i64) usize {
+    var tmp: [byte: 24] = [0: 24];
+    var n: usize = 0;
+    var neg: bool = false;
+    var v: u64 = 0;
+    if value < 0 {
+        neg = true;
+        v = (0 - value) as u64;
+    } else {
+        v = value as u64;
+    }
+    if v == 0 {
+        tmp[0] = 48 as byte;
+        n = 1;
+    }
+    while v > 0 {
+        const digit: u64 = v % 10u64;
+        tmp[n] = (48u64 + digit) as byte;
+        n = n + 1;
+        v = v / 10u64;
+    }
+    var total: usize = n;
+    if neg {
+        total = total + 1;
+    }
+    if total > cap {
+        return 0;
+    }
+    var i: usize = 0;
+    if neg {
+        buf[0] = 45 as byte;
+        i = 1;
+    }
+    while i < total {
+        buf[i] = tmp[total - 1 - i];
+        i = i + 1;
+    }
+    return total;
+}
+
+/// 向标准输出写入一个有符号整数（十进制，带换行可选）。
+/// 参数：value 为数值，newline 为是否补换行。
+/// 返回值：实际写入的字节数。
+export fn out_i64(value: i64, newline: bool) usize {
+    var buf: [byte: 24] = [0: 24];
+    const n: usize = format_i64(&buf[0], 24, value);
+    var written: usize = 0;
+    if n > 0 {
+        written = write(OUT_FD, &buf[0], n) as usize;
+    }
+    if newline {
+        const nl: [byte: 1] = [10];
+        _ = write(OUT_FD, &nl[0], 1);
+        written = written + 1;
+    }
+    return written;
+}
+
+/// 以大写十六进制输出一段字节（便于调试）。
+/// 参数：data 为源指针，n 为字节数。
+/// 返回值：无。
+export fn out_hex(data: &const byte, n: usize) void {
+    if data == null {
+        return;
+    }
+    var line: [byte: 64] = [0: 64];
+    var i: usize = 0;
+    while i < n {
+        const b: byte = data[i];
+        line[0] = hex_digit(((b as u32) >> 4) & 15u32);
+        line[1] = hex_digit((b as u32) & 15u32);
+        _ = write(OUT_FD, &line[0], 2);
+        i = i + 1;
+    }
+}
+
+fn hex_digit(v: u32) byte {
+    if v < 10u32 {
+        return (48u32 + v) as byte;
+    }
+    return (87u32 + v) as byte;
+}
+
+/// 把 u64 以十进制追加到缓冲。
+/// 参数：b 为目标缓冲，value 为数值。
+/// 返回值：无；分配失败时静默忽略。
+export fn buf_append_u64(b: &Buf, value: u64) void {
+    var tmp: [byte: 24] = [0: 24];
+    var n: usize = 0;
+    var v: u64 = value;
+    if v == 0 {
+        tmp[0] = 48 as byte;
+        n = 1;
+    }
+    while v > 0 {
+        tmp[n] = (48u64 + (v % 10u64)) as byte;
+        n = n + 1;
+        v = v / 10u64;
+    }
+    var i: usize = 0;
+    while i < n {
+        const appended: !void = buf_append_byte(b, tmp[n - 1 - i]);
+        _ = appended catch { return; };
+        i = i + 1;
+    }
+}
