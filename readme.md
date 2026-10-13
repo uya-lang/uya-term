@@ -8,7 +8,7 @@
 ## 快速开始
 
 ```sh
-make build                       # 编译到 bin/uya-ssh
+make build                       # 编译到 bin/uya-ssh（默认静态、零依赖）
 bin/uya-ssh --help
 bin/uya-ssh user@host            # 等价于 ssh user@host，但启用了图片粘贴
 alias ssh="$PWD/bin/uya-ssh"     # 也可以直接替换 ssh
@@ -20,6 +20,28 @@ make install                     # 安装到 ~/.local/bin/uya-ssh
 ```sh
 make check      # 类型检查 + 单元测试 + 集成测试（伪终端端到端，含真实 sshd）
 ```
+
+### 零依赖静态产物
+
+`make build` 默认产出**静态链接**的单个可执行文件：没有 ELF 解释器（不依赖 `ld.so`）、
+动态段里没有任何 `NEEDED` 项（不依赖 `libc.so`），也没有未定义符号。
+因此 `bin/uya-ssh` 可以 `scp` 到任意同架构的 Linux 机器上直接运行——包括
+`env -i` 之类的空环境、没有 glibc 的容器镜像、chroot 或 rescue 环境：
+
+```sh
+file bin/uya-ssh          # => statically linked
+ldd bin/uya-ssh           # => 不是动态可执行文件
+readelf -d bin/uya-ssh    # => There is no dynamic section in this file
+env -i ./bin/uya-ssh --version
+```
+
+链接开关是 `STATIC`（默认 `1`）：`LDFLAGS=-static` 会透传给 `uya build` 内部的链接步骤。
+宿主机缺少静态 libc（`libc.a`；例如只装了裁剪过的 `libc6-dev` 或部分 musl 工具链）时
+构建会失败，此时用 `make build STATIC=0` 回退动态链接；集成测试 `t11` 在 `STATIC=0`
+下自动跳过。
+
+注意：静态只是**本程序**零依赖。会话里的 `ssh` 仍是系统 `ssh`，它自身可能是动态链接的，
+需要在目标机上有对应的 libc。
 
 ## 为什么需要包装层
 
@@ -116,6 +138,11 @@ verbose = no
 - **原始模式**：进入前保存 `struct termios`（本机 60 字节），退出与信号路径都会恢复。
 - **窗口尺寸**：`SIGWINCH`/轮询 → `TIOCGWINSZ` → `TIOCSWINSZ` 写 PTY master，
   子进程 `stty size` 立刻可见。
+- **静态链接**：`uya build` 的链接步骤走内部 `make`，需要 `-static` 时通过环境变量
+  `LDFLAGS=-static` 透传（`--nostdlib` 路线冲突，见下）。
+- **不用 `--nostdlib`**：该路线会 `-nostdlib -static -lgcc` 并禁用宿主头文件，
+  实测本程序的 `WNOHANG` 等 libc 常量在无头文件时不可见，且 `posix_spawnp` 等
+  glibc 扩展不会被隐式声明；因此走"照常用 libc，但整程序静态链接"的路线。
 
 ## 测试
 
@@ -134,6 +161,7 @@ tests/integration/ 伪终端端到端（python 驱动）
   t08 OSC 52 透传 + DECRPM 应答不泄漏屏幕
   t09 代理模式（假 5522 终端）
   t10 配置文件前缀键生效
+  t11 零依赖静态产物（无 INTERP/NEEDED、env -i 可运行、clip 往返、PTY 端到端）
 ```
 
 ## 状态与路线图
@@ -146,6 +174,7 @@ tests/integration/ 伪终端端到端（python 驱动）
 | M3 | OSC 5522 服务端（粘贴事件、口令、读写） | ✅ |
 | M4 | 代理模式 + OSC 52 透传 | ✅ |
 | M5 | 配置、文档、测试收口 | ✅ 已交付 |
+| M6 | 零依赖静态构建（`-static`，无 INTERP/NEEDED） | ✅ 已交付 |
 | P2 | 纯 Uya 的 SSH-2 协议客户端（curve25519/ed25519/bigint…） | 规划中 |
 
 ## 已知限制
@@ -154,6 +183,7 @@ tests/integration/ 伪终端端到端（python 驱动）
 - 仅 Linux 已验证（termios/PTY 走 libc）；macOS 分支未测试。
 - 剪贴板仓库为单机本地存储，未实现 X11/Wayland 剪贴板对接（代理模式下由终端提供）。
 - 全屏程序交互依赖真实终端，自动化测试只断言关键序列。
+- 静态产物只覆盖自身；被包装的 `ssh` 仍需目标机上有可用的 libc 与 PATH。
 
 ## 许可证
 
