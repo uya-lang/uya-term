@@ -1,0 +1,160 @@
+// tests/unit/test_osc_scan.uya - OSC/CSI 增量扫描器单元测试
+// 说明：覆盖跨分片、BEL/ST 两种终止符、普通文本透传、超长序列丢弃等路径。
+
+use std.testing.assert_eq_i64;
+use std.testing.expect;
+
+use osc.scan.OscScanner;
+use osc.scan.ScanKind;
+use osc.scan.ScanStep;
+use osc.scan.scanner_consume;
+use osc.scan.scanner_feed;
+use osc.scan.scanner_free;
+use osc.scan.scanner_new;
+use osc.scan.scanner_next;
+use osc.scan.osc_parse_number;
+use osc.scan.find_byte;
+use util.buf.cstr_len;
+
+/// 判定一段完整输入中第一个片段的种类。
+/// 参数：text 为输入字节，n 为长度，step 为输出结果。
+/// 返回值：无。
+fn scan_once(s: &OscScanner, step: &ScanStep) void {
+    const done: !void = scanner_next(s, step, 4096);
+    _ = done catch {
+        step.kind = ScanKind.dropped;
+    };
+}
+
+test "普通文本整段透传" {
+    var s: OscScanner = scanner_new();
+    const hello: &const byte = "hello world";
+    try scanner_feed(&s, hello, cstr_len(hello));
+    var step: ScanStep = ScanStep{};
+    scan_once(&s, &step);
+    try expect(step.kind == ScanKind.text);
+    try assert_eq_i64(step.text_len as i64, 11);
+    try assert_eq_i64(step.consumed as i64, 11);
+    scanner_free(&s);
+}
+
+test "OSC 负载解析（BEL 终止）" {
+    const input: &const byte = "\x1b]5522;type=read\x07";
+    var s: OscScanner = scanner_new();
+    try scanner_feed(&s, input, cstr_len(input));
+    var step: ScanStep = ScanStep{};
+    scan_once(&s, &step);
+    try expect(step.kind == ScanKind.osc);
+    try assert_eq_i64(step.payload_len as i64, 14);
+    const payload: &byte = s.pending.data + step.payload_off;
+    var number: u32 = 0;
+    var rest: usize = 0;
+    try expect(osc_parse_number(payload, step.payload_len, &number, &rest));
+    try assert_eq_i64(number as i64, 5522);
+    try assert_eq_i64(rest as i64, 4);
+    scanner_free(&s);
+}
+
+test "OSC 负载解析（ESC 反斜杠终止）" {
+    const input: &const byte = "\x1b]52;c;aGVsbG8=\x1b\\";
+    var s: OscScanner = scanner_new();
+    try scanner_feed(&s, input, cstr_len(input));
+    var step: ScanStep = ScanStep{};
+    scan_once(&s, &step);
+    try expect(step.kind == ScanKind.osc);
+    const payload: &byte = s.pending.data + step.payload_off;
+    var number: u32 = 0;
+    var rest: usize = 0;
+    try expect(osc_parse_number(payload, step.payload_len, &number, &rest));
+    try assert_eq_i64(number as i64, 52);
+    scanner_free(&s);
+}
+
+test "跨分片：半个序列不产生判定" {
+    const head: &const byte = "\x1b]55";
+    const tail: &const byte = "22;type=read\x07";
+    var s: OscScanner = scanner_new();
+    try scanner_feed(&s, head, cstr_len(head));
+    var step: ScanStep = ScanStep{};
+    scan_once(&s, &step);
+    try expect(step.kind == ScanKind.incomplete);
+    try scanner_feed(&s, tail, cstr_len(tail));
+    scan_once(&s, &step);
+    try expect(step.kind == ScanKind.osc);
+    try assert_eq_i64(step.payload_len as i64, 14);
+    scanner_free(&s);
+}
+
+test "ESC 在 EST 中间断开也能正确续接" {
+    const head: &const byte = "\x1b]5522;type=write\x1b";
+    var s: OscScanner = scanner_new();
+    try scanner_feed(&s, head, cstr_len(head));
+    var step: ScanStep = ScanStep{};
+    scan_once(&s, &step);
+    try expect(step.kind == ScanKind.incomplete);
+    try scanner_feed(&s, "\\" as &const byte, 1);
+    scan_once(&s, &step);
+    try expect(step.kind == ScanKind.osc);
+    try assert_eq_i64(step.payload_len as i64, 15);
+    scanner_free(&s);
+}
+
+test "文本 + 序列混合：先吐文本再吐序列" {
+    var s: OscScanner = scanner_new();
+    const input: &const byte = "abc\x1b]9;x\x07def";
+    try scanner_feed(&s, input, cstr_len(input));
+    var step: ScanStep = ScanStep{};
+    scan_once(&s, &step);
+    try expect(step.kind == ScanKind.text);
+    try assert_eq_i64(step.text_len as i64, 3);
+    scanner_consume(&s, step.consumed);
+    scan_once(&s, &step);
+    try expect(step.kind == ScanKind.osc);
+    scanner_consume(&s, step.consumed);
+    scan_once(&s, &step);
+    try expect(step.kind == ScanKind.text);
+    try assert_eq_i64(step.text_len as i64, 3);
+    scanner_free(&s);
+}
+
+test "CSI 序列识别与普通 ESC 透传" {
+    var s: OscScanner = scanner_new();
+    const csi: &const byte = "\x1b[?5522$p";
+    try scanner_feed(&s, csi, cstr_len(csi));
+    var step: ScanStep = ScanStep{};
+    scan_once(&s, &step);
+    try expect(step.kind == ScanKind.csi);
+    scanner_consume(&s, step.consumed);
+    // 单独的 ESC 不能吞掉后一个普通字节。
+    const lone: &const byte = "\x1bX";
+    try scanner_feed(&s, lone, cstr_len(lone));
+    scan_once(&s, &step);
+    try expect(step.kind == ScanKind.text);
+    try assert_eq_i64(step.text_len as i64, 1);
+    try assert_eq_i64(step.consumed as i64, 1);
+    scanner_free(&s);
+}
+
+test "超长未终止序列被丢弃而不是无限增长" {
+    var s: OscScanner = scanner_new();
+    var junk: [byte: 512] = [65: 512];
+    try scanner_feed(&s, "\x1b]" as &const byte, 2);
+    try scanner_feed(&s, &junk[0], 512);
+    var step: ScanStep = ScanStep{};
+    const done: !void = scanner_next(&s, &step, 64);
+    _ = done catch { };
+    try expect(step.kind == ScanKind.dropped);
+    try assert_eq_i64(s.overflow_drops as i64, 1);
+    scanner_free(&s);
+}
+
+test "find_byte 与数字解析边界" {
+    try assert_eq_i64(find_byte("abc;def" as &const byte, 7, 59 as byte), 3);
+    try assert_eq_i64(find_byte("abc" as &const byte, 3, 59 as byte), -1);
+    var number: u32 = 0;
+    var rest: usize = 0;
+    try expect(!osc_parse_number("abc" as &const byte, 3, &number, &rest));
+    try expect(osc_parse_number("5522;a" as &const byte, 6, &number, &rest));
+    try assert_eq_i64(number as i64, 5522);
+    try assert_eq_i64(rest as i64, 4);
+}

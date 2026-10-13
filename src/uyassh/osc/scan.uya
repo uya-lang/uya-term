@@ -1,0 +1,249 @@
+// src/uyassh/osc/scan.uya - OSC/CSI 序列增量扫描器
+// 说明：在字节流中识别 OSC（ESC ] ... BEL|ESC \）与 CSI（ESC [ ... 终止字节），
+//       支持跨 read 分片；普通字节原样按段返回给调用方。
+
+use util.buf.Buf;
+use util.buf.buf_append;
+use util.buf.buf_append_byte;
+use util.buf.buf_drop_prefix;
+use util.buf.buf_new;
+use util.buf.buf_free;
+use util.buf.buf_reserve;
+
+export error ScanInvalid;
+
+const ESC: byte = 27 as byte;
+const BEL: byte = 7 as byte;
+const BACKSLASH: byte = 92 as byte;
+
+/// 扫描器状态。
+/// 字段：pending 为尚未判定完成的字节（普通文本 + 可能的半个转义序列）。
+export struct OscScanner {
+    pending: Buf,
+    /// 已丢弃的过长的未终止序列计数（用于诊断）。
+    overflow_drops: usize,
+}
+
+/// 单次扫描结果。
+/// 字段：consumed 为已消费字节数，kind 为判定结果，payload_off/payload_len 指向
+///       scanner.pending 中的序列负载（不含 ESC ] 与终止符）。
+///       text_off/text_len 指向应原样透传的普通文本段。
+export struct ScanStep {
+    consumed: usize,
+    kind: ScanKind,
+    payload_off: usize,
+    payload_len: usize,
+    text_off: usize,
+    text_len: usize,
+}
+
+/// 扫描判定结果。
+export enum ScanKind {
+    /// 数据不足以判定，等待更多字节。
+    incomplete,
+    /// 一个完整的 OSC 序列。
+    osc,
+    /// 一个完整的 CSI 序列。
+    csi,
+    /// 一段普通字节（无转义）。
+    text,
+    /// 序列过长被丢弃（防止内存被恶意数据撑爆）。
+    dropped,
+}
+
+/// 创建扫描器。
+/// 参数：无。
+/// 返回值：空扫描器；用完需调用 scanner_free。
+export fn scanner_new() OscScanner {
+    return OscScanner{ pending: buf_new(), overflow_drops: 0 };
+}
+
+/// 释放扫描器。
+/// 参数：s 为扫描器。
+/// 返回值：无。
+export fn scanner_free(s: &OscScanner) void {
+    buf_free(&s.pending);
+}
+
+/// 向扫描器投喂数据。
+/// 参数：s 为扫描器，data/n 为新增字节。
+/// 返回值：无；分配失败时返回错误。
+export fn scanner_feed(s: &OscScanner, data: &const byte, n: usize) !void {
+    try buf_append(&s.pending, data, n);
+}
+
+/// 判定 pending 中的下一个片段。
+/// 参数：s 为扫描器，step 为输出结果，max_payload 为单条序列负载上限。
+/// 返回值：无；内部错误时返回错误。
+export fn scanner_next(s: &OscScanner, step: &ScanStep, max_payload: usize) !void {
+    step.consumed = 0;
+    step.kind = ScanKind.incomplete;
+    step.payload_off = 0;
+    step.payload_len = 0;
+    step.text_off = 0;
+    step.text_len = 0;
+    if s.pending.len == 0 {
+        return;
+    }
+    const data: &byte = s.pending.data;
+    // 找第一个 ESC。
+    var esc_at: usize = s.pending.len;
+    var i: usize = 0;
+    while i < s.pending.len {
+        if data[i] == ESC {
+            esc_at = i;
+            break;
+        }
+        i = i + 1;
+    }
+    if esc_at == s.pending.len {
+        // 没有转义序列：整段都是普通文本。
+        step.kind = ScanKind.text;
+        step.text_off = 0;
+        step.text_len = s.pending.len;
+        step.consumed = s.pending.len;
+        return;
+    }
+    if esc_at > 0 {
+        // 先吐出一段普通文本。
+        step.kind = ScanKind.text;
+        step.text_off = 0;
+        step.text_len = esc_at;
+        step.consumed = esc_at;
+        return;
+    }
+    // data[0] == ESC：判断序列类型。
+    if s.pending.len < 2 {
+        return;
+    }
+    const intro: byte = data[1];
+    if intro != 93 as byte && intro != 91 as byte {
+        // ESC 后既不是 ']' 也不是 '['：把 ESC 当普通字节吐出，避免吞数据。
+        step.kind = ScanKind.text;
+        step.text_off = 0;
+        step.text_len = 1;
+        step.consumed = 1;
+        return;
+    }
+    const is_osc: bool = intro == 93 as byte;
+    var end: usize = s.pending.len;
+    var payload_end: usize = 0;
+    var found: bool = false;
+    var j: usize = 2;
+    while j < s.pending.len {
+        if is_osc {
+            if data[j] == BEL {
+                end = j + 1;
+                payload_end = j;
+                found = true;
+                break;
+            }
+            if data[j] == ESC {
+                if j + 1 >= s.pending.len {
+                    break;
+                }
+                if data[j + 1] == BACKSLASH {
+                    end = j + 2;
+                    payload_end = j;
+                    found = true;
+                    break;
+                }
+            }
+        } else {
+            // CSI：终止字节为 0x40..0x7e。
+            if data[j] >= 64 as byte && data[j] <= 126 as byte {
+                end = j + 1;
+                payload_end = j + 1;
+                found = true;
+                break;
+            }
+        }
+        j = j + 1;
+    }
+    if !found {
+        if s.pending.len > max_payload {
+            // 超长且未终止：丢弃 ESC 之后的全部内容，避免无界增长。
+            step.kind = ScanKind.dropped;
+            step.consumed = s.pending.len;
+            s.overflow_drops = s.overflow_drops + 1;
+            return;
+        }
+        return;
+    }
+    if is_osc {
+        step.kind = ScanKind.osc;
+    } else {
+        step.kind = ScanKind.csi;
+    }
+    step.payload_off = 2;
+    step.payload_len = payload_end - 2;
+    step.consumed = end;
+    return;
+}
+
+/// 消费 pending 的前 n 个字节。
+/// 参数：s 为扫描器，n 为字节数。
+/// 返回值：无。
+export fn scanner_consume(s: &OscScanner, n: usize) void {
+    buf_drop_prefix(&s.pending, n);
+}
+
+/// 解析 OSC 负载的前缀数字（如 "5522"），并给出其后参数起点。
+/// 参数：payload/n 为 OSC 负载，number 为解析出的数值，rest_off 为数字后的偏移。
+/// 返回值：成功返回 true；负载不以数字开头时返回 false。
+export fn osc_parse_number(payload: &const byte, n: usize, number: &u32, rest_off: &usize) bool {
+    if n == 0 || payload == null {
+        return false;
+    }
+    var value: u32 = 0;
+    var i: usize = 0;
+    while i < n {
+        const c: byte = payload[i];
+        if c < 48 as byte || c > 57 as byte {
+            break;
+        }
+        value = value * 10u32 + ((c - 48 as byte) as u32);
+        i = i + 1;
+    }
+    if i == 0 {
+        return false;
+    }
+    number[0] = value;
+    rest_off[0] = i;
+    return true;
+}
+
+/// 在 [data, data+n) 中查找字节 c 的首次出现位置。
+/// 参数：data/n 为被搜索区间，c 为目标字节。
+/// 返回值：找到返回下标，未找到返回 -1。
+export fn find_byte(data: &const byte, n: usize, c: byte) i64 {
+    var i: usize = 0;
+    while i < n {
+        if data[i] == c {
+            return i as i64;
+        }
+        i = i + 1;
+    }
+    return -1 as i64;
+}
+
+/// 构造一个 OSC 序列（ESC ] payload ST）。
+/// 参数：out 为输出缓冲，payload/n 为负载。
+/// 返回值：无；分配失败时返回错误。
+export fn osc_encode(out: &Buf, payload: &const byte, n: usize) !void {
+    try buf_append_byte(out, ESC);
+    try buf_append_byte(out, 93 as byte);
+    try buf_append(out, payload, n);
+    try buf_append_byte(out, ESC);
+    try buf_append_byte(out, BACKSLASH);
+}
+
+/// 构造一个 CSI 序列（ESC [ payload final）。
+/// 参数：out 为输出缓冲，payload/n 为参数部分，final 为终止字节。
+/// 返回值：无；分配失败时返回错误。
+export fn csi_encode(out: &Buf, payload: &const byte, n: usize, final_byte: byte) !void {
+    try buf_append_byte(out, ESC);
+    try buf_append_byte(out, 91 as byte);
+    try buf_append(out, payload, n);
+    try buf_append_byte(out, final_byte);
+}

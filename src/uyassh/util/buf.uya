@@ -2,10 +2,14 @@
 // 说明：本模块是所有解析/编解码路径的基础设施；缓冲基于 std.mem.heap 分配器，
 //       所有函数均不 panic，容量不足时返回错误。
 
-use std.mem.heap.get_heap_allocator;
-use std.mem.allocator.IAllocator;
 use std.mem.mem.mem_copy;
 use std.mem.mem.mem_set;
+
+// 直接使用 libc 的堆接口：接口对象（IAllocator）取值路径在本机存在指针失效问题，
+// 而字节缓冲只需要 malloc/realloc/free 三个原语。
+extern "libc" fn malloc(size: usize) &void;
+extern "libc" fn realloc(ptr: &void, new_size: usize) &void;
+extern "libc" fn free(ptr: &void) void;
 
 export error BufOutOfMemory;
 export error BufTooSmall;
@@ -23,7 +27,11 @@ export struct Buf {
 /// 参数：无。
 /// 返回值：len=0、cap=0 的缓冲；使用前需保证容量或调用 buf_reserve。
 export fn buf_new() Buf {
-    return Buf{ data: null, len: 0, cap: 0 };
+    const p: &void = malloc(64);
+    if p == null {
+        return Buf{ data: null, len: 0, cap: 0 };
+    }
+    return Buf{ data: p as &byte, len: 0, cap: 64 };
 }
 
 /// 确保缓冲容量至少为 needed 字节。
@@ -40,15 +48,11 @@ export fn buf_reserve(b: &Buf, needed: usize) !void {
     while want < needed {
         want = want * 2;
     }
-    const allocator: &IAllocator = get_heap_allocator() as &IAllocator;
-    const fresh: &byte = try allocator.alloc(want);
-    if b.len > 0 && b.data != null {
-        mem_copy(fresh, b.data, b.len);
+    const fresh_ptr: &void = realloc(b.data as &void, want);
+    if fresh_ptr == null {
+        return error.BufOutOfMemory;
     }
-    if b.data != null {
-        allocator.dealloc(b.data);
-    }
-    b.data = fresh;
+    b.data = fresh_ptr as &byte;
     b.cap = want;
 }
 
@@ -57,8 +61,7 @@ export fn buf_reserve(b: &Buf, needed: usize) !void {
 /// 返回值：无。释放后缓冲处于 buf_new 状态，可再次使用。
 export fn buf_free(b: &Buf) void {
     if b.data != null {
-        const allocator: &IAllocator = get_heap_allocator() as &IAllocator;
-        allocator.dealloc(b.data);
+        free(b.data as &void);
     }
     b.data = null;
     b.len = 0;

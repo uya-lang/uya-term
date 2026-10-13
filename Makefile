@@ -1,5 +1,6 @@
 UYA ?= $(HOME)/uya/uya/bin/uya
 SRC := src/uyassh/main.uya
+MODROOT := src/uyassh
 BIN := bin/uya-ssh
 PREFIX ?= $(HOME)/.local
 
@@ -9,17 +10,17 @@ all: build
 
 # 仅做词法/语法/类型检查
 syntax:
-	$(UYA) check $(SRC)
+	$(UYA) check --project-root $(MODROOT) $(SRC)
 
 # 编译可执行文件
 build:
 	mkdir -p bin
-	$(UYA) build $(SRC) -o $(BIN)
+	$(UYA) build $(SRC) -o $(BIN) --project-root $(MODROOT)
 
-# 单元测试（字节级协议向量、扫描器、仓库）
+# 单元测试（协议编解码、扫描器、剪贴板仓库）
 unit:
 	@set -e; for f in tests/unit/test_*.uya; do \
-		if [ -e "$$f" ]; then echo "== $$f"; $(UYA) test "$$f"; fi; \
+		if [ -e "$$f" ]; then echo "== $$f"; $(UYA) test --project-root $(MODROOT) "$$f"; fi; \
 	done
 
 # 集成测试（伪终端端到端）

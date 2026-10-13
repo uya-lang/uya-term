@@ -1,0 +1,344 @@
+// src/uyassh/clip/cmd.uya - clip 子命令实现
+// 说明：add/list/use/clear 四个动作；add 支持从文件或标准输入读取内容。
+
+use libc.sys_read;
+use libc.sys_open;
+use libc.sys_close;
+use libc.sys_stat;
+use libc.Stat;
+use libc.O_RDONLY;
+
+use cli.cli.Options;
+use clip.store.ClipStore;
+use clip.store.ClipEntry;
+use clip.store.clip_store_open;
+use clip.store.clip_store_close;
+use clip.store.clip_put;
+use clip.store.clip_list;
+use clip.store.clip_set_current;
+use clip.store.clip_clear_current;
+use clip.store.clip_get_current;
+use util.buf.Buf;
+use util.buf.buf_new;
+use util.buf.buf_free;
+use util.buf.buf_append;
+use util.buf.cstr_eq;
+use util.buf.cstr_len;
+use util.out.buf_append_u64;
+use util.out.out_str;
+use util.out.out_bytes;
+use util.out.out_i64;
+use util.out.err_str;
+
+/// 单次读取上限（8 MiB，够放下普通截图）。
+const CLIP_MAX_BYTES: usize = 8 * 1024 * 1024;
+
+/// 执行 clip 子命令。
+/// 参数：opts 为解析后的选项。
+/// 返回值：进程退出码。
+export fn clip_run(opts: &Options) i32 {
+    if cstr_eq(opts.clip_action, "add") {
+        return clip_cmd_add(opts);
+    }
+    if cstr_eq(opts.clip_action, "list") {
+        return clip_cmd_list(opts);
+    }
+    if cstr_eq(opts.clip_action, "use") {
+        return clip_cmd_use(opts);
+    }
+    if cstr_eq(opts.clip_action, "clear") {
+        return clip_cmd_clear(opts);
+    }
+    if cstr_eq(opts.clip_action, "get") {
+        return clip_cmd_get(opts);
+    }
+    if cstr_eq(opts.clip_action, "mime") {
+        return clip_cmd_mime(opts);
+    }
+    err_str("uya-ssh: 未知 clip 动作: ");
+    err_str(opts.clip_action);
+    err_str("\n可用: add <文件> | list | use <序号> | get | mime | clear\n");
+    return 2;
+}
+
+/// 打开仓库（失败时打印错误）。
+/// 参数：store 为输出句柄。
+/// 返回值：成功返回 true。
+fn clip_open_or_report(store: &ClipStore) bool {
+    var ok: bool = true;
+    const opened: !void = clip_store_open(store, null);
+    _ = opened catch { ok = false; };
+    if !ok {
+        err_str("uya-ssh: 无法打开剪贴板仓库（检查 HOME 与 ~/.cache 权限）\n");
+    }
+    return ok;
+}
+
+/// clip add：把文件或标准输入放进仓库。
+/// 参数：opts 为选项（clip_operand 为文件名，缺省时读 stdin）。
+/// 返回值：进程退出码。
+fn clip_cmd_add(opts: &Options) i32 {
+    var store: ClipStore = ClipStore{};
+    if !clip_open_or_report(&store) {
+        return 4;
+    }
+    var data: Buf = buf_new();
+    defer { buf_free(&data); }
+    var name: &const byte = null;
+    var read_ok: bool = true;
+    if opts.clip_operand != null {
+        name = opts.clip_operand;
+        const n: i64 = clip_read_path(opts.clip_operand, &data);
+        if n < 0 {
+            err_str("uya-ssh: 无法读取文件: ");
+            err_str(opts.clip_operand);
+            err_str("\n");
+            clip_store_close(&store);
+            return 4;
+        }
+        read_ok = n >= 0;
+    } else {
+        const n: i64 = clip_read_fd(0, &data);
+        read_ok = n >= 0;
+        name = "stdin";
+    }
+    if !read_ok {
+        err_str("uya-ssh: 读取内容失败\n");
+        clip_store_close(&store);
+        return 4;
+    }
+    if data.len == 0 {
+        err_str("uya-ssh: 内容为空，未写入仓库\n");
+        clip_store_close(&store);
+        return 4;
+    }
+    var put_ok: bool = true;
+    const id: u32 = clip_put(&store, data.data, data.len, name) catch {
+        put_ok = false;
+        0 as u32;
+    };
+    if !put_ok {
+        err_str("uya-ssh: 写入仓库失败\n");
+        clip_store_close(&store);
+        return 4;
+    }
+    out_str("已加入剪贴板仓库: id=");
+    out_i64(id as i64, false);
+    out_str(" bytes=");
+    out_i64(data.len as i64, true);
+    clip_store_close(&store);
+    return 0;
+}
+
+/// clip list：列出仓库内容。
+/// 参数：opts 为选项（未使用）。
+/// 返回值：进程退出码。
+fn clip_cmd_list(opts: &Options) i32 {
+    _ = opts;
+    var store: ClipStore = ClipStore{};
+    if !clip_open_or_report(&store) {
+        return 4;
+    }
+    var entries: [ClipEntry: 64] = [ClipEntry{}: 64];
+    const count: usize = clip_list(&store, &entries[0], 64);
+    if count == 0 {
+        out_str("剪贴板仓库为空\n");
+        clip_store_close(&store);
+        return 0;
+    }
+    out_str("ID\t大小\tMIME\t名称\t当前\n");
+    var i: usize = 0;
+    while i < count {
+        out_i64(entries[i].id as i64, false);
+        out_str("\t");
+        out_i64(entries[i].size as i64, false);
+        out_str("\t");
+        out_str(&entries[i].mime[0]);
+        out_str("\t");
+        out_str(&entries[i].name[0]);
+        if entries[i].id == store.current_id {
+            out_str("\t*");
+        }
+        out_str("\n");
+        i = i + 1;
+    }
+    clip_store_close(&store);
+    return 0;
+}
+
+/// clip use：切换当前项。
+/// 参数：opts 为选项（clip_operand 为序号）。
+/// 返回值：进程退出码。
+fn clip_cmd_use(opts: &Options) i32 {
+    if opts.clip_operand == null {
+        err_str("uya-ssh: clip use 需要序号\n");
+        return 2;
+    }
+    const wanted: u32 = clip_parse_u32(opts.clip_operand);
+    var store: ClipStore = ClipStore{};
+    if !clip_open_or_report(&store) {
+        return 4;
+    }
+    var entries: [ClipEntry: 64] = [ClipEntry{}: 64];
+    const count: usize = clip_list(&store, &entries[0], 64);
+    var found: bool = false;
+    var i: usize = 0;
+    while i < count {
+        if entries[i].id == wanted {
+            found = true;
+            break;
+        }
+        i = i + 1;
+    }
+    if !found {
+        err_str("uya-ssh: 没有该序号\n");
+        clip_store_close(&store);
+        return 4;
+    }
+    const applied: !void = clip_set_current(&store, wanted);
+    _ = applied catch { };
+    out_str("当前剪贴项: id=");
+    out_i64(wanted as i64, true);
+    clip_store_close(&store);
+    return 0;
+}
+
+/// clip clear：清空当前项指针。
+/// 参数：opts 为选项（未使用）。
+/// 返回值：进程退出码。
+fn clip_cmd_clear(opts: &Options) i32 {
+    _ = opts;
+    var store: ClipStore = ClipStore{};
+    if !clip_open_or_report(&store) {
+        return 4;
+    }
+    const cleared: !void = clip_clear_current(&store);
+    _ = cleared catch { };
+    out_str("已清空当前剪贴项\n");
+    clip_store_close(&store);
+    return 0;
+}
+
+/// clip get：把当前项内容写到标准输出（二进制安全）。
+/// 参数：opts 为选项（未使用）。
+/// 返回值：进程退出码。
+fn clip_cmd_get(opts: &Options) i32 {
+    _ = opts;
+    var store: ClipStore = ClipStore{};
+    if !clip_open_or_report(&store) {
+        return 4;
+    }
+    var data: Buf = buf_new();
+    defer { buf_free(&data); }
+    const reserved: !void = buf_reserve(&data, 65536);
+    _ = reserved catch { };
+    if data.cap == 0 {
+        clip_store_close(&store);
+        err_str("uya-ssh: 内存不足\n");
+        return 4;
+    }
+    var mime: [byte: 64] = [0: 64];
+    var got_ok: bool = true;
+    const n: usize = clip_get_current(&store, data.data, data.cap, &mime[0], 64) catch {
+        got_ok = false;
+        0 as usize;
+    };
+    if !got_ok {
+        clip_store_close(&store);
+        err_str("uya-ssh: 剪贴板为空（先执行 clip add）\n");
+        return 4;
+    }
+    var written: usize = 0;
+    while written < n {
+        _ = out_bytes(data.data + written, n - written);
+        written = n;
+    }
+    clip_store_close(&store);
+    return 0;
+}
+
+/// clip mime：打印当前项 MIME 类型。
+/// 参数：opts 为选项（未使用）。
+/// 返回值：进程退出码。
+fn clip_cmd_mime(opts: &Options) i32 {
+    _ = opts;
+    var store: ClipStore = ClipStore{};
+    if !clip_open_or_report(&store) {
+        return 4;
+    }
+    var entries: [ClipEntry: 64] = [ClipEntry{}: 64];
+    const count: usize = clip_list(&store, &entries[0], 64);
+    var i: usize = 0;
+    while i < count {
+        if entries[i].id == store.current_id {
+            out_str(&entries[i].mime[0]);
+            out_str("\n");
+            clip_store_close(&store);
+            return 0;
+        }
+        i = i + 1;
+    }
+    clip_store_close(&store);
+    err_str("uya-ssh: 剪贴板为空\n");
+    return 4;
+}
+
+/// 解析十进制序号。
+/// 参数：text 为 C 字符串。
+/// 返回值：数值；无数字时返回 0。
+fn clip_parse_u32(text: &const byte) u32 {
+    if text == null {
+        return 0;
+    }
+    var v: u32 = 0;
+    var i: usize = 0;
+    while text[i] != 0 {
+        const c: byte = text[i];
+        if c < 48 as byte || c > 57 as byte {
+            break;
+        }
+        v = v * 10u32 + ((c - 48 as byte) as u32);
+        i = i + 1;
+    }
+    return v;
+}
+
+/// 读取文件内容到缓冲（上限 CLIP_MAX_BYTES）。
+/// 参数：path 为文件路径，out 为目标缓冲。
+/// 返回值：读取字节数；失败返回 -1。
+fn clip_read_path(path: &const byte, out: &Buf) i64 {
+    var st: Stat = Stat{};
+    const st_ok: i32 = sys_stat(path, &st) catch { -1 as i32; };
+    if st_ok != 0 {
+        return -1 as i64;
+    }
+    if st.st_size < 0 || st.st_size as u64 > CLIP_MAX_BYTES as u64 {
+        return -1 as i64;
+    }
+    const fd: i32 = sys_open(path, O_RDONLY as i32, 0) catch { return -1 as i64; };
+    const n: i64 = clip_read_fd(fd, out);
+    _ = sys_close(fd) catch { 0 as i32; };
+    return n;
+}
+
+/// 从 fd 读取内容到缓冲（上限 CLIP_MAX_BYTES）。
+/// 参数：fd 为输入描述符，out 为目标缓冲。
+/// 返回值：读取字节数；失败返回 -1。
+fn clip_read_fd(fd: i32, out: &Buf) i64 {
+    var chunk: [byte: 65536] = [0: 65536];
+    var total: usize = 0;
+    while total < CLIP_MAX_BYTES {
+        const got: isize = sys_read(fd, &chunk[0], 65536) catch { return -1 as i64; };
+        if got < 0 {
+            return -1 as i64;
+        }
+        if got == 0 {
+            break;
+        }
+        const appended: !void = buf_append(out, &chunk[0], got as usize);
+        _ = appended catch { return -1 as i64; };
+        total = total + (got as usize);
+    }
+    return total as i64;
+}
+

@@ -1,0 +1,625 @@
+// src/uyassh/clip/store.uya - 剪贴板仓库
+// 说明：把剪贴项（通常是图片）存到 ~/.cache/uyassh/clip/，用 index 文件记录元数据，
+//       用 current 文件记录"当前项"。MIME 由内容魔数嗅探，不依赖外部命令。
+
+use libc.sys_mkdir;
+use libc.sys_open;
+use libc.sys_close;
+use libc.sys_read;
+use libc.sys_write;
+use libc.sys_stat;
+use libc.sys_lseek;
+use libc.sys_unlink;
+use libc.Stat;
+use libc.O_RDONLY;
+use libc.O_WRONLY;
+use libc.O_CREAT;
+use libc.O_TRUNC;
+
+use std.env.get;
+
+use util.buf.Buf;
+use util.buf.buf_new;
+use util.buf.buf_free;
+use util.buf.buf_append;
+use util.buf.buf_append_byte;
+use util.buf.buf_append_cstr;
+use util.buf.buf_clear;
+use util.buf.cstr_len;
+use util.out.buf_append_u64;
+use util.out.out_str;
+
+export error ClipIoError;
+export error ClipNoHome;
+export error ClipNotFound;
+
+/// 仓库中单个条目的元数据。
+/// 字段：id 为递增序号，mime 为 MIME 文本（固定长度），size 为字节数，
+///       name 为原始文件名（截断保存）。
+export struct ClipEntry {
+    id: u32,
+    mime: [byte: 64],
+    size: u64,
+    name: [byte: 96],
+}
+
+/// 仓库句柄。
+/// 字段：dir 为仓库目录（'\0' 结尾），current_id 为当前项编号（0 表示无）。
+export struct ClipStore {
+    dir: &byte,
+    dir_cap: usize,
+    index_path: &byte,
+    current_path: &byte,
+    current_id: u32,
+}
+
+/// 把十进制数写入缓冲。
+/// 参数：b 为目标缓冲，v 为数值。
+/// 返回值：无。
+fn append_u32(b: &Buf, v: u32) void {
+    buf_append_u64(b, v as u64);
+}
+
+/// 分配一块堆内存（'\0' 结尾路径用）。
+/// 参数：n 为字节数。
+/// 返回值：指针；失败时为 null。
+fn path_alloc(n: usize) &byte {
+    const p: &void = malloc(n);
+    if p == null {
+        return null;
+    }
+    var q: &byte = p as &byte;
+    var i: usize = 0;
+    while i < n {
+        q[i] = 0 as byte;
+        i = i + 1;
+    }
+    return q;
+}
+
+extern "libc" fn malloc(size: usize) &void;
+extern "libc" fn free(ptr: &void) void;
+
+/// 把 src（'\0' 结尾）复制进 dst，最多 cap-1 字节。
+/// 参数：dst/cap 为目标，src 为源。
+/// 返回值：写入字节数（不含结尾）。
+fn copy_cstr(dst: &byte, cap: usize, src: &const byte) usize {
+    if dst == null || src == null || cap == 0 {
+        return 0;
+    }
+    var i: usize = 0;
+    while src[i] != 0 && i + 1 < cap {
+        dst[i] = src[i];
+        i = i + 1;
+    }
+    dst[i] = 0 as byte;
+    return i;
+}
+
+/// 拼接 `prefix` + `suffix` 到 dst（'\0' 结尾）。
+/// 参数：dst/cap 为目标，prefix/suffix 为两段 C 字符串。
+/// 返回值：结果长度；放不下时返回 0 并把 dst 置空串。
+fn join_path(dst: &byte, cap: usize, prefix: &const byte, suffix: &const byte) usize {
+    const a: usize = copy_cstr(dst, cap, prefix);
+    if a == 0 || a + 1 >= cap {
+        return 0;
+    }
+    var i: usize = 0;
+    while suffix[i] != 0 && a + i + 1 < cap {
+        dst[a + i] = suffix[i];
+        i = i + 1;
+    }
+    dst[a + i] = 0 as byte;
+    return a + i;
+}
+
+/// 打开仓库：确定目录、必要时创建，并读取当前项编号。
+/// 参数：store 为输出句柄，base_dir 为仓库目录（可为 null，表示用默认位置）。
+/// 返回值：无；无法确定目录时返回错误。
+export fn clip_store_open(store: &ClipStore, base_dir: &const byte) !void {
+    var dir: &byte = null;
+    if base_dir != null && base_dir[0] != 0 {
+        dir = path_alloc(512);
+        if dir == null {
+            return error.ClipIoError;
+        }
+        _ = copy_cstr(dir, 512, base_dir);
+    } else {
+        const home: &const byte = get("HOME");
+        if home == null || home[0] == 0 {
+            return error.ClipNoHome;
+        }
+        dir = path_alloc(512);
+        if dir == null {
+            return error.ClipIoError;
+        }
+        if join_path(dir, 512, home, "/.cache/uyassh/clip") == 0 {
+            free(dir as &void);
+            return error.ClipIoError;
+        }
+    }
+    // 逐级创建目录（失败时忽略：目录可能已存在）。
+    clip_mkdir_p(dir);
+    store.dir = dir;
+    store.dir_cap = 512;
+    store.index_path = path_alloc(640);
+    store.current_path = path_alloc(640);
+    if store.index_path == null || store.current_path == null {
+        return error.ClipIoError;
+    }
+    if join_path(store.index_path, 640, dir, "/index") == 0 {
+        return error.ClipIoError;
+    }
+    if join_path(store.current_path, 640, dir, "/current") == 0 {
+        return error.ClipIoError;
+    }
+    store.current_id = clip_read_current(store);
+}
+
+/// 关闭仓库并释放资源。
+/// 参数：store 为句柄。
+/// 返回值：无。
+export fn clip_store_close(store: &ClipStore) void {
+    if store.dir != null {
+        free(store.dir as &void);
+    }
+    if store.index_path != null {
+        free(store.index_path as &void);
+    }
+    if store.current_path != null {
+        free(store.current_path as &void);
+    }
+    store.dir = null;
+    store.index_path = null;
+    store.current_path = null;
+}
+
+/// 逐级创建目录。
+/// 参数：path 为 C 字符串路径。
+/// 返回值：无（失败忽略）。
+fn clip_mkdir_p(path: &const byte) void {
+    var buf: [byte: 512] = [0: 512];
+    const n: usize = cstr_len(path);
+    if n == 0 || n >= 512 {
+        return;
+    }
+    var i: usize = 0;
+    while i < n {
+        buf[i] = path[i];
+        if path[i] == 47 as byte && i > 0 {
+            buf[i] = 0 as byte;
+            _ = sys_mkdir(&buf[0], 493) catch { 0 as i32; };
+            buf[i] = 47 as byte;
+        }
+        i = i + 1;
+    }
+    buf[n] = 0 as byte;
+    _ = sys_mkdir(&buf[0], 493) catch { 0 as i32; };
+}
+
+/// 读取 current 文件中的当前编号。
+/// 参数：store 为句柄。
+/// 返回值：编号；不存在或为空时返回 0。
+fn clip_read_current(store: &ClipStore) u32 {
+    var buf: [byte: 32] = [0: 32];
+    const n: i64 = clip_read_file(store.current_path, &buf[0], 32);
+    if n <= 0 {
+        return 0;
+    }
+    return clip_parse_u32(&buf[0], n as usize);
+}
+
+/// 解析十进制数字前缀。
+/// 参数：data/n 为输入。
+/// 返回值：数值；无数字时返回 0。
+fn clip_parse_u32(data: &const byte, n: usize) u32 {
+    var v: u32 = 0;
+    var i: usize = 0;
+    while i < n {
+        const c: byte = data[i];
+        if c < 48 as byte || c > 57 as byte {
+            break;
+        }
+        v = v * 10u32 + ((c - 48 as byte) as u32);
+        i = i + 1;
+    }
+    return v;
+}
+
+/// 读取文件全部内容（最多 cap 字节）。
+/// 参数：path 为路径，out/cap 为目标缓冲。
+/// 返回值：读取字节数；失败返回 -1。
+fn clip_read_file(path: &const byte, out: &byte, cap: usize) i64 {
+    const fd: i32 = sys_open(path, O_RDONLY as i32, 0) catch { return -1 as i64; };
+    var total: usize = 0;
+    while total < cap {
+        const got: isize = sys_read(fd, out + total, cap - total) catch { -1 as isize; };
+        if got <= 0 {
+            break;
+        }
+        total = total + (got as usize);
+    }
+    _ = sys_close(fd) catch { 0 as i32; };
+    return total as i64;
+}
+
+/// 写入文件（覆盖）。
+/// 参数：path 为路径，data/n 为内容。
+/// 返回值：无；失败时返回错误。
+fn clip_write_file(path: &const byte, data: &const byte, n: usize) !void {
+    const fd: i32 = try sys_open(path, (O_WRONLY | O_CREAT | O_TRUNC) as i32, 420);
+    var total: usize = 0;
+    while total < n {
+        const put: isize = try sys_write(fd, data + total, n - total);
+        if put <= 0 {
+            _ = sys_close(fd) catch { 0 as i32; };
+            return error.ClipIoError;
+        }
+        total = total + (put as usize);
+    }
+    _ = sys_close(fd) catch { 0 as i32; };
+}
+
+/// 嗅探内容的 MIME 类型。
+/// 参数：data/n 为内容前缀，out/cap 为 MIME 输出缓冲。
+/// 返回值：无；无法识别时写入 application/octet-stream。
+export fn clip_sniff_mime(data: &const byte, n: usize, out: &byte, cap: usize) void {
+    if clip_is_png(data, n) {
+        _ = copy_cstr(out, cap, "image/png");
+        return;
+    }
+    if clip_is_jpeg(data, n) {
+        _ = copy_cstr(out, cap, "image/jpeg");
+        return;
+    }
+    if clip_is_gif(data, n) {
+        _ = copy_cstr(out, cap, "image/gif");
+        return;
+    }
+    if clip_is_webp(data, n) {
+        _ = copy_cstr(out, cap, "image/webp");
+        return;
+    }
+    if clip_is_bmp(data, n) {
+        _ = copy_cstr(out, cap, "image/bmp");
+        return;
+    }
+    if clip_is_text(data, n) {
+        _ = copy_cstr(out, cap, "text/plain");
+        return;
+    }
+    _ = copy_cstr(out, cap, "application/octet-stream");
+}
+
+fn clip_is_png(d: &const byte, n: usize) bool {
+    if n < 8 {
+        return false;
+    }
+    return d[0] == 137 as byte && d[1] == 80 as byte && d[2] == 78 as byte && d[3] == 71 as byte &&
+        d[4] == 13 as byte && d[5] == 10 as byte && d[6] == 26 as byte && d[7] == 10 as byte;
+}
+
+fn clip_is_jpeg(d: &const byte, n: usize) bool {
+    if n < 3 {
+        return false;
+    }
+    return d[0] == 255 as byte && d[1] == 216 as byte && d[2] == 255 as byte;
+}
+
+fn clip_is_gif(d: &const byte, n: usize) bool {
+    if n < 6 {
+        return false;
+    }
+    return d[0] == 71 as byte && d[1] == 73 as byte && d[2] == 70 as byte && d[3] == 56 as byte &&
+        (d[4] == 55 as byte || d[4] == 57 as byte) && d[5] == 97 as byte;
+}
+
+fn clip_is_webp(d: &const byte, n: usize) bool {
+    if n < 12 {
+        return false;
+    }
+    return d[0] == 82 as byte && d[1] == 73 as byte && d[2] == 70 as byte && d[3] == 70 as byte &&
+        d[8] == 87 as byte && d[9] == 69 as byte && d[10] == 66 as byte && d[11] == 80 as byte;
+}
+
+fn clip_is_bmp(d: &const byte, n: usize) bool {
+    if n < 2 {
+        return false;
+    }
+    return d[0] == 66 as byte && d[1] == 77 as byte;
+}
+
+/// 判断是否像文本：无非可打印字节且不含 NUL。
+/// 参数：data/n 为内容前缀。
+/// 返回值：像文本返回 true。
+fn clip_is_text(data: &const byte, n: usize) bool {
+    var i: usize = 0;
+    while i < n {
+        const c: byte = data[i];
+        if c == 0 as byte {
+            return false;
+        }
+        if c < 9 as byte {
+            return false;
+        }
+        if c > 13 as byte && c < 32 as byte {
+            return false;
+        }
+        i = i + 1;
+    }
+    return n > 0;
+}
+
+/// 判断两段 MIME 是否相等（按 '\0' 结尾规则的字节比较）。
+/// 参数：a/an 与 b 为两段文本。
+/// 返回值：相等返回 true。
+export fn clip_mime_eq(a: &const byte, an: usize, b: &const byte) bool {
+    const bn: usize = cstr_len(b);
+    if an != bn {
+        return false;
+    }
+    var i: usize = 0;
+    while i < an {
+        if a[i] != b[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// 读取文件大小（失败返回 -1）。
+/// 参数：path 为路径。
+/// 返回值：字节数。
+fn clip_file_size(path: &const byte) i64 {
+    var st: Stat = Stat{};
+    const r: i32 = sys_stat(path, &st) catch { -1 as i32; };
+    if r != 0 {
+        return -1 as i64;
+    }
+    return st.st_size;
+}
+
+/// 读取 index 文件中的所有条目。
+/// 参数：store 为句柄，entries 为输出数组，cap 为容量。
+/// 返回值：读到的条目数。
+export fn clip_list(store: &ClipStore, entries: &ClipEntry, cap: usize) usize {
+    var raw: [byte: 16384] = [0: 16384];
+    const n: i64 = clip_read_file(store.index_path, &raw[0], 16384);
+    if (n <= 0) {
+        return 0;
+    }
+    var count: usize = 0;
+    var off: usize = 0;
+    const total: usize = n as usize;
+    while off < total && count < cap {
+        var line_end: usize = off;
+        while line_end < total && raw[line_end] != 10 as byte {
+            line_end = line_end + 1;
+        }
+        const line_len: usize = line_end - off;
+        if clip_parse_entry(&raw[off], line_len, &entries[count]) {
+            count = count + 1;
+        }
+        off = line_end + 1;
+    }
+    return count;
+}
+
+/// 解析一行 index 记录（格式：id<TAB>size<TAB>mime<TAB>name）。
+/// 参数：line/n 为一行文本，out 为输出条目。
+/// 返回值：解析成功返回 true。
+fn clip_parse_entry(line: &const byte, n: usize, out: &ClipEntry) bool {
+    if n == 0 {
+        return false;
+    }
+    var field_start: [usize: 4] = [0: 4];
+    var field_len: [usize: 4] = [0: 4];
+    var idx: usize = 0;
+    var start: usize = 0;
+    var i: usize = 0;
+    while i <= n && idx < 4 {
+        const at_end: bool = i == n;
+        if at_end || line[i] == 9 as byte {
+            field_start[idx] = start;
+            field_len[idx] = i - start;
+            idx = idx + 1;
+            start = i + 1;
+        }
+        i = i + 1;
+    }
+    if idx < 4 {
+        return false;
+    }
+    out.id = clip_parse_u32(line + field_start[0], field_len[0]);
+    out.size = clip_parse_u32(line + field_start[1], field_len[1]) as u64;
+    clip_copy_field(line + field_start[2], field_len[2], &out.mime[0], 64);
+    clip_copy_field(line + field_start[3], field_len[3], &out.name[0], 96);
+    return out.id != 0;
+}
+
+/// 把字段内容复制进定长缓冲（补 '\0'）。
+/// 参数：src/n 为源，dst/cap 为目标。
+/// 返回值：无。
+fn clip_copy_field(src: &const byte, n: usize, dst: &byte, cap: usize) void {
+    var i: usize = 0;
+    while i < n && i + 1 < cap {
+        dst[i] = src[i];
+        i = i + 1;
+    }
+    dst[i] = 0 as byte;
+}
+
+/// 计算下一个可用编号。
+/// 参数：store 为句柄。
+/// 返回值：编号（从 1 开始）。
+export fn clip_next_id(store: &ClipStore) u32 {
+    var entries: [ClipEntry: 64] = [ClipEntry{}: 64];
+    const count: usize = clip_list(store, &entries[0], 64);
+    var max_id: u32 = 0;
+    var i: usize = 0;
+    while i < count {
+        if entries[i].id > max_id {
+            max_id = entries[i].id;
+        }
+        i = i + 1;
+    }
+    return max_id + 1u32;
+}
+
+/// 把一段数据写入仓库并登记为当前项。
+/// 参数：store 为句柄，data/n 为内容，name 为原始名（可为 null）。
+/// 返回值：新条目编号；失败时返回错误。
+export fn clip_put(store: &ClipStore, data: &const byte, n: usize, name: &const byte) !u32 {
+    const id: u32 = clip_next_id(store);
+    return clip_put_as(store, data, n, name, id);
+}
+
+/// 以指定编号写入仓库。
+/// 参数：store 为句柄，data/n 为内容，name 为原始名（可为 null），id 为编号。
+/// 返回值：编号；失败时返回错误。
+export fn clip_put_as(store: &ClipStore, data: &const byte, n: usize, name: &const byte, id: u32) !u32 {
+    var path: [byte: 768] = [0: 768];
+    var idbuf: [byte: 16] = [0: 16];
+    var idb: Buf = buf_new();
+    defer { buf_free(&idb); }
+    append_u32(&idb, id);
+    _ = copy_cstr(&idbuf[0], 16, idb.data);
+    var suffix: [byte: 32] = [0: 32];
+    _ = copy_cstr(&suffix[0], 32, "/item-");
+    const slen: usize = cstr_len(&suffix[0]);
+    var sj: usize = 0;
+    while sj < idb.len && slen + sj + 1 < 32 {
+        suffix[slen + sj] = idb.data[sj];
+        sj = sj + 1;
+    }
+    suffix[slen + sj] = 0 as byte;
+    if join_path(&path[0], 768, store.dir, &suffix[0]) == 0 {
+        return error.ClipIoError;
+    }
+    _ = idbuf;
+    try clip_write_file(&path[0], data, n);
+    var mime: [byte: 64] = [0: 64];
+    var sniff_len: usize = n;
+    if sniff_len > 64 {
+        sniff_len = 64;
+    }
+    clip_sniff_mime(data, sniff_len, &mime[0], 64);
+    try clip_append_index(store, id, n as u64, &mime[0], name);
+    try clip_set_current(store, id);
+    return id;
+}
+
+/// 追加一条 index 记录。
+/// 参数：store 为句柄，id/size/mime/name 为条目信息。
+/// 返回值：无；失败时返回错误。
+fn clip_append_index(store: &ClipStore, id: u32, size: u64, mime: &const byte, name: &const byte) !void {
+    const fd: i32 = try sys_open(store.index_path, (O_WRONLY | O_CREAT) as i32, 420);
+    const end: i64 = sys_lseek(fd, 0, 2) catch { -1 as i64; };
+    if end < 0 {
+        _ = sys_close(fd) catch { 0 as i32; };
+        return error.ClipIoError;
+    }
+    var line: Buf = buf_new();
+    defer { buf_free(&line); }
+    append_u32(&line, id);
+    try buf_append_byte(&line, 9 as byte);
+    buf_append_u64(&line, size);
+    try buf_append_byte(&line, 9 as byte);
+    try buf_append_cstr(&line, mime);
+    try buf_append_byte(&line, 9 as byte);
+    if name != null {
+        try buf_append_cstr(&line, name);
+    }
+    try buf_append_byte(&line, 10 as byte);
+    var total: usize = 0;
+    while total < line.len {
+        const put: isize = try sys_write(fd, line.data + total, line.len - total);
+        if put <= 0 {
+            _ = sys_close(fd) catch { 0 as i32; };
+            return error.ClipIoError;
+        }
+        total = total + (put as usize);
+    }
+    _ = sys_close(fd) catch { 0 as i32; };
+}
+
+/// 设置当前项。
+/// 参数：store 为句柄，id 为编号。
+/// 返回值：无；失败时返回错误。
+export fn clip_set_current(store: &ClipStore, id: u32) !void {
+    var b: Buf = buf_new();
+    defer { buf_free(&b); }
+    append_u32(&b, id);
+    try buf_append_byte(&b, 10 as byte);
+    try clip_write_file(store.current_path, b.data, b.len);
+    store.current_id = id;
+}
+
+/// 拼出某个条目的数据文件路径。
+/// 参数：store 为句柄，id 为编号，out/cap 为目标缓冲。
+/// 返回值：路径长度；失败返回 0。
+export fn clip_item_path(store: &ClipStore, id: u32, out: &byte, cap: usize) usize {
+    var b: Buf = buf_new();
+    defer { buf_free(&b); }
+    append_u32(&b, id);
+    var suffix: [byte: 32] = [0: 32];
+    _ = copy_cstr(&suffix[0], 32, "/item-");
+    const slen: usize = cstr_len(&suffix[0]);
+    var j: usize = 0;
+    while j < b.len && slen + j + 1 < 32 {
+        suffix[slen + j] = b.data[j];
+        j = j + 1;
+    }
+    suffix[slen + j] = 0 as byte;
+    return join_path(out, cap, store.dir, &suffix[0]);
+}
+
+/// 读取当前条目的内容。
+/// 参数：store 为句柄，out/cap 为目标缓冲，mime/mime_cap 为可选 MIME 输出。
+/// 返回值：实际读取字节数；失败时返回错误。
+export fn clip_get_current(store: &ClipStore, out: &byte, cap: usize, mime: &byte, mime_cap: usize) !usize {
+    const id: u32 = store.current_id;
+    if id == 0 {
+        return error.ClipNotFound;
+    }
+    var path: [byte: 768] = [0: 768];
+    if clip_item_path(store, id, &path[0], 768) == 0 {
+        return error.ClipIoError;
+    }
+    const n: i64 = clip_read_file(&path[0], out, cap);
+    if n <= 0 {
+        return error.ClipNotFound;
+    }
+    if mime != null && mime_cap > 0 {
+        var entries: [ClipEntry: 64] = [ClipEntry{}: 64];
+        const count: usize = clip_list(store, &entries[0], 64);
+        var i: usize = 0;
+        while i < count {
+            if entries[i].id == id {
+                _ = copy_cstr(mime, mime_cap, &entries[i].mime[0]);
+                break;
+            }
+            i = i + 1;
+        }
+    }
+    return n as usize;
+}
+
+/// 清空整个仓库（删除 index 与 current；条目文件保留但不再被引用）。
+/// 参数：store 为句柄。
+/// 返回值：无。
+export fn clip_store_reset(store: &ClipStore) void {
+    _ = sys_unlink(store.index_path) catch { -1 as i32; };
+    _ = sys_unlink(store.current_path) catch { -1 as i32; };
+    store.current_id = 0;
+}
+
+/// 清空当前项指针。
+/// 参数：store 为句柄。
+/// 返回值：无；失败时返回错误。
+export fn clip_clear_current(store: &ClipStore) !void {
+    const removed: i32 = sys_unlink(store.current_path) catch { -1 as i32; };
+    _ = removed;
+    store.current_id = 0;
+}

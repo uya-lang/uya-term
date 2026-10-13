@@ -10,6 +10,7 @@ use cli.cli.print_help;
 use cli.cli.is_clip_invocation;
 use util.out.out_str;
 use sess.wrapper.wrapper_run;
+use clip.cmd.clip_run;
 
 const VERSION: &const byte = "uya-ssh 0.1.0 (uya-term)\n";
 
@@ -46,9 +47,7 @@ export fn main() i32 {
 /// 参数：opts 为解析后的选项。
 /// 返回值：进程退出码。
 fn run_clip(opts: &Options) i32 {
-    _ = opts;
-    out_str("uya-ssh: clip 子命令尚未实现\n");
-    return 3;
+    return clip_run(opts);
 }
 
 /// 执行 PTY 包装透传（M1 实现）。
