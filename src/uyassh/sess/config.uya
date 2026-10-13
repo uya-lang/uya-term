@@ -1,0 +1,256 @@
+// src/uyassh/sess/config.uya - 配置文件解析（~/.config/uyassh/config）
+// 说明：纯键值文本，每行 `键 = 值`，`#` 开头为注释。支持的键见 readme。
+
+use libc.sys_open;
+use libc.sys_read;
+use libc.sys_close;
+use libc.O_RDONLY;
+use std.env.get;
+
+use util.buf.cstr_len;
+use util.buf.cstr_eq;
+use util.out.err_str;
+
+/// 配置项。
+/// 字段：prefix_byte 为本地前缀键；clip_dir 为剪贴板仓库目录（空表示默认）；
+///       force_serve 表示即使本地终端支持 5522 也自己扮演终端；
+///       verbose 为诊断开关；loaded 表示是否成功读到配置。
+export struct Config {
+    prefix_byte: byte,
+    clip_dir: [byte: 256],
+    force_serve: bool,
+    verbose: bool,
+    loaded: bool,
+}
+
+/// 默认配置。
+/// 参数：无。
+/// 返回值：前缀键为 Ctrl-]、其余为空的配置。
+export fn config_default() Config {
+    return Config{
+        prefix_byte: 29 as byte,
+        clip_dir: [0: 256],
+        force_serve: false,
+        verbose: false,
+        loaded: false,
+    };
+}
+
+/// 读取并解析配置文件（不存在时返回默认配置）。
+/// 参数：无。
+/// 返回值：配置实例；文件不存在时 loaded=false 但其余字段为默认值。
+export fn config_load() Config {
+    var cfg: Config = config_default();
+    var path: [byte: 320] = [0: 320];
+    if !config_path(&path[0], 320) {
+        return cfg;
+    }
+    var raw: [byte: 8192] = [0: 8192];
+    const n: i64 = config_read(&path[0], &raw[0], 8192);
+    if n <= 0 {
+        return cfg;
+    }
+    cfg.loaded = true;
+    config_parse(&raw[0], n as usize, &cfg);
+    return cfg;
+}
+
+/// 组装配置文件路径（$XDG_CONFIG_HOME 或 $HOME/.config）。
+/// 参数：out/cap 为目标缓冲。
+/// 返回值：成功返回 true。
+fn config_path(out: &byte, cap: usize) bool {
+    const xdg: &const byte = get("XDG_CONFIG_HOME" as &const byte);
+    if xdg != null && xdg[0] != 0 {
+        return config_join(out, cap, xdg, "/uyassh/config");
+    }
+    const home: &const byte = get("HOME" as &const byte);
+    if home == null || home[0] == 0 {
+        return false;
+    }
+    return config_join(out, cap, home, "/.config/uyassh/config");
+}
+
+/// 拼接两个 C 字符串到目标缓冲。
+/// 参数：out/cap 为目标，a/b 为两段。
+/// 返回值：成功返回 true；放不下返回 false。
+fn config_join(out: &byte, cap: usize, a: &const byte, b: &const byte) bool {
+    var i: usize = 0;
+    var a_written: usize = 0;
+    const a_len: usize = cstr_len(a);
+    while a[i] != 0 && i + 1 < cap {
+        out[i] = a[i];
+        i = i + 1;
+        a_written = a_written + 1;
+    }
+    var j: usize = 0;
+    while b[j] != 0 && i + 1 < cap {
+        out[i] = b[j];
+        i = i + 1;
+        j = j + 1;
+    }
+    out[i] = 0 as byte;
+    if i == 0 {
+        return false;
+    }
+    // 只有内容被截断（还有剩余字符未写入）时才算失败。
+    const a_left: bool = a_len > a_written;
+    const b_left: bool = b[j] != 0;
+    return !(a_left || b_left);
+}
+
+/// 读取文件内容。
+/// 参数：path 为路径，out/cap 为目标缓冲。
+/// 返回值：读取字节数；失败返回 -1。
+fn config_read(path: &const byte, out: &byte, cap: usize) i64 {
+    const fd: i32 = sys_open(path, O_RDONLY as i32, 0) catch { return -1 as i64; };
+    var total: usize = 0;
+    while total < cap {
+        const got: isize = sys_read(fd, out + total, cap - total) catch { -1 as isize; };
+        if got <= 0 {
+            break;
+        }
+        total = total + (got as usize);
+    }
+    _ = sys_close(fd) catch { 0 as i32; };
+    if total == 0 {
+        return -1 as i64;
+    }
+    return total as i64;
+}
+
+/// 逐行解析配置文本。
+/// 参数：raw/n 为内容，cfg 为目标配置。
+/// 返回值：无。
+fn config_parse(raw: &const byte, n: usize, cfg: &Config) void {
+    var off: usize = 0;
+    while off < n {
+        var end: usize = off;
+        while end < n && raw[end] != 10 as byte {
+            end = end + 1;
+        }
+        config_parse_line(raw + off, end - off, cfg);
+        off = end + 1;
+    }
+}
+
+/// 解析单行（跳过空行与注释）。
+/// 参数：line/n 为该行，cfg 为目标配置。
+/// 返回值：无。
+fn config_parse_line(line: &const byte, n: usize, cfg: &Config) void {
+    var i: usize = 0;
+    while i < n && (line[i] == 32 as byte || line[i] == 9 as byte) {
+        i = i + 1;
+    }
+    if i >= n || line[i] == 35 as byte {
+        return;
+    }
+    var eq: usize = i;
+    while eq < n && line[eq] != 61 as byte {
+        eq = eq + 1;
+    }
+    if eq >= n {
+        return;
+    }
+    const key: &const byte = line + i;
+    const key_len: usize = config_trim_len(key, eq - i);
+    var vstart: usize = eq + 1;
+    while vstart < n && (line[vstart] == 32 as byte || line[vstart] == 9 as byte) {
+        vstart = vstart + 1;
+    }
+    const val: &const byte = line + vstart;
+    var val_len: usize = n - vstart;
+    while val_len > 0 && (val[val_len - 1] == 13 as byte || val[val_len - 1] == 32 as byte ||
+        val[val_len - 1] == 9 as byte) {
+        val_len = val_len - 1;
+    }
+    if config_key_is(key, key_len, "prefix" as &const byte) {
+        const p: byte = config_parse_prefix(val, val_len);
+        if p != 0 as byte {
+            cfg.prefix_byte = p;
+        }
+        return;
+    }
+    if config_key_is(key, key_len, "clip-dir" as &const byte) {
+        var i2: usize = 0;
+        while i2 < val_len && i2 + 1 < 256 {
+            cfg.clip_dir[i2] = val[i2];
+            i2 = i2 + 1;
+        }
+        cfg.clip_dir[i2] = 0 as byte;
+        return;
+    }
+    if config_key_is(key, key_len, "force-serve" as &const byte) {
+        cfg.force_serve = config_truthy(val, val_len);
+        return;
+    }
+    if config_key_is(key, key_len, "verbose" as &const byte) {
+        cfg.verbose = config_truthy(val, val_len);
+        return;
+    }
+    err_str("[uya-ssh] 忽略未知配置项\n");
+}
+
+/// 去掉尾部空白后的长度（键名）。
+/// 参数：s 为起点，n 为长度。
+/// 返回值：有效长度。
+fn config_trim_len(s: &const byte, n: usize) usize {
+    var len: usize = n;
+    while len > 0 && (s[len - 1] == 32 as byte || s[len - 1] == 9 as byte) {
+        len = len - 1;
+    }
+    return len;
+}
+
+/// 比较键名。
+/// 参数：key/key_len 为实际键，want 为期望键。
+/// 返回值：相等返回 true。
+fn config_key_is(key: &const byte, key_len: usize, want: &const byte) bool {
+    const wlen: usize = cstr_len(want);
+    if wlen != key_len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < key_len {
+        if key[i] != want[i] {
+            return false;
+        }
+        i = i + 1;
+    }
+    return true;
+}
+
+/// 解析真值（yes/true/1/on）。
+/// 参数：val/n 为值文本。
+/// 返回值：为真返回 true。
+fn config_truthy(val: &const byte, n: usize) bool {
+    if config_key_is(val, n, "1" as &const byte) || config_key_is(val, n, "yes" as &const byte) ||
+        config_key_is(val, n, "true" as &const byte) || config_key_is(val, n, "on" as &const byte) {
+        return true;
+    }
+    return false;
+}
+
+/// 解析前缀键写法：单字符、^X 或 C-x。
+/// 参数：val/n 为值文本。
+/// 返回值：控制字节；无法识别返回 0。
+fn config_parse_prefix(val: &const byte, n: usize) byte {
+    if n == 0 {
+        return 0 as byte;
+    }
+    if (val[0] == 94 as byte || val[0] == 67 as byte) && n >= 2 {
+        var c: byte = val[n - 1];
+        if c == 63 as byte {
+            return 127 as byte;
+        }
+        if c >= 97 as byte && c <= 122 as byte {
+            const shifted: u32 = (c as u32) - 32u32;
+            c = shifted as byte;
+        }
+        if c >= 64 as byte && c <= 95 as byte {
+            const masked: u32 = (c as u32) - 64u32;
+            return masked as byte;
+        }
+        return 0 as byte;
+    }
+    return val[0];
+}

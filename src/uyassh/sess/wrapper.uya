@@ -6,6 +6,8 @@ use std.runtime.saved_envp;
 
 use cli.cli.Options;
 use cli.cli.PtyMode;
+use std.env.get;
+
 use pty.spawn.PtySession;
 use pty.spawn.SpawnSpec;
 use pty.spawn.pty_open;
@@ -20,12 +22,13 @@ use term.termios.term_restore;
 use term.termios.term_is_tty;
 use util.out.err_str;
 use util.buf.cstr_eq;
-use std.env.get;
+
+use sess.config.Config;
+use sess.config.config_load;
+
 use clip.store.ClipStore;
 use clip.store.clip_store_open;
 use clip.store.clip_store_close;
-use util.buf.cstr_eq;
-use std.env.get;
 
 export error WrapperSpawnFailed;
 export error WrapperFailed;
@@ -45,6 +48,10 @@ export struct WrapperState {
     resized: bool,
     /// 本地终端是否原生支持 OSC 5522（决定 serve/proxy）。
     local_supports_5522: bool,
+    /// 生效的本地前缀键（命令行优先，其次配置文件）。
+    prefix_byte: byte,
+    /// 配置文件指定的剪贴板目录（空表示默认）。
+    clip_dir: [byte: 256],
 }
 
 /// 运行包装会话。
@@ -63,7 +70,27 @@ export fn wrapper_run(opts: &Options) i32 {
         verbose: opts.verbose,
         resized: false,
         local_supports_5522: cli_local_supports_5522(),
+        prefix_byte: opts.prefix_byte,
+        clip_dir: [0: 256],
     };
+    const cfg_file: Config = config_load();
+    if cfg_file.loaded {
+        if cfg_file.verbose {
+            state.verbose = true;
+        }
+        if cfg_file.force_serve {
+            state.local_supports_5522 = false;
+        }
+        if state.prefix_byte == 29 as byte && cfg_file.prefix_byte != 29 as byte {
+            state.prefix_byte = cfg_file.prefix_byte;
+        }
+        var ci: usize = 0;
+        while cfg_file.clip_dir[ci] != 0 && ci + 1 < 256 {
+            state.clip_dir[ci] = cfg_file.clip_dir[ci];
+            ci = ci + 1;
+        }
+        state.clip_dir[ci] = 0 as byte;
+    }
     if !wrapper_build_argv(opts, &state) {
         err_str("uya-ssh: 参数过多\n");
         return 2;
@@ -112,9 +139,13 @@ fn wrapper_run_pty(opts: &Options, state: &WrapperState) i32 {
     session.master_fd = master;
     var store: ClipStore = ClipStore{};
     var store_ready: bool = true;
-    const clip_opened: !void = clip_store_open(&store, null);
+    var clip_base: &const byte = null;
+    if state.clip_dir[0] != 0 {
+        clip_base = &state.clip_dir[0];
+    }
+    const clip_opened: !void = clip_store_open(&store, clip_base);
     _ = clip_opened catch { store_ready = false; };
-    const cfg: SessionConfig = session_config(state.local_fd, opts.prefix_byte,
+    const cfg: SessionConfig = session_config(state.local_fd, state.prefix_byte,
         state.local_supports_5522, &store, opts.verbose);
     const result: SessionResult = session_run(&session, &cfg);
     if store_ready {
