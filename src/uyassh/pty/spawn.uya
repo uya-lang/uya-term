@@ -1,0 +1,126 @@
+// src/uyassh/pty/spawn.uya - 伪终端分配与子进程启动
+// 说明：用 posix_openpt/grantpt/unlockpt/ptsname 申请 PTY，用 posix_spawnp +
+//       file_actions 把子进程的 0/1/2 接到 slave；不使用 fork（运行时 fork 路径不稳）。
+
+use libc.sys_close;
+use libc.sys_read;
+use libc.sys_write;
+use libc.sys_fcntl;
+use libc.F_GETFL;
+use libc.F_SETFL;
+use libc.O_RDWR;
+use libc.O_NONBLOCK;
+
+export error PtyOpenFailed;
+export error PtySpawnFailed;
+export error PtyFileActionsFailed;
+
+/// posix_spawnattr_t 在本机（glibc/x86_64）为 336 字节；仅用到偏移 0 的 short __flags。
+const SPAWN_ATTR_BYTES: usize = 336;
+/// posix_spawn_file_actions_t 在本机为 80 字节。
+const SPAWN_FA_BYTES: usize = 80;
+/// POSIX_SPAWN_SETSID：让子进程成为新会话首进程，从而获得控制终端。
+const POSIX_SPAWN_SETSID: i16 = 0x80;
+
+/// 子进程启动描述。
+/// 字段：program 为可执行文件名（走 PATH 查找），args 为以 null 结尾的参数向量，
+///       envp 为以 null 结尾的环境变量向量，slave_path 为 PTY slave 设备路径。
+export struct SpawnSpec {
+    program: &const byte,
+    args: &(&const byte),
+    envp: &(&const byte),
+    slave_path: &const byte,
+}
+
+/// 已启动的 PTY 会话。
+/// 字段：master_fd 为父进程侧的 PTY 主设备，child_pid 为子进程号。
+export struct PtySession {
+    master_fd: i32,
+    child_pid: i32,
+}
+
+extern "libc" fn posix_openpt(flags: i32) i32;
+extern "libc" fn grantpt(fd: i32) i32;
+extern "libc" fn unlockpt(fd: i32) i32;
+// 注意：split-C 后端会把返回指针的 extern 生成成返回 int32 的声明（指针被 cltq 截断），
+// 因此这里不用 ptsname，改用把结果写进调用方缓冲的 ptsname_r。
+extern "libc" fn ptsname_r(fd: i32, buf: &byte, buflen: usize) i32;
+extern "libc" fn posix_spawnp(pid: &i32, file: &const byte, file_actions: &void,
+    attrp: &const void, argv: &(&const byte), envp: &(&const byte)) i32;
+extern "libc" fn posix_spawn_file_actions_init(actions: &void) i32;
+extern "libc" fn posix_spawn_file_actions_addopen(actions: &void, fd: i32,
+    path: &const byte, oflag: i32, mode: i32) i32;
+extern "libc" fn posix_spawn_file_actions_addclose(actions: &void, fd: i32) i32;
+extern "libc" fn posix_spawn_file_actions_destroy(actions: &void) i32;
+
+/// 申请一对 PTY 设备并返回 master。
+/// 参数：无。
+/// 返回值：master 文件描述符与 slave 路径（写入 slave_path_out）；失败时返回错误。
+export fn pty_open(slave_path_out: &byte, path_cap: usize) !i32 {
+    const master: i32 = posix_openpt(O_RDWR as i32);
+    if master < 0 {
+        return error.PtyOpenFailed;
+    }
+    if grantpt(master) != 0 || unlockpt(master) != 0 {
+        _ = sys_close(master);
+        return error.PtyOpenFailed;
+    }
+    if path_cap == 0 {
+        _ = sys_close(master);
+        return error.PtyOpenFailed;
+    }
+    slave_path_out[0] = 0 as byte;
+    const rc: i32 = ptsname_r(master, slave_path_out, path_cap);
+    if rc != 0 || slave_path_out[0] == 0 {
+        _ = sys_close(master);
+        return error.PtyOpenFailed;
+    }
+    return master;
+}
+
+/// 启动子进程并把它接到 PTY slave。
+/// 参数：spec 为启动描述，master_fd 为父进程持有的 master，out 为会话输出参数。
+/// 返回值：无；失败时返回错误（子进程未启动或已回收）。
+export fn pty_spawn(spec: &const SpawnSpec, master_fd: i32, out: &PtySession) !void {
+    var fa: [byte: SPAWN_FA_BYTES] = [0: SPAWN_FA_BYTES];
+    if posix_spawn_file_actions_init(&fa[0] as &void) != 0 {
+        return error.PtyFileActionsFailed;
+    }
+    var fi: i32 = 0;
+    // 0/1/2 直接打开 slave，避免 dup2 与额外 fd 继承。
+    fi = posix_spawn_file_actions_addopen(&fa[0] as &void, 0, spec.slave_path, O_RDWR as i32, 0);
+    if fi == 0 {
+        fi = posix_spawn_file_actions_addopen(&fa[0] as &void, 1, spec.slave_path, O_RDWR as i32, 0);
+    }
+    if fi == 0 {
+        fi = posix_spawn_file_actions_addopen(&fa[0] as &void, 2, spec.slave_path, O_RDWR as i32, 0);
+    }
+    // 关闭 master，避免子进程继承后 master 永不 EOF。
+    if fi == 0 {
+        fi = posix_spawn_file_actions_addclose(&fa[0] as &void, master_fd);
+    }
+    if fi != 0 {
+        _ = posix_spawn_file_actions_destroy(&fa[0] as &void);
+        return error.PtyFileActionsFailed;
+    }
+    var attr: [byte: SPAWN_ATTR_BYTES] = [0: SPAWN_ATTR_BYTES];
+    var flags_ptr: &i16 = &attr[0] as &i16;
+    flags_ptr[0] = POSIX_SPAWN_SETSID;
+    var pid: i32 = 0;
+    const rc: i32 = posix_spawnp(&pid, spec.program, &fa[0] as &void, &attr[0] as &const void,
+        spec.args, spec.envp);
+    _ = posix_spawn_file_actions_destroy(&fa[0] as &void);
+    if rc != 0 || pid <= 0 {
+        return error.PtySpawnFailed;
+    }
+    out.master_fd = master_fd;
+    out.child_pid = pid;
+}
+
+/// 把 fd 设为非阻塞。
+/// 参数：fd 为目标描述符。
+/// 返回值：无；失败时返回错误。
+export fn pty_set_nonblocking(fd: i32) !void {
+    const flags: i32 = try sys_fcntl(fd, F_GETFL, 0);
+    _ = try sys_fcntl(fd, F_SETFL, flags | (O_NONBLOCK as i32));
+}

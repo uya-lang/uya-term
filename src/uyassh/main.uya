@@ -9,6 +9,7 @@ use cli.cli.parse_args;
 use cli.cli.print_help;
 use cli.cli.is_clip_invocation;
 use util.out.out_str;
+use sess.wrapper.wrapper_run;
 
 const VERSION: &const byte = "uya-ssh 0.1.0 (uya-term)\n";
 
@@ -54,7 +55,5 @@ fn run_clip(opts: &Options) i32 {
 /// 参数：opts 为解析后的选项。
 /// 返回值：子进程退出码或包装器错误码。
 fn run_wrapper(opts: &Options) i32 {
-    _ = opts;
-    out_str("uya-ssh: 包装器尚未实现\n");
-    return 3;
+    return wrapper_run(opts);
 }

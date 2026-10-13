@@ -1,0 +1,146 @@
+// src/uyassh/sess/wrapper.uya - PTY 包装会话
+// 说明：把 Options 变成一个可执行的子进程，用 PTY 包住它并转发字节；
+//       本地终端进入 raw 模式，退出时无条件恢复。
+
+use std.runtime.saved_envp;
+
+use cli.cli.Options;
+use cli.cli.PtyMode;
+use pty.spawn.PtySession;
+use pty.spawn.SpawnSpec;
+use pty.spawn.pty_open;
+use pty.spawn.pty_spawn;
+use sess.loop.LoopConfig;
+use sess.loop.LoopResult;
+use sess.loop.loop_run;
+use term.termios.Termios;
+use term.termios.term_enter_raw;
+use term.termios.term_restore;
+use term.termios.term_is_tty;
+use util.out.err_str;
+
+export error WrapperSpawnFailed;
+export error WrapperFailed;
+
+const SLAVE_PATH_CAP: usize = 128;
+const ARG_CAP: usize = 66;
+
+/// 包装器运行时状态（供钩子共享）。
+export struct WrapperState {
+    argv: [&const byte: ARG_CAP],
+    envp: &(&const byte),
+    term_saved: Termios,
+    term_active: bool,
+    local_fd: i32,
+    verbose: bool,
+    /// 最近一次收到的本地窗口尺寸变化标记。
+    resized: bool,
+}
+
+/// 运行包装会话。
+/// 参数：opts 为解析后的命令行选项。
+/// 返回值：子进程退出码，或包装器自身的错误码。
+export fn wrapper_run(opts: &Options) i32 {
+    if opts.pty_mode == PtyMode.never {
+        return wrapper_run_no_pty(opts);
+    }
+    var state: WrapperState = WrapperState{
+        argv: [null: ARG_CAP],
+        envp: saved_envp as &(&const byte),
+        term_saved: Termios{},
+        term_active: false,
+        local_fd: 0,
+        verbose: opts.verbose,
+        resized: false,
+    };
+    if !wrapper_build_argv(opts, &state) {
+        err_str("uya-ssh: 参数过多\n");
+        return 2;
+    }
+    const local_is_tty: bool = term_is_tty(0);
+    if local_is_tty {
+        const entered: !void = term_enter_raw(0, &state.term_saved);
+        _ = entered catch {
+            err_str("uya-ssh: 无法把终端切换到 raw 模式\n");
+            return 4;
+        };
+        state.term_active = true;
+    }
+    const code: i32 = wrapper_run_pty(opts, &state);
+    wrapper_restore_terminal(&state);
+    return code;
+}
+
+/// 运行 PTY 会话并转发。
+/// 参数：opts 为选项，state 为运行时状态。
+/// 返回值：子进程退出码。
+fn wrapper_run_pty(opts: &Options, state: &WrapperState) i32 {
+    var slave_path: [byte: SLAVE_PATH_CAP] = [0: SLAVE_PATH_CAP];
+    var master: i32 = 0;
+    const opened: !i32 = pty_open(&slave_path[0], SLAVE_PATH_CAP);
+    master = opened catch {
+        err_str("uya-ssh: 无法申请伪终端\n");
+        return 4;
+    };
+    var spec: SpawnSpec = SpawnSpec{
+        program: opts.program,
+        args: &state.argv[0],
+        envp: state.envp,
+        slave_path: &slave_path[0],
+    };
+    var session: PtySession = PtySession{ master_fd: master, child_pid: 0 };
+    var spawn_spec: SpawnSpec = spec;
+    const spawned: !void = pty_spawn(&spawn_spec, master, &session);
+    _ = spawned catch {
+        err_str("uya-ssh: 启动子进程失败: ");
+        err_str(opts.program);
+        err_str("\n");
+        return 127;
+    };
+    // master 交还给外部持有的 fd 变量（spawn 只填写 pid）。
+    session.master_fd = master;
+    const cfg: LoopConfig = LoopConfig{ local_fd: state.local_fd, watch_resize: true, dump_child: false };
+    const result: LoopResult = loop_run(&session, &cfg);
+    if result.exited {
+        return result.exit_code;
+    }
+    return 0;
+}
+
+/// 不使用 PTY 的简单透传（stdout 走管道，不做 OSC 拦截）。
+/// 参数：opts 为选项。
+/// 返回值：子进程退出码。
+fn wrapper_run_no_pty(opts: &Options) i32 {
+    _ = opts;
+    err_str("uya-ssh: --no-pty 模式尚未实现\n");
+    return 4;
+}
+
+/// 把选项与子程序组装成参数向量。
+/// 参数：opts 为选项，state 为用于存放参数的状态。
+/// 返回值：成功返回 true；参数过多返回 false。
+fn wrapper_build_argv(opts: &Options, state: &WrapperState) bool {
+    if opts.arg_count + 2 > ARG_CAP {
+        return false;
+    }
+    state.argv[0] = opts.program;
+    var i: usize = 0;
+    while i < opts.arg_count {
+        state.argv[i + 1] = opts.args[i];
+        i = i + 1;
+    }
+    state.argv[opts.arg_count + 1] = null;
+    return true;
+}
+
+/// 恢复本地终端属性。
+/// 参数：state 为运行时状态。
+/// 返回值：无。
+export fn wrapper_restore_terminal(state: &WrapperState) void {
+    if !state.term_active {
+        return;
+    }
+    const restored: !void = term_restore(state.local_fd, &state.term_saved);
+    _ = restored catch { return; };
+    state.term_active = false;
+}

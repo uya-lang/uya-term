@@ -1,0 +1,163 @@
+// src/uyassh/term/termios.uya - 终端模式与窗口尺寸
+// 说明：封装 struct termios（本机 Linux/glibc 布局，60 字节）与 TIOCGWINSZ/TIOCSWINSZ，
+//       提供 raw 模式的进入/恢复与窗口尺寸读取/下发。
+
+use libc.sys_ioctl;
+use libc.sys_close;
+use libc.sys_open;
+use libc.sys_read;
+use libc.sys_write;
+use libc.sys_fcntl;
+use libc.F_GETFL;
+use libc.F_SETFL;
+use libc.O_RDWR;
+use libc.O_NONBLOCK;
+
+
+export error TermNotATty;
+export error TermIoctlFailed;
+
+/// Linux x86_64 的 ioctl 请求码。
+export const TCGETS: i64 = 0x5401;
+export const TCSETS: i64 = 0x5402;
+export const TIOCGWINSZ: i64 = 0x5413;
+export const TIOCSWINSZ: i64 = 0x5414;
+
+/// termios 标志与下标（Linux/glibc）。
+const IFLAG_IXON: u32 = 0x00000400;
+const IFLAG_ICRNL: u32 = 0x00000100;
+const IFLAG_INLCR: u32 = 0x00000040;
+const IFLAG_BRKINT: u32 = 0x00000002;
+const IFLAG_IGNBRK: u32 = 0x00000001;
+const IFLAG_IGNPAR: u32 = 0x00000004;
+const IFLAG_ISTRIP: u32 = 0x00000020;
+const OFLAG_OPOST: u32 = 0x00000001;
+const LFLAG_ISIG: u32 = 0x00000001;
+const LFLAG_ICANON: u32 = 0x00000002;
+const LFLAG_ECHO: u32 = 0x00000008;
+const LFLAG_ECHOE: u32 = 0x00000010;
+const LFLAG_ECHOK: u32 = 0x00000020;
+const LFLAG_ECHONL: u32 = 0x00000040;
+const LFLAG_IEXTEN: u32 = 0x00008000;
+
+const CC_VMIN: usize = 6;
+const CC_VTIME: usize = 5;
+
+/// 终端属性（与内核 struct termios 二进制兼容，本机 60 字节）。
+export struct Termios {
+    c_iflag: u32,
+    c_oflag: u32,
+    c_cflag: u32,
+    c_lflag: u32,
+    c_line: byte,
+    c_cc: [byte: 32],
+    c_ispeed: u32,
+    c_ospeed: u32,
+}
+
+/// 终端窗口尺寸（struct winsize）。
+export struct WinSize {
+    ws_row: u16,
+    ws_col: u16,
+    ws_xpixel: u16,
+    ws_ypixel: u16,
+}
+
+/// 读取 fd 的终端属性。
+/// 参数：fd 为终端文件描述符，out 为输出结构体。
+/// 返回值：无；fd 不是终端或 ioctl 失败时返回错误。
+export fn term_get_attrs(fd: i32, out: &Termios) !void {
+    const r: i32 = try sys_ioctl(fd, TCGETS, out as i64);
+    if r != 0 {
+        return error.TermIoctlFailed;
+    }
+}
+
+/// 写回 fd 的终端属性。
+/// 参数：fd 为终端文件描述符，attrs 为待设置属性。
+/// 返回值：无；失败时返回错误。
+export fn term_set_attrs(fd: i32, attrs: &const Termios) !void {
+    const r: i32 = try sys_ioctl(fd, TCSETS, attrs as i64);
+    if r != 0 {
+        return error.TermIoctlFailed;
+    }
+}
+
+/// 读取 fd 的窗口尺寸。
+/// 参数：fd 为终端文件描述符，out 为输出结构体。
+/// 返回值：无；失败时返回错误。
+export fn term_get_winsize(fd: i32, out: &WinSize) !void {
+    const r: i32 = try sys_ioctl(fd, TIOCGWINSZ, out as i64);
+    if r != 0 {
+        return error.TermIoctlFailed;
+    }
+}
+
+/// 设置 fd 的窗口尺寸。
+/// 参数：fd 为终端文件描述符，ws 为待设置尺寸。
+/// 返回值：无；失败时返回错误。
+export fn term_set_winsize(fd: i32, ws: &const WinSize) !void {
+    const r: i32 = try sys_ioctl(fd, TIOCSWINSZ, ws as i64);
+    if r != 0 {
+        return error.TermIoctlFailed;
+    }
+}
+
+/// 把 attrs 就地改成 raw 模式（保留输出处理与信号，交给我们自己转发）。
+/// 参数：attrs 为待修改的终端属性。
+/// 返回值：无。
+export fn term_make_raw(attrs: &Termios) void {
+    const iflag_clear: u32 = IFLAG_IXON | IFLAG_ICRNL | IFLAG_INLCR | IFLAG_BRKINT | IFLAG_IGNBRK | IFLAG_IGNPAR | IFLAG_ISTRIP;
+    const lflag_clear: u32 = LFLAG_ICANON | LFLAG_ECHO | LFLAG_ECHOE | LFLAG_ECHOK | LFLAG_ECHONL;
+    attrs.c_iflag = attrs.c_iflag & (4294967295u32 ^ iflag_clear);
+    attrs.c_lflag = attrs.c_lflag & (4294967295u32 ^ lflag_clear);
+    attrs.c_cc[CC_VMIN] = 1 as byte;
+    attrs.c_cc[CC_VTIME] = 0 as byte;
+}
+
+/// 进入 raw 模式并保存原属性。
+/// 参数：fd 为终端 fd，saved 为保存原属性的输出参数。
+/// 返回值：无；失败时返回错误。
+export fn term_enter_raw(fd: i32, saved: &Termios) !void {
+    try term_get_attrs(fd, saved);
+    var raw: Termios = *saved;
+    term_make_raw(&raw);
+    try term_set_attrs(fd, &raw);
+}
+
+/// 从保存的属性恢复终端。
+/// 参数：fd 为终端 fd，saved 为先前保存的属性。
+/// 返回值：无；失败时返回错误。
+export fn term_restore(fd: i32, saved: &const Termios) !void {
+    try term_set_attrs(fd, saved);
+}
+
+/// 判断 fd 是否是终端。
+/// 参数：fd 为文件描述符。
+/// 返回值：是终端返回 true。
+export fn term_is_tty(fd: i32) bool {
+    var probe: Termios = Termios{};
+    const r: i32 = sys_ioctl(fd, TCGETS, &probe as i64) catch { -1 as i32; };
+    return r == 0;
+}
+
+/// 读取当前终端尺寸，失败时返回 80x24 兜底。
+/// 参数：fd 为终端 fd。
+/// 返回值：窗口尺寸。
+export fn term_winsize_or_default(fd: i32) WinSize {
+    var ws: WinSize = WinSize{ ws_row: 0, ws_col: 0, ws_xpixel: 0, ws_ypixel: 0 };
+    const r: i32 = sys_ioctl(fd, TIOCGWINSZ, &ws as i64) catch { -1 as i32; };
+    if r != 0 || ws.ws_row == 0 || ws.ws_col == 0 {
+        return WinSize{ ws_row: 24, ws_col: 80, ws_xpixel: 0, ws_ypixel: 0 };
+    }
+    return ws;
+}
+
+/// 把 fd 设为非阻塞。
+/// 参数：fd 为目标文件描述符。
+/// 返回值：无；失败时返回错误。
+export fn term_set_nonblocking(fd: i32) !void {
+    const flags: i32 = try sys_fcntl(fd, F_GETFL, 0);
+    const merged: i32 = flags | (O_NONBLOCK as i32);
+    _ = try sys_fcntl(fd, F_SETFL, merged);
+}

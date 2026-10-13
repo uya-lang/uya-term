@@ -1,0 +1,137 @@
+// src/uyassh/pty/relay.uya - 终端转发原语
+// 说明：只提供 poll/读写/退出码处理等原语；转发主循环位于 sess/loop.uya，
+//       以便在那里直接调用 OSC 处理逻辑（Uya 不支持函数指针，因此不用回调钩子）。
+
+use libc.sys_poll;
+use libc.sys_read;
+use libc.sys_write;
+use libc.sys_waitpid;
+use libc.PollFd;
+use libc.POLLIN;
+use libc.POLLHUP;
+use libc.WNOHANG;
+
+export error RelayIoError;
+
+/// 单次读取的字节上限。
+export const RELAY_CHUNK: usize = 8192;
+
+/// poll 的等待结果。
+/// 字段：child_readable 表示 PTY 有数据可读（或已挂断），local_readable 表示本地有输入，
+///       interrupted 表示被信号打断（EINTR），此时其他字段无意义。
+export struct RelayReady {
+    child_readable: bool,
+    local_readable: bool,
+    interrupted: bool,
+}
+
+/// 创建"无事件"的等待结果。
+/// 参数：无。
+/// 返回值：三个标志均为 false 的结果。
+export fn relay_ready_none() RelayReady {
+    return RelayReady{ child_readable: false, local_readable: false, interrupted: false };
+}
+
+/// 同时等待 PTY master 与本地输入。
+/// 参数：master_fd 为 PTY master，local_fd 为本地终端 fd（<0 表示不再监听），
+///       timeout_ms 为等待毫秒数。
+/// 返回值：就绪情况；poll 出错时返回错误。
+export fn relay_wait(master_fd: i32, local_fd: i32, timeout_ms: i32) !RelayReady {
+    var ready: RelayReady = relay_ready_none();
+    var fds: [PollFd: 2] = [PollFd{}: 2];
+    fds[0].fd = master_fd;
+    fds[0].events = POLLIN;
+    var nfds: usize = 1;
+    if local_fd >= 0 {
+        fds[1].fd = local_fd;
+        fds[1].events = POLLIN;
+        nfds = 2;
+    }
+    const n: i32 = sys_poll(&fds[0], nfds, timeout_ms) catch { -1 as i32; };
+    if n < 0 {
+        // EINTR：交由调用方决定是否继续。
+        ready.interrupted = true;
+        return ready;
+    }
+    if n == 0 {
+        return ready;
+    }
+    const child_mask: i32 = (POLLIN as i32) | (POLLHUP as i32);
+    ready.child_readable = (fds[0].revents as i32 & child_mask) != 0;
+    if nfds == 2 {
+        ready.local_readable = (fds[1].revents as i32 & (POLLIN as i32)) != 0;
+    }
+    return ready;
+}
+
+/// 从 PTY master 读取一段数据。
+/// 参数：master_fd 为 PTY master，buf 为输出缓冲，cap 为容量。
+/// 返回值：读取字节数；0 表示对端已关闭；负值表示暂时无数据或出错。
+export fn relay_read_child(master_fd: i32, buf: &byte, cap: usize) i32 {
+    const got: isize = sys_read(master_fd, buf, cap) catch { -1 as isize; };
+    return got as i32;
+}
+
+/// 从本地 fd 读取一段数据。
+/// 参数：local_fd 为本地 fd，buf 为输出缓冲，cap 为容量。
+/// 返回值：读取字节数；0 表示 EOF；负值表示暂时无数据或出错。
+export fn relay_read_local(local_fd: i32, buf: &byte, cap: usize) i32 {
+    const got: isize = sys_read(local_fd, buf, cap) catch { -1 as isize; };
+    return got as i32;
+}
+
+/// 把一段数据写入本地标准输出。
+/// 参数：data 为源指针，n 为字节数。
+/// 返回值：实际写入字节数。
+export fn relay_write_stdout(data: &const byte, n: usize) usize {
+    if n == 0 {
+        return 0;
+    }
+    const w: isize = sys_write(1, data, n) catch { 0 as isize; };
+    if w <= 0 {
+        return 0;
+    }
+    return w as usize;
+}
+
+/// 把一段数据写入 PTY master（即送给子进程）。
+/// 参数：master_fd 为 PTY master，data 为源指针，n 为字节数。
+/// 返回值：实际写入字节数。
+export fn relay_write_child(master_fd: i32, data: &const byte, n: usize) usize {
+    if n == 0 {
+        return 0;
+    }
+    const w: isize = sys_write(master_fd, data, n) catch { 0 as isize; };
+    if w <= 0 {
+        return 0;
+    }
+    return w as usize;
+}
+
+/// 非阻塞回收子进程。
+/// 参数：pid 为子进程号，status_out 为已退出时写入原始状态（可为 null）。
+/// 返回值：已退出返回 true，仍在运行返回 false。
+export fn relay_child_exited(pid: i32, status_out: &i32) bool {
+    var status: i32 = 0;
+    const got: i32 = sys_waitpid(pid, &status, WNOHANG) catch { 0 as i32; };
+    if got != pid {
+        return false;
+    }
+    if status_out != null {
+        status_out[0] = status;
+    }
+    return true;
+}
+
+/// 从子进程退出状态解析退出码。
+/// 参数：status 为 waitpid 返回的原始状态。
+/// 返回值：正常退出返回退出码，被信号终止返回 128+信号。
+export fn relay_decode_status(status: i32) i32 {
+    const sig: i32 = status & 127;
+    if sig != 0 {
+        return 128 + sig;
+    }
+    return (status >> 8) & 255;
+}
+
+

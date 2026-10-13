@@ -1,0 +1,159 @@
+// src/uyassh/sess/loop.uya - 转发主循环
+// 说明：把本地 stdin 与 PTY master 双向搬运；M1 只做透传，M2 起在此接入 OSC 扫描，
+//       M3 起在本地输入路径上处理前缀键。
+
+use pty.relay.RELAY_CHUNK;
+use pty.relay.RelayReady;
+use pty.relay.relay_wait;
+use pty.relay.relay_read_child;
+use pty.relay.relay_read_local;
+use pty.relay.relay_write_stdout;
+use pty.relay.relay_write_child;
+use pty.relay.relay_child_exited;
+use pty.relay.relay_decode_status;
+
+use pty.spawn.PtySession;
+use term.termios.WinSize;
+use term.termios.term_winsize_or_default;
+use term.termios.term_set_winsize;
+
+/// 主循环的统计与状态。
+/// 字段：exit_code 为子进程退出码（未退出时为 0），exited 表示子进程已被回收，
+///       local_eof 表示本地输入已关闭，bytes_in/bytes_out 为双向字节计数。
+export struct LoopResult {
+    exit_code: i32,
+    exited: bool,
+    local_eof: bool,
+    bytes_in: u64,
+    bytes_out: u64,
+}
+
+/// 由调用方提供的每轮钩子。
+/// 说明：Uya 无函数指针，因此用"回调宿主结构体 + 直接调用"替代；本结构体只承载数据。
+export struct LoopConfig {
+    local_fd: i32,
+    watch_resize: bool,
+    dump_child: bool,
+}
+
+/// 运行转发主循环。
+/// 参数：session 为 PTY 会话，cfg 为循环配置。
+/// 返回值：循环结果（子进程退出码等）。
+export fn loop_run(session: &PtySession, cfg: &const LoopConfig) LoopResult {
+    var result: LoopResult = LoopResult{ exit_code: 0, exited: false, local_eof: false, bytes_in: 0, bytes_out: 0 };
+    var child_buf: [byte: RELAY_CHUNK] = [0: RELAY_CHUNK];
+    var local_buf: [byte: RELAY_CHUNK] = [0: RELAY_CHUNK];
+    var last_ws: WinSize = term_winsize_or_default(cfg.local_fd);
+    if cfg.watch_resize {
+        loop_push_winsize(session.master_fd, &last_ws);
+    }
+    var local_open: bool = true;
+    var running: bool = true;
+    while running {
+        const waited: !RelayReady = relay_wait(session.master_fd, loop_local_fd(local_open, cfg.local_fd), 100);
+        const ready: RelayReady = waited catch {
+            running = false;
+            RelayReady{ child_readable: false, local_readable: false, interrupted: true };
+        };
+        if cfg.watch_resize {
+            const now_ws: WinSize = term_winsize_or_default(cfg.local_fd);
+            if now_ws.ws_row != last_ws.ws_row || now_ws.ws_col != last_ws.ws_col {
+                last_ws.ws_row = now_ws.ws_row;
+                last_ws.ws_col = now_ws.ws_col;
+                last_ws.ws_xpixel = now_ws.ws_xpixel;
+                last_ws.ws_ypixel = now_ws.ws_ypixel;
+                loop_push_winsize(session.master_fd, &last_ws);
+            }
+        }
+        if ready.child_readable {
+            const got: i32 = relay_read_child(session.master_fd, &child_buf[0], RELAY_CHUNK);
+            if got > 0 {
+                result.bytes_out = result.bytes_out + (got as u64);
+                loop_on_child_output(&child_buf[0], got as usize, cfg);
+            } else if got == 0 {
+                running = false;
+            }
+        }
+        if local_open && ready.local_readable {
+            const got_local: i32 = relay_read_local(cfg.local_fd, &local_buf[0], RELAY_CHUNK);
+            if got_local > 0 {
+                result.bytes_in = result.bytes_in + (got_local as u64);
+                loop_on_local_input(session.master_fd, &local_buf[0], got_local as usize);
+            } else if got_local == 0 {
+                local_open = false;
+                result.local_eof = true;
+            }
+        }
+        var status: i32 = 0;
+        if relay_child_exited(session.child_pid, &status) {
+            result.exit_code = relay_decode_status(status);
+            result.exited = true;
+            running = false;
+        }
+    }
+    _ = loop_drain(session.master_fd, cfg);
+    return result;
+}
+
+/// 本地 fd 的监听参数：已 EOF 时返回 -1 让 poll 不再等待它。
+/// 参数：local_open 表示本地输入是否仍然打开，local_fd 为本地 fd。
+/// 返回值：用于 poll 的 fd。
+fn loop_local_fd(local_open: bool, local_fd: i32) i32 {
+    if !local_open {
+        return -1;
+    }
+    return local_fd;
+}
+
+/// 处理一段来自子进程的输出（M1：原样写本地）。
+/// 参数：data/n 为输出字节。
+/// 返回值：无。
+fn loop_on_child_output(data: &const byte, n: usize, cfg: &const LoopConfig) void {
+    if cfg.dump_child {
+        _ = relay_write_stdout(data, n);
+        return;
+    }
+    _ = relay_write_stdout(data, n);
+}
+
+/// 处理一段来自本地的输入（M1：原样写子进程）。
+/// 参数：master_fd 为 PTY master，data/n 为输入字节。
+/// 返回值：无。
+fn loop_on_local_input(master_fd: i32, data: &const byte, n: usize) void {
+    _ = relay_write_child(master_fd, data, n);
+}
+
+/// 把窗口尺寸下发到 PTY。
+/// 参数：master_fd 为 PTY master，ws 为尺寸。
+/// 返回值：无。
+fn loop_push_winsize(master_fd: i32, ws: &const WinSize) void {
+    if ws.ws_row == 0 || ws.ws_col == 0 {
+        return;
+    }
+    const applied: !void = term_set_winsize(master_fd, ws);
+    _ = applied catch { return; };
+}
+
+/// 子进程退出后读净残留输出，避免最后几行丢失。
+/// 参数：master_fd 为 PTY master，cfg 为循环配置。
+/// 返回值：固定的 0（退出码由调用方用 relay_wait_child 获得）。
+fn loop_drain(master_fd: i32, cfg: &const LoopConfig) i32 {
+    var tail: [byte: RELAY_CHUNK] = [0: RELAY_CHUNK];
+    var rounds: i32 = 0;
+    while rounds < 128 {
+        const waited: !RelayReady = relay_wait(master_fd, -1, 20);
+        const ready: RelayReady = waited catch {
+            RelayReady{ child_readable: false, local_readable: false, interrupted: true };
+        };
+        if !ready.child_readable {
+            break;
+        }
+        const got: i32 = relay_read_child(master_fd, &tail[0], RELAY_CHUNK);
+        if got <= 0 {
+            break;
+        }
+        loop_on_child_output(&tail[0], got as usize, cfg);
+        rounds = rounds + 1;
+    }
+    return 0;
+}
