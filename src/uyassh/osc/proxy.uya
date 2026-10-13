@@ -1,0 +1,306 @@
+// src/uyassh/osc/proxy.uya - 代理模式：向本地终端索取剪贴板
+// 说明：当本地终端原生支持 OSC 5522（kitty/ghostty/wezterm…）时，剪贴板由终端持有。
+//       热键触发时我们扮演"应用"：向终端请求 MIME 列表 → 请求数据 → 把结果作为粘贴
+//       事件交给子进程应用。本模块只负责请求构造与应答解析。
+
+use osc.b64.b64_encode;
+use osc.b64.b64_decode;
+use osc.b64.b64_encoded_len;
+use osc.b64.b64_decoded_max;
+use util.buf.Buf;
+use util.buf.buf_new;
+use util.buf.buf_free;
+use util.buf.buf_clear;
+use util.buf.buf_append;
+use util.buf.buf_append_byte;
+use util.buf.buf_reserve;
+use util.buf.cstr_len;
+use util.buf.bytes_eq;
+use util.buf.bytes_find;
+
+/// 代理请求的状态。
+export enum ProxyState {
+    /// 空闲。
+    idle,
+    /// 已请求 MIME 列表，等待应答。
+    waiting_mime_list,
+    /// 已请求数据，等待 DATA/DONE。
+    waiting_data,
+    /// 已收集到数据。
+    ready,
+}
+
+/// 代理请求器。
+/// 字段：state 为当前状态，mime 为已选定的 MIME，data 为累积的原始数据，
+///       error_text 记录最近一次失败原因（供诊断）。
+export struct ProxyReader {
+    state: ProxyState,
+    mime: [byte: 128],
+    data: Buf,
+    error_text: [byte: 64],
+}
+
+/// 创建代理请求器。
+/// 参数：无。
+/// 返回值：空闲状态的请求器。
+export fn proxy_new() ProxyReader {
+    return ProxyReader{
+        state: ProxyState.idle,
+        mime: [0: 128],
+        data: buf_new(),
+        error_text: [0: 64],
+    };
+}
+
+/// 释放资源。
+/// 参数：r 为请求器。
+/// 返回值：无。
+export fn proxy_free(r: &ProxyReader) void {
+    buf_free(&r.data);
+}
+
+/// 构造一条发往终端的 OSC 5522 报文（含定界符）。
+/// 参数：out 为目标缓冲，meta 为元数据文本，b64_payload/b64_len 为 base64 载荷（可为 null）。
+/// 返回值：无；失败时返回错误。
+fn proxy_emit(out: &Buf, meta: &const byte, b64_payload: &const byte, b64_len: usize) !void {
+    try buf_append_byte(out, 27 as byte);
+    try buf_append_byte(out, 93 as byte);
+    try append_text(out, "5522;" as &const byte);
+    try append_text(out, meta);
+    if b64_payload != null {
+        try buf_append_byte(out, 59 as byte);
+        try buf_append(out, b64_payload, b64_len);
+    }
+    try buf_append_byte(out, 27 as byte);
+    try buf_append_byte(out, 92 as byte);
+}
+
+/// 追加一段 C 字符串（本模块内部用）。
+/// 参数：out 为目标，text 为源。
+/// 返回值：无；失败时返回错误。
+fn append_text(out: &Buf, text: &const byte) !void {
+    if text == null {
+        return;
+    }
+    try buf_append(out, text, cstr_len(text));
+}
+
+/// 发起"MIME 列表"请求（载荷为 base64 的句点）。
+/// 参数：r 为请求器，out 为目标缓冲。
+/// 返回值：无；失败时返回错误。
+export fn proxy_request_mime_list(r: &ProxyReader, out: &Buf) !void {
+    buf_clear(&r.data);
+    r.mime[0] = 0 as byte;
+    r.error_text[0] = 0 as byte;
+    try proxy_emit(out, "type=read" as &const byte, "Lg==" as &const byte, 4);
+    r.state = ProxyState.waiting_mime_list;
+}
+
+/// 发起"读取数据"请求（请求指定 MIME 列表）。
+/// 参数：r 为请求器，out 为目标缓冲，mime_b64 为 base64 后的 MIME 列表，len 为其长度。
+/// 返回值：无；失败时返回错误。
+export fn proxy_request_data(r: &ProxyReader, out: &Buf, mime_b64: &const byte, len: usize) !void {
+    buf_clear(&r.data);
+    try proxy_emit(out, "type=read" as &const byte, mime_b64, len);
+    r.state = ProxyState.waiting_data;
+}
+
+/// 处理一条来自终端的 OSC 5522 应答负载（不含 ESC ] 5522; 前缀与终止符）。
+/// 参数：r 为请求器，payload/n 为应答负载。
+/// 返回值：无。
+export fn proxy_feed_response(r: &ProxyReader, payload: &const byte, n: usize) void {
+    if n == 0 {
+        return;
+    }
+    // 负载形如 "type=read:status=DATA:mime=<b64>;<b64 data>"。
+    const status_at: i64 = util_find(payload, n, "status=" as &const byte, 7);
+    if status_at < 0 {
+        return;
+    }
+    const sp: usize = (status_at as usize) + 7;
+    if matches_at(payload, n, sp, "OK" as &const byte) {
+        return;
+    }
+    if matches_at(payload, n, sp, "DONE" as &const byte) {
+        if r.state == ProxyState.waiting_data {
+            r.state = ProxyState.ready;
+        }
+        if r.state == ProxyState.waiting_mime_list {
+            r.state = ProxyState.idle;
+        }
+        return;
+    }
+    if matches_at(payload, n, sp, "ENOSYS" as &const byte) || matches_at(payload, n, sp, "EPERM" as &const byte) ||
+        matches_at(payload, n, sp, "EBUSY" as &const byte) || matches_at(payload, n, sp, "EINVAL" as &const byte) {
+        set_error(r);
+        r.state = ProxyState.idle;
+        return;
+    }
+    if matches_at(payload, n, sp, "DATA" as &const byte) {
+        proxy_handle_data(r, payload, n);
+    }
+}
+
+/// 处理 DATA 包：解析 mime 与数据并累积。
+/// 参数：r 为请求器，payload/n 为应答负载。
+/// 返回值：无。
+fn proxy_handle_data(r: &ProxyReader, payload: &const byte, n: usize) void {
+    const mime_marker: &const byte = "mime=";
+    const mi: i64 = util_find(payload, n, mime_marker, 5);
+    if mi < 0 {
+        return;
+    }
+    const mime_start: usize = (mi as usize) + 5;
+    var mime_end: usize = mime_start;
+    while mime_end < n && payload[mime_end] != 59 as byte && payload[mime_end] != 58 as byte {
+        mime_end = mime_end + 1;
+    }
+    var decoded_mime: [byte: 128] = [0: 128];
+    const dm: usize = b64_decode(payload + mime_start, mime_end - mime_start, &decoded_mime[0], 128) catch { 0 as usize; };
+    if dm == 0 {
+        return;
+    }
+    // 句点表示"可用 MIME 列表"。
+    const is_list: bool = dm == 1 && decoded_mime[0] == 46 as byte;
+    var data_start: usize = mime_end;
+    while data_start < n && payload[data_start] != 59 as byte {
+        data_start = data_start + 1;
+    }
+    if data_start >= n {
+        return;
+    }
+    data_start = data_start + 1;
+    const b64_len: usize = n - data_start;
+    if is_list {
+        // 选定首个图片类型（否则退回文本）。
+        const chosen: usize = pick_mime(&decoded_mime[0], dm, &r.mime[0], 128);
+        _ = chosen;
+        return;
+    }
+    var chunk: Buf = buf_new();
+    defer { buf_free(&chunk); }
+    const need: usize = b64_decoded_max(b64_len);
+    const reserved: !void = buf_reserve(&chunk, need);
+    _ = reserved catch { return; };
+    const got: usize = b64_decode(payload + data_start, b64_len, chunk.data, chunk.cap) catch { return; };
+    const appended: !void = buf_append(&r.data, chunk.data, got);
+    _ = appended catch { return; };
+    if r.mime[0] == 0 as byte {
+        _ = copy_text(&r.mime[0], 128, &decoded_mime[0], dm);
+    }
+}
+
+/// 从 MIME 列表中挑选一个合适的类型写入 chosen。
+/// 参数：list/n 为空格分隔列表，chosen/cap 为输出。
+/// 返回值：写入长度。
+fn pick_mime(list: &const byte, n: usize, chosen: &byte, cap: usize) usize {
+    // 优先图片，其次文本。
+    if list_has(list, n, "image/png" as &const byte) {
+        return copy_text(chosen, cap, "image/png" as &const byte, cstr_len("image/png" as &const byte));
+    }
+    if list_has(list, n, "image/jpeg" as &const byte) {
+        return copy_text(chosen, cap, "image/jpeg" as &const byte, cstr_len("image/jpeg" as &const byte));
+    }
+    if list_has(list, n, "image/webp" as &const byte) {
+        return copy_text(chosen, cap, "image/webp" as &const byte, cstr_len("image/webp" as &const byte));
+    }
+    if list_has(list, n, "text/plain" as &const byte) {
+        return copy_text(chosen, cap, "text/plain" as &const byte, cstr_len("text/plain" as &const byte));
+    }
+    // 没有偏好类型：取第一项。
+    var end: usize = 0;
+    while end < n && list[end] != 32 as byte && list[end] != 10 as byte && list[end] != 9 as byte {
+        end = end + 1;
+    }
+    if end == 0 {
+        return 0;
+    }
+    return copy_text(chosen, cap, list, end);
+}
+
+/// 判断空格分隔列表中是否包含某个词。
+/// 参数：list/n 为列表，word 为词。
+/// 返回值：包含返回 true。
+fn list_has(list: &const byte, n: usize, word: &const byte) bool {
+    const wlen: usize = cstr_len(word);
+    if wlen == 0 {
+        return false;
+    }
+    var i: usize = 0;
+    while i + wlen <= n {
+        const at_start: bool = i == 0 || list[i - 1] == 32 as byte || list[i - 1] == 10 as byte;
+        var at_end: bool = true;
+        if i + wlen < n {
+            const after: byte = list[i + wlen];
+            if after != 32 as byte && after != 10 as byte && after != 9 as byte {
+                at_end = false;
+            }
+        }
+        if at_start && at_end && bytes_eq(list + i, wlen, word, wlen) {
+            return true;
+        }
+        i = i + 1;
+    }
+    return false;
+}
+
+/// 把一段字节复制进定长文本缓冲。
+/// 参数：dst/cap 为目标，src/n 为源。
+/// 返回值：写入长度。
+fn copy_text(dst: &byte, cap: usize, src: &const byte, n: usize) usize {
+    var i: usize = 0;
+    while i < n && i + 1 < cap {
+        dst[i] = src[i];
+        i = i + 1;
+    }
+    dst[i] = 0 as byte;
+    return i;
+}
+
+/// 判断 payload 在 off 处是否是给定词。
+/// 参数：payload/n 为负载，off 为位置，word 为词。
+/// 返回值：是返回 true。
+fn matches_at(payload: &const byte, n: usize, off: usize, word: &const byte) bool {
+    const wlen: usize = cstr_len(word);
+    if off + wlen > n {
+        return false;
+    }
+    return bytes_eq(payload + off, wlen, word, wlen);
+}
+
+/// 记录一次失败原因。
+/// 参数：r 为请求器。
+/// 返回值：无。
+fn set_error(r: &ProxyReader) void {
+    const msg: &const byte = "terminal denied or unsupported";
+    _ = copy_text(&r.error_text[0], 64, msg, cstr_len(msg));
+}
+
+/// 判断是否已收集好数据。
+/// 参数：r 为请求器。
+/// 返回值：就绪返回 true。
+export fn proxy_ready(r: &const ProxyReader) bool {
+    return r.state == ProxyState.ready;
+}
+
+/// 判断是否正在等待终端应答。
+/// 参数：r 为请求器。
+/// 返回值：等待中返回 true。
+export fn proxy_busy(r: &const ProxyReader) bool {
+    return r.state == ProxyState.waiting_mime_list || r.state == ProxyState.waiting_data;
+}
+
+/// 组装读数据请求所需的 base64 MIME（把已选 MIME 编码）。
+/// 参数：r 为请求器，out/cap 为目标。
+/// 返回值：编码长度。
+export fn proxy_mime_b64(r: &const ProxyReader, out: &byte, cap: usize) usize {
+    const n: usize = cstr_len(&r.mime[0]);
+    if n == 0 {
+        return 0;
+    }
+    return b64_encode(&r.mime[0], n, out, cap) catch { 0 as usize; };
+}
+
+fn util_find(data: &const byte, n: usize, needle: &const byte, nlen: usize) i64 {
+    return bytes_find(data, n, needle, nlen);
+}
