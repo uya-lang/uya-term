@@ -263,6 +263,7 @@ fn handle_read(h: &OscHandler, meta: &const byte, meta_len: usize,
 /// 发送可用 MIME 列表（DATA:mime=Lg==）。
 /// 参数：h 为处理器，out 为应答缓冲，primary 为是否主选区，pw_ok 为口令是否有效。
 /// 返回值：无。
+/// 说明：载荷必须是 **base64 编码后的**列表，不是明文 —— 见 emit_mime_list_data 的注释。
 fn send_mime_list(h: &OscHandler, out: &Buf, primary: bool, pw_ok: bool) void {
     const opened: !void = emit_read_status(out, "OK" as &const byte, null, 0, primary);
     _ = opened catch { return; };
@@ -270,10 +271,29 @@ fn send_mime_list(h: &OscHandler, out: &Buf, primary: bool, pw_ok: bool) void {
     defer { buf_free(&list); }
     const built: !void = build_mime_list(h, &list, pw_ok);
     _ = built catch { return; };
-    const sent: !void = emit_read_data(out, DOT_B64, cstr_len(DOT_B64), list.data, list.len, null, 0);
+    const sent: !void = emit_mime_list_data(out, &list);
     _ = sent catch { return; };
     const done: !void = emit_read_status(out, "DONE" as &const byte, null, 0, false);
     _ = done catch { return; };
+}
+
+/// 把 MIME 列表按 5522 规范发成 DATA 帧（载荷 base64 编码）。
+/// 参数：out 为应答缓冲，list 为明文 MIME 列表（空格分隔）。
+/// 返回值：无；失败时返回错误。
+///
+/// **载荷必须是 base64**：`mime=Lg==` 里的 `Lg==` 是"句点"的 base64，它标记的是
+/// "这一帧装的是可用 MIME 列表"；而**帧的载荷**同样按规范的 DATA 帧处理 —— 也就是
+/// 必须 base64 编码。这里曾经直接把明文列表当载荷发出去（`;image/png`），
+/// 症状很隐蔽：读端对每个 DATA 块**单独 base64 解码**（规范要求每块自带 padding），
+/// 明文 `image/png` 长度 9 不是 4 的倍数，解码直接失败 ⇒ 那一帧被整块丢弃。
+/// 于是"先问格式列表、再决定取什么"的客户端永远看不到可用格式，
+/// 而**数据帧**（我们编码是对的）却一切正常 —— 一半对一半错，
+/// 表现得像"贴图能贴、但取不到格式信息"，很难一眼看出是编码问题。
+fn emit_mime_list_data(out: &Buf, list: &Buf) !void {
+    var encoded: Buf = buf_new();
+    defer { buf_free(&encoded); }
+    try append_b64(&encoded, list.data, list.len);
+    try emit_read_data(out, DOT_B64, cstr_len(DOT_B64), encoded.data, encoded.len, null, 0);
 }
 
 /// 组装可用 MIME 列表（空格分隔）。
@@ -713,8 +733,8 @@ export fn handler_emit_paste_event(h: &OscHandler, out: &Buf, has_content: bool)
     }
     // 1) OK 包
     try emit_paste_ok(out, pw);
-    // 2) DATA 包（mime=Lg==，载荷是 MIME 列表）
-    try emit_read_data(out, DOT_B64, cstr_len(DOT_B64), list.data, list.len, null, 0);
+    // 2) DATA 包（mime=Lg==，载荷是 base64 后的 MIME 列表 —— 与 read 路径同一份实现）
+    try emit_mime_list_data(out, &list);
     // 3) DONE 包
     try emit_read_status(out, "DONE" as &const byte, null, 0, false);
 }
