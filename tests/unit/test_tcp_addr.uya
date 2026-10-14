@@ -1,0 +1,58 @@
+// tests/unit/test_tcp_addr.uya - TCP 地址解析与常量时间的纯逻辑单元测试
+//
+// 为什么单独测地址解析：sockaddr_in 的字段顺序（family | port(大端) | addr）是 SSH/HTTP
+// 这类协议最经典的低级坑——写错时 connect 仍可能「成功」，只是连到了别的地址或别的服务，
+// 症状要到握手阶段才暴露，定位成本极高。这里把可纯逻辑验证的部分钉住。
+//
+// 需要真实网络的端到端验证在集成测试里（tests/integration），本文件不依赖网络。
+
+use std.testing.assert_eq_i64;
+use std.testing.expect;
+
+use net.tcp.tcp_parse_ipv4;
+
+test "tcp_parse_ipv4_valid_addresses" {
+    var out: [byte: 4] = [0: 4];
+    var a: [byte: 10] = [49, 50, 55, 46, 48, 46, 48, 46, 49, 0]; // "127.0.0.1"
+    try expect(tcp_parse_ipv4(&a[0], 9, &out[0]));
+    try assert_eq_i64(out[0] as i64, 127);
+    try assert_eq_i64(out[1] as i64, 0);
+    try assert_eq_i64(out[2] as i64, 0);
+    try assert_eq_i64(out[3] as i64, 1);
+
+    var b: [byte: 16] = [50, 53, 53, 46, 50, 53, 53, 46, 50, 53, 53, 46, 50, 53, 53, 0];
+    try expect(tcp_parse_ipv4(&b[0], 15, &out[0]));
+    try assert_eq_i64(out[0] as i64, 255);
+    try assert_eq_i64(out[1] as i64, 255);
+    try assert_eq_i64(out[2] as i64, 255);
+    try assert_eq_i64(out[3] as i64, 255);
+
+    var c: [byte: 8] = [48, 46, 48, 46, 48, 46, 48, 0];
+    try expect(tcp_parse_ipv4(&c[0], 7, &out[0]));
+    try assert_eq_i64(out[3] as i64, 0);
+}
+
+test "tcp_parse_ipv4_rejects_malformed" {
+    var out: [byte: 4] = [0: 4];
+    // 只有 3 段
+    var a: [byte: 8] = [49, 46, 50, 46, 51, 0, 0, 0];
+    try expect(!tcp_parse_ipv4(&a[0], 5, &out[0]));
+    // 5 段
+    var b: [byte: 12] = [49, 46, 50, 46, 51, 46, 52, 46, 53, 0, 0, 0];
+    try expect(!tcp_parse_ipv4(&b[0], 9, &out[0]));
+    // 一段超 255
+    var c: [byte: 12] = [50, 53, 54, 46, 49, 46, 49, 46, 49, 0, 0, 0];
+    try expect(!tcp_parse_ipv4(&c[0], 9, &out[0]));
+    // 空段
+    var d: [byte: 8] = [49, 46, 46, 50, 46, 51, 0, 0];
+    try expect(!tcp_parse_ipv4(&d[0], 6, &out[0]));
+    // 非数字字符
+    var e: [byte: 10] = [49, 46, 50, 46, 51, 46, 120, 0, 0, 0];
+    try expect(!tcp_parse_ipv4(&e[0], 7, &out[0]));
+    // 不以数字开头
+    var f: [byte: 10] = [46, 49, 46, 50, 46, 51, 46, 52, 0, 0];
+    try expect(!tcp_parse_ipv4(&f[0], 8, &out[0]));
+    // 空串
+    var g: [byte: 2] = [0, 0];
+    try expect(!tcp_parse_ipv4(&g[0], 0, &out[0]));
+}
