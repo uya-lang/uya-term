@@ -246,6 +246,91 @@ fn build_read_request(out: &Buf, pw: &const byte, pw_len: usize, mime: &const by
     try buf_append(out, mime, mime_len);
 }
 
+/// 构造"列出可用 MIME"的读请求（载荷为字面量 Lg==，即句点的 base64）。
+/// 参数：out 为目标缓冲。
+/// 返回值：无；失败时返回错误。
+fn build_mime_list_request(out: &Buf) !void {
+    try buf_append(out, "5522;type=read;Lg==" as &const byte,
+        cstr_len("5522;type=read;Lg==" as &const byte));
+}
+
+test "MIME 列表帧的载荷必须是 base64（不是明文）" {
+    var store: ClipStore = ClipStore{};
+    const opened: !void = clip_store_open(&store, TEST_DIR);
+    _ = opened catch { };
+    clip_store_reset(&store);
+
+    // 仓库里放一张真 PNG，让列表里出现 image/png（否则只会报 text/plain）。
+    var png: [byte: 32] = [137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 0, 0, 0, 0];
+    const png_len: usize = 16;
+    var put_ok: bool = true;
+    const stored: u32 = clip_put(&store, &png[0], png_len, "shot.png" as &const byte) catch {
+        put_ok = false;
+        0 as u32;
+    };
+    try expect(put_ok);
+
+    var handler: OscHandler = handler_new(ClipMode.serve, &store);
+    var req: Buf = buf_new();
+    const built: !void = build_mime_list_request(&req);
+    var req_ok: bool = true;
+    _ = built catch { req_ok = false; };
+    try expect(req_ok);
+
+    var resp: Buf = buf_new();
+    try expect(handler_osc(&handler, req.data, req.len, &resp));
+    try expect(out_has(&resp, "status=DATA:mime=Lg==" as &const byte));
+
+    // 关键断言：把载荷按 base64 解出来，必须正好是明文列表 "image/png"。
+    // 这条测试的意义在于**载荷编码**，而不是字段名 —— 之前只断言
+    // "DATA:mime=Lg==" 这个标记存在，明文载荷照样能过，于是这个 bug 一直躲着。
+    // 真实读端（uya-agent 的 clipt）对每个 DATA 块**单独 base64 解码**，
+    // 明文 "image/png" 长度 9 不是 4 的倍数 ⇒ 解码失败 ⇒ 整帧被丢弃。
+    var decoded: [byte: 512] = [0: 512];
+    const n: usize = extract_data_payload(&resp, &decoded[0], 512);
+    try expect(n > 0);
+    try expect(bytes_eq(&decoded[0], n, "image/png" as &const byte, cstr_len("image/png" as &const byte)));
+
+    handler_free(&handler);
+    buf_free(&req);
+    buf_free(&resp);
+    clip_store_close(&store);
+}
+
+test "粘贴事件里的 MIME 列表帧同样是 base64" {
+    var store: ClipStore = ClipStore{};
+    const opened: !void = clip_store_open(&store, TEST_DIR);
+    _ = opened catch { };
+    clip_store_reset(&store);
+    var png: [byte: 32] = [137, 80, 78, 71, 13, 10, 26, 10, 0, 0, 0, 13, 0, 0, 0, 0];
+    var put_ok: bool = true;
+    const stored: u32 = clip_put(&store, &png[0], 16, "shot.png" as &const byte) catch {
+        put_ok = false;
+        0 as u32;
+    };
+    try expect(put_ok);
+    _ = stored;
+
+    var handler: OscHandler = handler_new(ClipMode.serve, &store);
+    var out: Buf = buf_new();
+    const event: !void = handler_emit_paste_event(&handler, &out, true);
+    var event_ok: bool = true;
+    _ = event catch { event_ok = false; };
+    try expect(event_ok);
+
+    // 三段结构照旧，且列表帧载荷是 base64 的 "image/png"。
+    try expect(out_has(&out, "type=read:status=OK" as &const byte));
+    try expect(out_has(&out, "type=read:status=DATA:mime=Lg==" as &const byte));
+    try expect(out_has(&out, "type=read:status=DONE" as &const byte));
+    var decoded: [byte: 512] = [0: 512];
+    const n: usize = extract_data_payload(&out, &decoded[0], 512);
+    try expect(bytes_eq(&decoded[0], n, "image/png" as &const byte, cstr_len("image/png" as &const byte)));
+
+    handler_free(&handler);
+    buf_free(&out);
+    clip_store_close(&store);
+}
+
 /// 从应答缓冲中提取第一个 DATA 包的 base64 数据并解码。
 /// 参数：resp 为应答，out/cap 为输出。
 /// 返回值：解码长度；未找到返回 0。
