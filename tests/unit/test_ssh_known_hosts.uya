@@ -1,0 +1,166 @@
+// tests/unit/test_ssh_known_hosts.uya - known_hosts 匹配与策略
+//
+// 重点覆盖**哈希条目**：现代 OpenSSH 默认 HashKnownHosts yes，本机 known_hosts
+// 实测 65/65 行都是 `|1|salt|hash` 形式。不实现 HMAC-SHA1 匹配的话，每台机器
+// 都会被判成「未知主机」——而症状看起来像「文件没读到」，容易往路径上排查。
+//
+// 同时覆盖：明文条目、通配符、marker（@revoked）、非 22 端口的 `[host]:port` 规范化。
+
+use std.testing.assert_eq_i64;
+use std.testing.expect;
+
+use ssh.known_hosts.HostCheck;
+use ssh.known_hosts.HostKeyStatus;
+use ssh.known_hosts.known_hosts_check;
+use ssh.known_hosts.known_hosts_allows;
+use ssh.known_hosts.kh_hmac_sha1;
+use ssh.known_hosts.kh_hash_host;
+
+/// 造结果结构。
+/// 参数：无。
+/// 返回值：unknown 状态。
+fn hc_new() HostCheck {
+    return HostCheck{ status: HostKeyStatus.unknown, revoked: false, ca: false };
+}
+
+test "known_hosts_hmac_sha1_rfc2202_case2" {
+    // RFC 2202 用例 2：HMAC-SHA1("key", "The quick brown fox jumps over the lazy dog")
+    //   = de7c9b85b8b78aa6bc8a7a36f70a90701c9db4d9
+    var key: [byte: 3] = [107, 101, 121];
+    var msg: [byte: 43] = [
+        84, 104, 101, 32, 113, 117, 105, 99, 107, 32, 98, 114, 111, 119, 110, 32,
+        102, 111, 120, 32, 106, 117, 109, 112, 115, 32, 111, 118, 101, 114, 32, 116,
+        104, 101, 32, 108, 97, 122, 121, 32, 100, 111, 103,
+    ];
+    var mac: [byte: 20] = [0: 20];
+    kh_hmac_sha1(&key[0], 3, &msg[0], 43, &mac[0]);
+    var want: [byte: 20] = [
+        222, 124, 155, 133, 184, 183, 138, 166, 188, 138,
+        122, 54, 247, 10, 144, 112, 28, 157, 180, 217,
+    ];
+    var i: usize = 0;
+    while i < 20 {
+        try assert_eq_i64(mac[i] as i64, want[i] as i64);
+        i = i + 1;
+    }
+}
+
+test "known_hosts_hash_host_canonicalization" {
+    // 非 22 端口必须规范化成 [host]:port，否则哈希条目的被哈希串对不上
+    var host: [byte: 10] = [108, 111, 99, 97, 108, 104, 111, 115, 116, 0];
+    var out: [byte: 64] = [0: 64];
+    var n: usize = 0;
+    try expect(kh_hash_host(&out[0], 64, &n, &host[0], 22));
+    try assert_eq_i64(n as i64, 9);
+    try assert_eq_i64(out[0] as i64, 108); // 'l'
+    try expect(kh_hash_host(&out[0], 64, &n, &host[0], 2222));
+    try assert_eq_i64(n as i64, 16);
+    try assert_eq_i64(out[0] as i64, 91);  // '['
+    try assert_eq_i64(out[10] as i64, 93); // ']'
+    try assert_eq_i64(out[11] as i64, 58); // ':'
+}
+
+test "known_hosts_hashed_entry_match_and_mismatch" {
+    // 哈希条目：salt=00..13，host="hashedhost"，blob 是合成的 ed25519 公钥
+    var text: [byte: 141] = [
+        124, 49, 124, 65, 65, 69, 67, 65, 119, 81, 70, 66, 103, 99, 73, 67,
+        81, 111, 76, 68, 65, 48, 79, 68, 120, 65, 82, 69, 104, 77, 61, 124,
+        99, 51, 56, 56, 90, 88, 106, 104, 82, 74, 122, 98, 71, 49, 103, 118,
+        75, 80, 108, 102, 69, 80, 48, 50, 79, 104, 69, 61, 32, 115, 115, 104,
+        45, 101, 100, 50, 53, 53, 49, 57, 32, 65, 65, 65, 65, 67, 51, 78,
+        122, 97, 67, 49, 108, 90, 68, 73, 49, 78, 84, 69, 53, 65, 65, 65,
+        65, 73, 65, 85, 81, 71, 121, 89, 120, 80, 69, 100, 83, 88, 87, 104,
+        122, 102, 111, 109, 85, 110, 54, 113, 49, 119, 77, 118, 87, 52, 101, 122,
+        51, 65, 103, 48, 89, 73, 121, 52, 53, 82, 69, 57, 97,
+    ];
+    var host: [byte: 11] = [104, 97, 115, 104, 101, 100, 104, 111, 115, 116, 0];
+    var kt: [byte: 11] = [115, 115, 104, 45, 101, 100, 50, 53, 53, 49, 57, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    // 真 blob（与条目里的 base64 一致）
+    var blob: [byte: 51] = [
+        0, 0, 0, 11, 115, 115, 104, 45, 101, 100, 50, 53, 53, 49, 57, 0,
+        0, 0, 32, 5, 16, 27, 38, 49, 60, 71, 82, 93, 104, 115, 126, 137,
+        148, 159, 170, 181, 192, 203, 214, 225, 236, 247, 2, 13, 24, 35, 46,
+        57, 68, 79, 90,
+    ];
+    var out: HostCheck = hc_new();
+    known_hosts_check(&text[0], 141, &host[0], 22, &kt[0], 11, &blob[0], 51, &out);
+    try assert_eq_i64(out.status as i64, HostKeyStatus.ok as i64);
+
+    // 换一个字节的密钥 → mismatch
+    var bad: [byte: 51] = [0: 51];
+    var i: usize = 0;
+    while i < 51 {
+        bad[i] = blob[i];
+        i = i + 1;
+    }
+    bad[30] = bad[30] ^ (1 as byte);
+    var out2: HostCheck = hc_new();
+    known_hosts_check(&text[0], 141, &host[0], 22, &kt[0], 11, &bad[0], 51, &out2);
+    try assert_eq_i64(out2.status as i64, HostKeyStatus.mismatch as i64);
+
+    // 无关主机 → unknown
+    var other: [byte: 12] = [111, 116, 104, 101, 114, 104, 111, 115, 116, 120, 121, 0];
+    var out3: HostCheck = hc_new();
+    known_hosts_check(&text[0], 141, &other[0], 22, &kt[0], 11, &blob[0], 51, &out3);
+    try assert_eq_i64(out3.status as i64, HostKeyStatus.unknown as i64);
+}
+
+test "known_hosts_plaintext_entry_and_wildcard" {
+    // 明文条目 + 通配符：*.example.com 应匹配 a.example.com，不匹配 example.com
+    var line: [byte: 60] = [
+        42, 46, 101, 120, 97, 109, 112, 108, 101, 46, 99, 111, 109, 32, 115, 115,
+        104, 45, 101, 100, 50, 53, 53, 49, 57, 32, 65, 65, 65, 65, 67, 51, 78, 122,
+        97, 67, 49, 108, 90, 68, 73, 49, 78, 84, 69, 53, 65, 65, 65, 65, 73, 65, 85,
+        81, 71, 121, 89, 120, 80, 69, 0,
+    ];
+    var kt: [byte: 11] = [115, 115, 104, 45, 101, 100, 50, 53, 53, 49, 57, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    var blob: [byte: 51] = [
+        0, 0, 0, 11, 115, 115, 104, 45, 101, 100, 50, 53, 53, 49, 57, 0,
+        0, 0, 32, 5, 16, 27, 38, 49, 60, 71, 82, 93, 104, 115, 126, 137,
+        148, 159, 170, 181, 192, 203, 214, 225, 236, 247, 2, 13, 24, 35, 46,
+        57, 68, 79, 90,
+    ];
+    // 匹配 a.example.com
+    var h1: [byte: 16] = [97, 46, 101, 120, 97, 109, 112, 108, 101, 46, 99, 111, 109, 0, 0, 0];
+    var o1: HostCheck = hc_new();
+    known_hosts_check(&line[0], 59, &h1[0], 22, &kt[0], 11, &blob[0], 51, &o1);
+    try assert_eq_i64(o1.status as i64, HostKeyStatus.mismatch as i64);
+
+    // 不匹配 example.com（通配符要求前缀至少一个字符）
+    var h2: [byte: 14] = [101, 120, 97, 109, 112, 108, 101, 46, 99, 111, 109, 0, 0, 0];
+    var o2: HostCheck = hc_new();
+    known_hosts_check(&line[0], 59, &h2[0], 22, &kt[0], 11, &blob[0], 51, &o2);
+    try assert_eq_i64(o2.status as i64, HostKeyStatus.unknown as i64);
+}
+
+test "known_hosts_revoked_entry_blocks" {
+    // @revoked 条目：即使密钥一致也必须拦下（这是安全属性，不能靠密钥比对）
+    var line: [byte: 80] = [
+        64, 114, 101, 118, 111, 107, 101, 100, 32, 104, 97, 115, 104, 101, 100, 104,
+        111, 115, 116, 32, 115, 115, 104, 45, 101, 100, 50, 53, 53, 49, 57, 32, 65,
+        65, 65, 65, 67, 51, 78, 122, 97, 67, 49, 108, 90, 68, 73, 49, 78, 84, 69,
+        53, 65, 65, 65, 65, 73, 65, 85, 81, 71, 121, 89, 120, 80, 69, 0, 0, 0, 0,
+    ];
+    var host: [byte: 11] = [104, 97, 115, 104, 101, 100, 104, 111, 115, 116, 0];
+    var kt: [byte: 11] = [115, 115, 104, 45, 101, 100, 50, 53, 53, 49, 57, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0];
+    var blob: [byte: 51] = [
+        0, 0, 0, 11, 115, 115, 104, 45, 101, 100, 50, 53, 53, 49, 57, 0,
+        0, 0, 32, 5, 16, 27, 38, 49, 60, 71, 82, 93, 104, 115, 126, 137,
+        148, 159, 170, 181, 192, 203, 214, 225, 236, 247, 2, 13, 24, 35, 46,
+        57, 68, 79, 90,
+    ];
+    var out: HostCheck = hc_new();
+    known_hosts_check(&line[0], 66, &host[0], 22, &kt[0], 11, &blob[0], 51, &out);
+    try expect(out.revoked);
+    try expect(!known_hosts_allows(out.status, true));
+}
+
+test "known_hosts_policy" {
+    // 策略：ok 放行；unknown 仅在 accept_new 时放行；mismatch/other_type 一律拒绝
+    try expect(known_hosts_allows(HostKeyStatus.ok, false));
+    try expect(known_hosts_allows(HostKeyStatus.ok, true));
+    try expect(!known_hosts_allows(HostKeyStatus.unknown, false));
+    try expect(known_hosts_allows(HostKeyStatus.unknown, true));
+    try expect(!known_hosts_allows(HostKeyStatus.mismatch, true));
+    try expect(!known_hosts_allows(HostKeyStatus.other_type, true));
+}
