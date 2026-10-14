@@ -25,21 +25,19 @@ fn eq(a: &const byte, b: &const byte, n: usize) !void {
 }
 
 test "kdf_secret_to_mpint_strips_leading_zeros" {
-    // 小端秘密的最高字节为 0 → 大端前导零要去掉
+    // 首字节为 0 → 作为大端数的前导零，要去掉（输出比输入短）
     var secret: [byte: 32] = [0: 32];
     var i: usize = 0;
     while i < 32 {
         secret[i] = (((i + 1) % (256 as usize)) as! byte).value;
         i = i + 1;
     }
-    secret[31] = 0; // 小端最高字节 = 0 → 大端最低…（注意小端/大端方向）
+    secret[0] = 0;
     var out: [byte: 40] = [0: 40];
     var n: usize = 0;
     try expect(kdf_secret_to_mpint(&out[0], 40, &n, &secret[0]));
-    // 参考实现：Python
-    //   be = secret[::-1]; 去掉前导零; 若最高位为 1 则补 0
-    // 这里只验长度与首字节的定性性质
-    try expect(n > 0 && n <= 33);
+    try assert_eq_i64(n as i64, 31);
+    try assert_eq_i64(out[0] as i64, 2);
 }
 
 test "kdf_secret_to_mpint_zero_is_empty" {
@@ -52,16 +50,35 @@ test "kdf_secret_to_mpint_zero_is_empty" {
 }
 
 test "kdf_secret_to_mpint_high_bit_gets_padding" {
-    // 让 mpint 体的最高位为 1：小端秘密的最低字节为 0x80 时，大端体首字节最高位为 1
+    // RFC 8731：把 32 字节按**大端**解释。首字节 0x80 的最高位为 1 → 必须补 0x00。
     var secret: [byte: 32] = [0: 32];
     secret[0] = 0x80 as byte;
     var out: [byte: 40] = [0: 40];
     var n: usize = 0;
     try expect(kdf_secret_to_mpint(&out[0], 40, &n, &secret[0]));
-    // 必须补了 0x00 → 首字节为 0，长度 = 1 + 1（只有最低字节非零）
+    // 首字节 0x80 为体最高位 → 补 0x00；其余 31 个 0x00 是**尾随零**（有意义），保留
+    try assert_eq_i64(n as i64, 33);
     try assert_eq_i64(out[0] as i64, 0);
-    try assert_eq_i64(n as i64, 2);
     try assert_eq_i64(out[1] as i64, 0x80);
+    try assert_eq_i64(out[32] as i64, 0);
+}
+
+test "kdf_secret_to_mpint_keeps_byte_order" {
+    // 关键：**不反转字节**。32 字节小端 u 坐标要「按大端解释」，
+    // 即字节序列原样保留，只做去零/补零。
+    var secret: [byte: 32] = [0: 32];
+    secret[0] = 0x01 as byte;
+    secret[1] = 0x02 as byte;
+    secret[31] = 0x03 as byte;
+    var out: [byte: 40] = [0: 40];
+    var n: usize = 0;
+    try expect(kdf_secret_to_mpint(&out[0], 40, &n, &secret[0]));
+    // secret[0]=0x01 非零 → 无前导零可去；首字节最高位为 0 → 无需补零。
+    // 于是 32 字节原样保留（中间的 0x00 是数值的一部分，不能删）。
+    try assert_eq_i64(n as i64, 32);
+    try assert_eq_i64(out[0] as i64, 1);
+    try assert_eq_i64(out[1] as i64, 2);
+    try assert_eq_i64(out[31] as i64, 3);
 }
 
 test "kdf_derive_a_to_f_against_reference" {

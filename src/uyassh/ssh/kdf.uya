@@ -27,7 +27,10 @@ const KDF_MAX: usize = 128;
 
 /// 计算交换哈希 H = HASH(V_C || V_S || I_C || I_S || K_S || e || f || K)（curve25519 版，§8）。
 ///
-/// 参数：h 为 32 字节输出；v_c/v_s 为版本串（不含 CR LF）；i_c/i_s 为 KEXINIT 载荷；
+/// 参数：h 为 32 字节输出；v_c/v_s 为版本串——**必须已去掉行尾的 CR/LF**
+///       （RFC 4253 §8 明确要求不含 CR LF；带着 LF 算出来的 H 与对端不一致，
+///       症状就是主机密钥验签稳定失败，而 KEX 本身看起来没问题）；
+///       i_c/i_s 为 KEXINIT 载荷；
 ///       k_s 为服务器主机密钥 blob；q_c/q_s 为双方临时公钥（32 字节）；
 ///       k_mpint 为共享秘密的 mpint 编码。
 /// 返回值：无。
@@ -138,24 +141,26 @@ export fn kdf_derive(out: &byte, need: usize, k_mpint: &const byte, k_len: usize
 ///       secret 为 32 字节小端共享秘密（RFC 7748 输出即小端）。
 /// 返回值：成功返回 true。
 export fn kdf_secret_to_mpint(out: &byte, cap: usize, n_out: &usize, secret: &const byte) bool {
-    // X25519 输出是小端，mpint 要大端：先反转
-    var be: [byte: 33] = [0: 33];
-    var i: usize = 0;
-    while i < 32 {
-        be[i] = secret[31 - i];
-        i = i + 1;
-    }
-    // 去前导零（但全零要保留为空串，表示整数 0）
+    // RFC 8731 §3 / RFC 4253：K 是「把 X25519 的 32 字节输出按**大端**解释成无符号整数」
+    // 再编码成 mpint。也就是说**字节序列保持原样**，只做两件事：
+    //   1) 去掉前导零字节（全零时编码为空串，表示整数 0）
+    //   2) 最高位字节为 1 时前面补一个 0x00（保持正数语义）
+    //
+    // **不要反转字节**。这一条极易搞反：X25519 的输出是「小端 u 坐标」，
+    // 直觉上会想把它反转成大端——但协议要的是「把这 32 字节当作大端数」，
+    // OpenSSH 也是这么做的（sshbuf_put_bignum2_bytes 按大端解释入参）。
+    // 反转了会让双方算出的 H 不一致，症状是主机密钥验签稳定失败，
+    // 而 KEX 流程本身看起来一切正常——本轮就是这么撞上去的。
     var start: usize = 0;
-    while start < 32 && be[start] == 0 {
+    while start < 32 && secret[start] == 0 {
         start = start + 1;
     }
     const len: usize = 32 - start;
     if len == 0 {
         n_out[0] = 0;
-        return cap >= 0;
+        return true;
     }
-    const high: bool = (be[start] & 128 as byte) != 0;
+    const high: bool = (secret[start] & 128 as byte) != 0;
     const total: usize = len + (if high { 1 } else { 0 });
     if total > cap {
         return false;
@@ -165,9 +170,9 @@ export fn kdf_secret_to_mpint(out: &byte, cap: usize, n_out: &usize, secret: &co
         out[0] = 0 as byte;
         off = 1;
     }
-    i = 0;
+    var i: usize = 0;
     while i < len {
-        out[off + i] = be[start + i];
+        out[off + i] = secret[start + i];
         i = i + 1;
     }
     n_out[0] = total;
