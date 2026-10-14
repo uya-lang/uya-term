@@ -107,7 +107,12 @@ fn run_native(opts: &Options) i32 {
     }
     var req: NativeRequest = native_request_new();
     req.pty = opts.pty_mode != PtyMode.never;
-    // 用户名：优先 $USER
+    // 用户名：优先目标里的 user@，否则 $USER。
+    // **注意：不解析 ~/.ssh/config 的 User/HostName/Port 别名。**
+    // 例如 ssh config 里写了 `Host hk.ersunfu.cn / User root`，
+    // 直接 `uyassh --transport=native hk.ersunfu.cn` 会用 $USER 而不是 root，
+    // 表现为「认证失败」——而系统 ssh 却能用（它读了 config）。
+    // 需要时请显式写 `user@host`。
     var uname: [byte: 5] = [85, 83, 69, 82, 0];
     var uenv: [byte: 64] = [0: 64];
     const uv: &byte = getenv(&uname[0]);

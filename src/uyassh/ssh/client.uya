@@ -149,7 +149,10 @@ export fn ssh_connect(p: &const ConnectParams, out: &SshSession) bool {
     out.authed = false;
     out.auth_methods_len = 0;
     out.ch = channel_new();
-    const fd: i32 = tcp_connect(p.host, p.port, 8000) catch {
+    // 连接超时给足：跨洲链路（RTT 数百毫秒）时 8 秒常常不够，
+    // 而连接失败会被上层当成「走不通」从而回退系统 ssh，
+    // 表现为「远程主机用不了原生，本地却正常」这类难查的现象。
+    const fd: i32 = tcp_connect(p.host, p.port, 30000) catch {
         out.stage = Stage.connect_failed;
         return false;
     };

@@ -82,7 +82,7 @@ export fn auth_sig_alg(key: &const PrivateKey) &const byte {
         return &ALG_ED25519[0];
     }
     if key.kind == KeyKind.rsa {
-        return &ALG_RSA_SHA2_256[0];
+        return &ALG_RSA_SHA2_256[0];  // 临时测试用 256
     }
     return null;
 }
