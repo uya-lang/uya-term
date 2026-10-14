@@ -234,11 +234,12 @@ export fn packet_build(st: &CipherState, payload: &const byte, n: usize, out: &B
     }
     const seq: u32 = st.seq;
     if st.active {
-        // 普通模式（RFC 4253 §6.4）：先算 MAC（覆盖 seq || 明文包），再加密
-        // packet_length 之后的内容（packet_length 本身保持明文）。
+        // 普通模式（RFC 4253 §6.4）：先算 MAC（覆盖 seq || 明文包，含 packet_length），
+        // 再加密**整个包**（包括开头的 packet_length 字段——见 packet_parse 里的说明，
+        // 这一点弄错的话只有连真实服务端才会暴露）。
         var mac: [byte: 32] = [0: 32];
         packet_mac(st, seq, out.data, total, &mac[0]);
-        packet_ctr_xor(st, out.data + 4, packet_len);
+        packet_ctr_xor(st, out.data, total);
         const a5: !void = buf_append(out, &mac[0], MAC_LEN);
         _ = a5 catch { return false; };
     }
@@ -278,13 +279,38 @@ export fn packet_parse(st: &CipherState, buf: &byte, n: usize, used: &usize,
         st.seq = st.seq + 1;
         return true;
     }
-    if n < 4 + BLOCK_LEN + MAC_LEN {
+    // 最小密文包只有 4(长度) + 12(packet_len) = 16 字节 + MAC，
+    // 而第一块需 16 字节——所以下界就是 BLOCK_LEN + MAC_LEN，**不能**写成
+    // 4 + BLOCK_LEN + MAC_LEN（那会把最小的合法包误判为「数据不足」，
+    // 症状是「小包永远解析失败，大包正常」，极难定位）。
+    if n < BLOCK_LEN + MAC_LEN {
         return false;
     }
-    // **packet_length 是明文**（RFC 4253 §6）：加密只覆盖 packet_length 之后的
-    // 内容（padding_length || payload || padding）。若把前 4 字节也拿去解密再读长度，
-    // 读到的就是密文里的随机值，长度校验必然失败——症状是「第一个包永远解析不出来」。
-    const packet_len: usize = wire_get_u32(buf) as usize;
+    // **packet_length 也是加密的**（RFC 4253 §6："the packet_length field is also
+    // encrypted"）。普通模式（aes*-ctr + hmac-sha2-*）下，密文覆盖从
+    // packet_length 开始的**整个包**，只有 MAC 是明文附在末尾。
+    //
+    // 这里踩过一个代价很大的坑：我原本以为 packet_length 保持明文（那只在
+    // AEAD 模式如 chacha20-poly1305 下才成立），于是发送时只加密 packet_length
+    // 之后的内容。结果服务端用新密钥解密我们那个包时，把明文的 `00 00 00 1c`
+    // 当成密文去解，读出一个天文数字长度，日志里报
+    //     Bad packet length 4161568435. → message authentication code incorrect
+    // 而自己的单元测试完全测不出来——因为收发双方用的是同一套错误约定，
+    // 自洽地互相验证通过了。**只有对真实服务端才会暴露**。
+    //
+    // 因此解密必须从 buf[0] 开始，解出来的前 4 字节才是真正的 packet_length。
+    // 问题：要先知道长度才能知道解密多少字节，而长度本身是加密的。
+    // 解决办法（标准做法）：密文长度必为 block 的整数倍，因此先解出**第一个
+    // block**（16 字节），从前 4 字节读出 packet_length，再解剩下的部分。
+    // CTR 是流式的，按前缀增量解密不会错位。
+    var head: [byte: 16] = [0: 16];
+    var hi: usize = 0;
+    while hi < 16 {
+        head[hi] = buf[hi];
+        hi = hi + 1;
+    }
+    packet_ctr_xor(st, &head[0], 16);
+    const packet_len: usize = wire_get_u32(&head[0]) as usize;
     if packet_len < 5 || packet_len > PACKET_MAX + 64 {
         return false;
     }
@@ -292,10 +318,17 @@ export fn packet_parse(st: &CipherState, buf: &byte, n: usize, used: &usize,
     if n < total + MAC_LEN {
         return false;
     }
-    // MAC 覆盖 seq || **明文包**（RFC 4253 §6.4：先验 MAC 再解密是等价的，
-    // 前提是 MAC 覆盖明文）。因此必须先把密文解开、再对明文算 MAC 比对；
-    // 顺序颠倒（拿密文算 MAC）会让每个包都判失败。
-    packet_ctr_xor(st, buf + 4, packet_len);
+    // 头 16 字节已经解过，接着解剩余部分（同一 keystream 延续）
+    if packet_len > 12 {
+        packet_ctr_xor(st, buf + 16, packet_len - 12);
+    }
+    hi = 0;
+    while hi < 16 {
+        buf[hi] = head[hi];
+        hi = hi + 1;
+    }
+    // MAC 覆盖 seq || **明文包**（RFC 4253 §6.4）。所以要先把整个包解成明文，
+    // 再对明文算 MAC 比对；拿密文算 MAC 会让每个包都判失败。
     var mac: [byte: 32] = [0: 32];
     packet_mac(st, st.seq, buf, total, &mac[0]);
     if !packet_mac_eq(&mac[0], buf + total, MAC_LEN) {
@@ -310,4 +343,39 @@ export fn packet_parse(st: &CipherState, buf: &byte, n: usize, used: &usize,
     used[0] = total + MAC_LEN;
     st.seq = st.seq + 1;
     return true;
+}
+
+/// 复制密码状态（用于「预览解密」取长度而不推进真实 CTR/seq）。
+/// 参数：dst 为目标，src 为源。
+/// 返回值：无。
+///
+/// 说明：RFC 4253 §6 规定 packet_length 本身也是密文，所以读包时必须先解出
+/// 第一个 block 才能知道长度。用一个副本试探解密，可以避免在真实状态上
+/// 多推一次 keystream。
+export fn cipher_state_copy(dst: &CipherState, src: &const CipherState) void {
+    var i: usize = 0;
+    while i < 32 {
+        dst.key[i] = src.key[i];
+        i = i + 1;
+    }
+    i = 0;
+    while i < 16 {
+        dst.ctr[i] = src.ctr[i];
+        i = i + 1;
+    }
+    i = 0;
+    while i < 64 {
+        dst.mac_key[i] = src.mac_key[i];
+        i = i + 1;
+    }
+    i = 0;
+    while i < 16 {
+        dst.ks[i] = src.ks[i];
+        i = i + 1;
+    }
+    dst.key_len = src.key_len;
+    dst.mac_key_len = src.mac_key_len;
+    dst.seq = src.seq;
+    dst.active = src.active;
+    dst.ks_used = src.ks_used;
 }

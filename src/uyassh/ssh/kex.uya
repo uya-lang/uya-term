@@ -16,6 +16,7 @@
 //     双方选出不同的算法，症状是 NEWKEYS 后立刻解密失败。
 
 use util.buf.Buf;
+use ssh.wire.wire_get_u32;
 use util.buf.buf_new;
 use util.buf.buf_free;
 use util.buf.buf_append;
@@ -45,7 +46,7 @@ export const MSG_KEX_ECDH_INIT: byte = 30 as byte;
 export const MSG_KEX_ECDH_REPLY: byte = 31 as byte;
 
 /// 本实现公告的 KEX 算法（客户端顺序即偏好顺序）。
-export const KEX_ALGS: &const byte = "curve25519-sha256,curve25519-sha256@libssh.org";
+export const KEX_ALGS: &const byte = "curve25519-sha256,curve25519-sha256@libssh.org,kex-strict-c-v00@openssh.com";
 
 /// 公告的主机密钥算法。
 export const HOSTKEY_ALGS: &const byte = "ssh-ed25519,rsa-sha2-256,rsa-sha2-512";
@@ -337,4 +338,35 @@ export fn kex_parse_ecdh_reply(payload: &const byte, n: usize, ks: &byte, ks_len
 /// 返回值：无。
 export fn kex_compute_secret(k_out: &byte, priv: &const byte, qs: &const byte) void {
     x25519_scalarmult(k_out, priv, qs);
+}
+
+/// 检查对端 KEXINIT 是否公告了 strict KEX（`kex-strict-s-v00@openssh.com`）。
+///
+/// 说明：strict KEX 是 OpenSSH 针对 Terrapin（CVE-2023-48795）的缓解措施。
+/// **只要客户端也公告了** `kex-strict-c-v00@openssh.com`，双方就进入 strict 模式，
+/// 此时 NEWKEYS 之后**序列号重置为 0**。反过来，若客户端不公告，
+/// OpenSSH 服务端不会启用 strict（但它仍会在 KEXINIT 里列出 s-v00 标记）。
+///
+/// 参数：payload/n 为对端 KEXINIT 载荷。
+/// 返回值：对端公告了 strict 返回 true。
+export fn kex_peer_supports_strict(payload: &const byte, n: usize) bool {
+    if n < 17 || payload[0] != MSG_KEXINIT {
+        return false;
+    }
+    // kex 算法列表：msg(1) + cookie(16) 之后的第一个 string
+    var pos: usize = 17;
+    if pos + 4 > n {
+        return false;
+    }
+    const l: usize = wire_get_u32(payload + pos) as usize;
+    pos = pos + 4;
+    if pos + l > n {
+        return false;
+    }
+    // "kex-strict-s-v00@openssh.com" = 28 字节
+    var strict_name: [byte: 28] = [
+        107, 101, 120, 45, 115, 116, 114, 105, 99, 116, 45, 115, 45, 118, 48, 48,
+        64, 111, 112, 101, 110, 115, 115, 104, 46, 99, 111, 109,
+    ];
+    return kex_name_in(&strict_name[0], 28, payload + pos, l);
 }

@@ -95,8 +95,29 @@ export fn kdf_derive(out: &byte, need: usize, k_mpint: &const byte, k_len: usize
     }
     var produced: usize = 0;
     // 第一段：K || H || letter || session_id
+    //
+    // **K 必须是 mpint 的线格式（含 4 字节长度前缀）**，而不只是数据部分。
+    // RFC 4253 §7.2 写的是 HASH(K || H || letter || session_id)，
+    // 而 §6 里 K 是「encoded as mpint」——mpint 的编码天然带长度前缀。
+    //
+    // 这里踩过一个非常难查的坑：我原先只哈希 K 的数据部分（33 字节），
+    // 结果 **H 完全正确（主机密钥验签通过）但所有派生密钥全错**，
+    // 服务端只报 "message authentication code incorrect"。
+    // 因为 H 走的是另一条代码路径（kdf_exchange_hash_curve25519 里
+    // 用 kdf_put_u32 显式加了长度前缀，恰好正确），而 KDF 这条漏了。
+    // 症状极具误导性：看起来像加密实现错了，其实是 KDF 输入少了 4 字节。
+    // 定位方式：用 Python 写一个最小参考客户端，把「K 带/不带前缀」两种
+    // 派生都试一遍 —— 带前缀能登录、不带前缀报同样的 MAC 错。
+    const kl: u32 = k_len as u32;
+    var klen_buf: [byte: 4] = [
+        ((kl >> 24) & 255u32) as byte,
+        ((kl >> 16) & 255u32) as byte,
+        ((kl >> 8) & 255u32) as byte,
+        (kl & 255u32) as byte,
+    ];
     var ctx: Sha256Ctx = Sha256Ctx{};
     ctx.init();
+    ctx.update(klen_buf[0: 4]);
     ctx.update(k_mpint[0: k_len]);
     ctx.update(h[0: 32]);
     var lbuf: [byte: 1] = [letter];
@@ -118,6 +139,7 @@ export fn kdf_derive(out: &byte, need: usize, k_mpint: &const byte, k_len: usize
     while produced < need {
         var next: Sha256Ctx = Sha256Ctx{};
         next.init();
+        next.update(klen_buf[0: 4]);
         next.update(k_mpint[0: k_len]);
         next.update(h[0: 32]);
         next.update(out[0: produced]);
