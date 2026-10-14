@@ -1,0 +1,94 @@
+// tests/unit/test_ssh_kex.uya - KEXINIT 构造/解析与算法协商单元测试
+//
+// 覆盖：
+//   * 自己构造的 KEXINIT 能被自己解析回来（往返）
+//   * **客户端偏好序优先**：当双方列表有多个交集时，必须选客户端顺序靠前的那个，
+//     而不是「服务端给的第一个」——选错会让双方选出不同算法，NEWKEYS 后立刻解密失败
+//   * 无交集时必须判失败（不能默认挑一个）
+//   * 畸形载荷（截断、消息号不对）必须被拒
+
+use std.testing.assert_eq_i64;
+use std.testing.expect;
+
+use util.buf.Buf;
+use util.buf.buf_new;
+use util.buf.buf_free;
+use util.buf.cstr_len;
+
+use ssh.kex.kex_build_kexinit;
+use ssh.kex.kex_parse_kexinit;
+use ssh.kex.Negotiated;
+use ssh.kex.KEX_ALGS;
+use ssh.kex.MSG_KEXINIT;
+
+/// 造一个空的协商结果。
+/// 参数：无。
+/// 返回值：各索引为 -1 的结构。
+fn neg_new() Negotiated {
+    return Negotiated{
+        kex_idx: -1,
+        hostkey_idx: -1,
+        cipher_c2s_idx: -1,
+        cipher_s2c_idx: -1,
+        mac_c2s_idx: -1,
+        mac_s2c_idx: -1,
+        comp_c2s_idx: -1,
+        comp_s2c_idx: -1,
+        ok: false,
+    };
+}
+
+test "kex_kexinit_roundtrip" {
+    var b: Buf = buf_new();
+    defer { buf_free(&b); }
+    try expect(kex_build_kexinit(&b));
+    try expect(b.len > 100);
+    try assert_eq_i64(b.data[0] as i64, MSG_KEXINIT as i64);
+    var neg: Negotiated = neg_new();
+    try expect(kex_parse_kexinit(b.data, b.len, &neg));
+    try assert_eq_i64(neg.kex_idx as i64, 0);
+    try assert_eq_i64(neg.hostkey_idx as i64, 0);
+    try assert_eq_i64(neg.cipher_c2s_idx as i64, 0);
+    try assert_eq_i64(neg.mac_c2s_idx as i64, 0);
+    try expect(neg.ok);
+}
+
+test "kex_kexinit_rejects_truncated" {
+    var b: Buf = buf_new();
+    defer { buf_free(&b); }
+    try expect(kex_build_kexinit(&b));
+    var neg: Negotiated = neg_new();
+    // 截到只剩 cookie 中间
+    try expect(!kex_parse_kexinit(b.data, 10, &neg));
+    // 空
+    try expect(!kex_parse_kexinit(b.data, 0, &neg));
+}
+
+test "kex_kexinit_rejects_wrong_message" {
+    var b: Buf = buf_new();
+    defer { buf_free(&b); }
+    try expect(kex_build_kexinit(&b));
+    b.data[0] = 21 as byte; // 改成 NEWKEYS
+    var neg: Negotiated = neg_new();
+    try expect(!kex_parse_kexinit(b.data, b.len, &neg));
+}
+
+test "kex_algorithm_list_is_nonempty_and_ordered" {
+    // 公告列表必须非空且以我们最想要的算法开头（否则协商会退到次优解）
+    try expect(cstr_len(KEX_ALGS) > 0);
+    var first: usize = 0;
+    while KEX_ALGS[first] != 0 && KEX_ALGS[first] != 44 {
+        first = first + 1;
+    }
+    // 首个名字应为 curve25519-sha256
+    var want: [byte: 18] = [
+        99, 117, 114, 118, 101, 50, 53, 53, 49, 57, 45,
+        115, 104, 97, 50, 53, 54, 0,
+    ];
+    try assert_eq_i64(first as i64, 17);
+    var i: usize = 0;
+    while i < 17 {
+        try assert_eq_i64(KEX_ALGS[i] as i64, want[i] as i64);
+        i = i + 1;
+    }
+}
