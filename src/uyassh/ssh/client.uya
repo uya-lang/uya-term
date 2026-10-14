@@ -1,0 +1,437 @@
+// src/uyassh/ssh/client.uya - 原生 SSH 会话客户端（把各层组装成一次登录）
+//
+// 职责：一次完整的「连接 → 握手 → 认证 → 开会话通道」流程，并把结果
+// 交给上层（uyassh 的会话循环）使用。
+//
+// 端口/主机的解析放在 net/tcp；本模块只负责协议顺序。
+//
+// 重要顺序（RFC 4253/4252/4254）：
+//   1. 版本交换
+//   2. 发我方 KEXINIT，读对端 KEXINIT
+//   3. ECDH_INIT / ECDH_REPLY，算 K 与 H
+//   4. **先验主机密钥签名**，再用 known_hosts 判定是否可信
+//   5. NEWKEYS 双向切换（strict KEX 下序列号归零）
+//   6. SERVICE_REQUEST("ssh-userauth") → SERVICE_ACCEPT
+//   7. USERAUTH_REQUEST(publickey, 带签名) → USERAUTH_SUCCESS
+//   8. CHANNEL_OPEN("session") → OPEN_CONFIRMATION
+//   9. pty-req / shell（或 exec）
+//
+// 踩坑记录：
+//   * **验签必须在装密钥之前**（或至少在信任之前）。本实现把「验签 + known_hosts
+//     判定」放在 newkeys 之前，避免在未验证的对端上继续。
+//   * **known_hosts 策略默认拒绝未知主机**，只有显式 accept_new 才放行；
+//     不一致（mismatch）**永远拒绝**，不给开关。
+
+use net.tcp.tcp_connect;
+use net.tcp.tcp_close;
+use util.buf.Buf;
+use util.buf.buf_new;
+use ssh.transport.Transport;
+use ssh.transport.transport_new;
+use ssh.transport.transport_version_exchange;
+use ssh.transport.transport_send;
+use ssh.transport.transport_send_plain;
+use ssh.transport.transport_recv;
+use ssh.transport.transport_kex_with_vs;
+use ssh.transport.transport_newkeys;
+use ssh.transport.KexOutcome;
+use ssh.transport.MSG_SERVICE_ACCEPT;
+use ssh.kex.kex_build_kexinit;
+use ssh.kex.kex_peer_supports_strict;
+use ssh.kex.Negotiated;
+use ssh.kex.kex_parse_kexinit;
+use ssh.hostkey.HostKey;
+use ssh.hostkey.HostKeyKind;
+use ssh.hostkey.hostkey_parse;
+use ssh.hostkey.hostkey_parse_sig;
+use ssh.hostkey.hostkey_verify;
+use ssh.known_hosts.HostCheck;
+use ssh.known_hosts.HostKeyStatus;
+use ssh.known_hosts.known_hosts_check;
+use ssh.known_hosts.known_hosts_allows;
+use ssh.privkey.PrivateKey;
+use ssh.privkey.privkey_public_blob;
+use ssh.auth.auth_build_service_request;
+use ssh.auth.auth_build_publickey;
+use ssh.auth.auth_sign_input;
+use ssh.auth.auth_sign;
+use ssh.auth.auth_build_sig_blob;
+use ssh.auth.auth_parse_response;
+use ssh.auth.AuthResult;
+use ssh.auth.auth_sig_alg;
+use ssh.channel.SessionChannel;
+use ssh.channel.channel_new;
+use ssh.channel.channel_build_open;
+use ssh.channel.channel_parse_open_confirmation;
+use ssh.channel.MSG_CHANNEL_OPEN_CONFIRMATION;
+use util.buf.buf_append_byte;
+use ssh.channel.MSG_REQUEST_FAILURE;
+use ssh.channel.MSG_REQUEST_SUCCESS;
+use ssh.channel.MSG_GLOBAL_REQUEST;
+use ssh.channel.channel_handle;
+
+/// 连接阶段的结果。
+export enum Stage {
+    /// 全部成功。
+    ok,
+    /// TCP 连接失败。
+    connect_failed,
+    /// 协议版本或 KEX 失败。
+    kex_failed,
+    /// 主机密钥签名验证失败（可能是中间人）。
+    hostkey_bad,
+    /// 该主机未知，且未允许接受新主机。
+    host_unknown,
+    /// 主机密钥与 known_hosts 记录不一致（危险）。
+    host_mismatch,
+    /// 该主机只有其他类型的密钥。
+    host_other_type,
+    /// 主机被标记为 @revoked。
+    host_revoked,
+    /// 认证失败。
+    auth_failed,
+    /// 通道打开失败。
+    channel_failed,
+    /// 读写错误。
+    io_failed,
+}
+
+/// 一次会话。
+/// 字段：t 为传输层；ch 为通道；stage 为阶段结果；authed 表示认证通过；
+///       auth_methods 为服务端在失败时给出的可继续方法。
+export struct SshSession {
+    t: Transport,
+    ch: SessionChannel,
+    stage: Stage,
+    authed: bool,
+    auth_methods: [byte: 128],
+    auth_methods_len: usize,
+}
+
+/// 新建会话（避免在结构体字面量里直接调用函数——那会生成未知符号）。
+/// 参数：无。
+/// 返回值：初始会话。
+export fn ssh_session_new() SshSession {
+    var t: Transport = transport_new(0);
+    var ch: SessionChannel = channel_new();
+    var s: SshSession = SshSession{
+        t: t,
+        ch: ch,
+        stage: Stage.connect_failed,
+        authed: false,
+        auth_methods: [0: 128],
+        auth_methods_len: 0,
+    };
+    return s;
+}
+
+/// 简化入口需要的参数。
+/// 字段：host 为 C 串主机名；port 为端口；user 为 C 串用户名；
+///       known_hosts 为宿主 known_hosts 全文（可为空）；accept_new 表示允许接受未知主机；
+///       key 为已解析的私钥。
+export struct ConnectParams {
+    host: &const byte,
+    port: u16,
+    user: &const byte,
+    known_hosts: &const byte,
+    known_hosts_len: usize,
+    accept_new: bool,
+    key: &const PrivateKey,
+}
+
+/// 建立一次已认证的 SSH 会话（不开通道）。
+///
+/// 参数：p 为连接参数，out 为会话结果。
+/// 返回值：成功返回 true（out.stage 给出失败原因）。
+export fn ssh_connect(p: &const ConnectParams, out: &SshSession) bool {
+    out.stage = Stage.connect_failed;
+    out.authed = false;
+    out.auth_methods_len = 0;
+    out.ch = channel_new();
+    const fd: i32 = tcp_connect(p.host, p.port, 8000) catch {
+        out.stage = Stage.connect_failed;
+        return false;
+    };
+    out.t = transport_new(fd);
+    var vs: [byte: 256] = [0: 256];
+    var vs_len: usize = 0;
+    if !transport_version_exchange(&out.t, &vs[0], &vs_len) {
+        out.stage = Stage.kex_failed;
+        return false;
+    }
+    var ic: Buf = buf_new();
+    defer { buf_free(&ic); }
+    if !kex_build_kexinit(&ic) {
+        out.stage = Stage.kex_failed;
+        return false;
+    }
+    var ic_copy: [byte: 1024] = [0: 1024];
+    var i: usize = 0;
+    while i < ic.len {
+        ic_copy[i] = ic.data[i];
+        i = i + 1;
+    }
+    const ic_len: usize = ic.len;
+    if !transport_send_plain(&out.t, &ic_copy[0], ic_len) {
+        out.stage = Stage.kex_failed;
+        return false;
+    }
+    var ko: KexOutcome = KexOutcome{
+        i_s: [0: 2048], i_s_len: 0, k_s: [0: 512], k_s_len: 0, q_s: [0: 32],
+        sig: [0: 512], sig_len: 0, h: [0: 32], k_mpint: [0: 40], k_mpint_len: 0,
+        session_id: [0: 32], key_len: 16, mac_len: 32, strict: false,
+    };
+    if !transport_kex_with_vs(&out.t, &vs[0], vs_len, &ic_copy[0], ic_len, 16, 32, false, &ko) {
+        out.stage = Stage.kex_failed;
+        return false;
+    }
+    ko.strict = kex_peer_supports_strict(&ko.i_s[0], ko.i_s_len);
+    // --- 验签（在信任对端之前）---
+    var hk: HostKey = HostKey{
+        kind: HostKeyKind.unsupported, alg_name: [0: 32], alg_len: 0,
+        ed_pub: [0: 32], e: [0: 8], e_len: 0, n: [0: 512], n_len: 0,
+    };
+    if !hostkey_parse(&ko.k_s[0], ko.k_s_len, &hk) {
+        out.stage = Stage.hostkey_bad;
+        return false;
+    }
+    var salg: [byte: 32] = [0: 32];
+    var salg_len: usize = 0;
+    var sval: [byte: 512] = [0: 512];
+    var sval_len: usize = 0;
+    if !hostkey_parse_sig(&ko.sig[0], ko.sig_len, &salg[0], &salg_len, &sval[0], &sval_len) {
+        out.stage = Stage.hostkey_bad;
+        return false;
+    }
+    if !hostkey_verify(&hk, &salg[0], salg_len, &sval[0], sval_len, &ko.h[0]) {
+        out.stage = Stage.hostkey_bad;
+        return false;
+    }
+    // --- known_hosts 策略 ---
+    var hc: HostCheck = HostCheck{ status: HostKeyStatus.unknown, revoked: false, ca: false };
+    known_hosts_check(p.known_hosts, p.known_hosts_len, p.host, p.port,
+        &salg[0], salg_len, &ko.k_s[0], ko.k_s_len, &hc);
+    if hc.revoked {
+        out.stage = Stage.host_revoked;
+        return false;
+    }
+    if hc.status == HostKeyStatus.mismatch {
+        out.stage = Stage.host_mismatch;
+        return false;
+    }
+    if hc.status == HostKeyStatus.other_type {
+        out.stage = Stage.host_other_type;
+        return false;
+    }
+    if !known_hosts_allows(hc.status, p.accept_new) {
+        out.stage = Stage.host_unknown;
+        return false;
+    }
+    // --- 切换加密 ---
+    if !transport_newkeys(&out.t, &ko, true) {
+        out.stage = Stage.kex_failed;
+        return false;
+    }
+    // --- service request ---
+    var svc: Buf = buf_new();
+    defer { buf_free(&svc); }
+    if !auth_build_service_request(&svc) {
+        out.stage = Stage.auth_failed;
+        return false;
+    }
+    if !transport_send(&out.t, svc.data, svc.len) {
+        out.stage = Stage.io_failed;
+        return false;
+    }
+    if !transport_recv(&out.t) {
+        out.stage = Stage.io_failed;
+        return false;
+    }
+    if out.t.payload[0] != MSG_SERVICE_ACCEPT {
+        out.stage = Stage.auth_failed;
+        return false;
+    }
+    // --- publickey ---
+    var keyblob: [byte: 1024] = [0: 1024];
+    var kbn: usize = 0;
+    if !privkey_public_blob(p.key, &keyblob[0], 1024, &kbn) {
+        out.stage = Stage.auth_failed;
+        return false;
+    }
+    const alg: &const byte = auth_sig_alg(p.key);
+    if alg == null {
+        out.stage = Stage.auth_failed;
+        return false;
+    }
+    var sinput: Buf = buf_new();
+    defer { buf_free(&sinput); }
+    if !auth_sign_input(&sinput, &ko.session_id[0], p.user, alg, &keyblob[0], kbn) {
+        out.stage = Stage.auth_failed;
+        return false;
+    }
+    var rsv: [byte: 512] = [0: 512];
+    var rsvl: usize = 0;
+    if !auth_sign(p.key, sinput.data, sinput.len, alg, &rsv[0], 512, &rsvl) {
+        out.stage = Stage.auth_failed;
+        return false;
+    }
+    var sigblob: Buf = buf_new();
+    defer { buf_free(&sigblob); }
+    if !auth_build_sig_blob(&sigblob, alg, &rsv[0], rsvl) {
+        out.stage = Stage.auth_failed;
+        return false;
+    }
+    var req: Buf = buf_new();
+    defer { buf_free(&req); }
+    if !auth_build_publickey(&req, p.user, alg, &keyblob[0], kbn, true, sigblob.data, sigblob.len) {
+        out.stage = Stage.auth_failed;
+        return false;
+    }
+    if !transport_send(&out.t, req.data, req.len) {
+        out.stage = Stage.io_failed;
+        return false;
+    }
+    if !transport_recv(&out.t) {
+        out.stage = Stage.io_failed;
+        return false;
+    }
+    var ar: AuthResult = AuthResult{ ok: false, partial: false, methods: [0: 128], methods_len: 0 };
+    if !auth_parse_response(&out.t.payload[0], out.t.payload_len, &ar) {
+        out.stage = Stage.auth_failed;
+        return false;
+    }
+    if !ar.ok {
+        // 保存可继续的方法列表，便于上层提示
+        var m: usize = 0;
+        while m < ar.methods_len {
+            out.auth_methods[m] = ar.methods[m];
+            m = m + 1;
+        }
+        out.auth_methods_len = ar.methods_len;
+        out.stage = Stage.auth_failed;
+        return false;
+    }
+    out.authed = true;
+    out.stage = Stage.ok;
+    return true;
+}
+
+/// 在已认证会话上打开 session 通道。
+///
+/// 参数：out 为会话，request_pty 表示是否申请 pty，term 为终端类型，
+///       cols/rows 为窗口大小，command 为要执行的命令（空=交互 shell）。
+/// 返回值：成功返回 true。
+export fn ssh_open_session(out: &SshSession, request_pty: bool, term: &const byte,
+    cols: u32, rows: u32, command: &const byte) bool {
+    if !out.authed {
+        out.stage = Stage.auth_failed;
+        return false;
+    }
+    var b: Buf = buf_new();
+    defer { buf_free(&b); }
+    if !channel_build_open(&b) {
+        out.stage = Stage.channel_failed;
+        return false;
+    }
+    if !transport_send(&out.t, b.data, b.len) {
+        out.stage = Stage.io_failed;
+        return false;
+    }
+    if !channel_wait_for(out, MSG_CHANNEL_OPEN_CONFIRMATION) {
+        out.stage = Stage.channel_failed;
+        return false;
+    }
+    if !channel_parse_open_confirmation(&out.t.payload[0], out.t.payload_len, &out.ch) {
+        out.stage = Stage.channel_failed;
+        return false;
+    }
+    if request_pty {
+        if !channel_build_pty_req(&b, &out.ch, term, cols, rows) {
+            out.stage = Stage.channel_failed;
+            return false;
+        }
+        if !transport_send(&out.t, b.data, b.len) {
+            out.stage = Stage.io_failed;
+            return false;
+        }
+        // pty-req 带 want_reply，等服务端回执（成功/失败都继续，只记录）
+        if !transport_recv(&out.t) {
+            out.stage = Stage.io_failed;
+            return false;
+        }
+        out.ch.last_reply = out.t.payload[0];
+    }
+    if !channel_build_shell_or_exec(&b, &out.ch, command) {
+        out.stage = Stage.channel_failed;
+        return false;
+    }
+    if !transport_send(&out.t, b.data, b.len) {
+        out.stage = Stage.io_failed;
+        return false;
+    }
+    if !channel_wait_for(out, 0 as byte) {
+        out.stage = Stage.io_failed;
+        return false;
+    }
+    out.ch.last_reply = out.t.payload[0];
+    out.stage = Stage.ok;
+    return true;
+}
+
+/// 等待一个通道相关报文，自动跳过并应答服务端的全局请求。
+///
+/// 说明：sshd 在会话建立过程中会主动发 `hostkeys-00@openssh.com` 这样的
+/// **全局请求**（GLOBAL_REQUEST 80），用于宣告它所有的主机密钥。
+/// 如果按「下一个包一定是 CHANNEL_OPEN_CONFIRMATION」来写，就会把它当成
+/// 确认包而解析失败——症状是「认证成功、开通道失败」。
+/// 若该请求带 want_reply，还必须回 REQUEST_FAILURE(82)，否则 sshd 会一直等。
+///
+/// 参数：out 为会话；want 为期望的消息号（0 表示只要求是通道类报文）。
+/// 返回值：拿到期望报文返回 true。
+fn channel_wait_for(out: &SshSession, want: byte) bool {
+    var tries: usize = 0;
+    while tries < 16 {
+        if !transport_recv(&out.t) {
+            return false;
+        }
+        if out.t.payload_len < 1 {
+            return false;
+        }
+        const mt: byte = out.t.payload[0];
+        if mt == MSG_GLOBAL_REQUEST {
+            // 末尾的 want_reply 决定是否需要回执
+            if out.t.payload_len >= 1 && out.t.payload_len <= 8192 {
+                const wr: byte = out.t.payload[out.t.payload_len - 1];
+                if wr != 0 {
+                    var nack: Buf = buf_new();
+                    defer { buf_free(&nack); }
+                    const r: !void = buf_append_byte(&nack, MSG_REQUEST_FAILURE);
+                    _ = r catch { return false; };
+                    if !transport_send(&out.t, nack.data, nack.len) {
+                        return false;
+                    }
+                }
+            }
+            tries = tries + 1;
+            continue;
+        }
+        if mt == MSG_REQUEST_SUCCESS || mt == MSG_REQUEST_FAILURE {
+            tries = tries + 1;
+            continue;
+        }
+        if want != 0 as byte {
+            if mt == want {
+                return true;
+            }
+            // 其他通道报文先交给 channel_handle 处理掉
+            var off: usize = 0;
+            var len: usize = 0;
+            var err: bool = false;
+            _ = channel_handle(&out.t.payload[0], out.t.payload_len, &out.ch, &off, &len, &err);
+            tries = tries + 1;
+            continue;
+        }
+        return true;
+    }
+    return false;
+}

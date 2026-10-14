@@ -1,0 +1,394 @@
+// src/uyassh/ssh/channel.uya - 连接层：会话通道、pty、shell、窗口调整
+//
+// 说明：认证成功之后建立会话通道：
+//   SSH_MSG_CHANNEL_OPEN(90)  "session" | sender_channel | window | max_packet
+//   SSH_MSG_CHANNEL_OPEN_CONFIRMATION(91)   recipient | sender | window | max_packet
+//   然后按需：
+//   SSH_MSG_CHANNEL_REQUEST(98)  <recipient> "pty-req"   want_reply | TERM | cols | rows | px | py | modes
+//   SSH_MSG_CHANNEL_REQUEST(98)  <recipient> "shell"     want_reply
+//   SSH_MSG_CHANNEL_REQUEST(98)  <recipient> "exec"      want_reply | command
+//   SSH_MSG_CHANNEL_REQUEST(98)  <recipient> "window-change"  <cols> <rows> <px> <py>
+//   SSH_MSG_CHANNEL_DATA(94)     <recipient> <string data>
+//   SSH_MSG_CHANNEL_WINDOW_ADJUST(93)  <recipient> <bytes>
+//
+// 踩坑记录：
+//   * **收发的 recipient 不是同一个数**：我们发出的包用**对端**的 channel 号
+//     （OPEN_CONFIRMATION 里的 sender），收到的包用**我们自己的** channel 号。
+//     两者混用会让服务端把后续请求全丢掉（或直接断连），而症状只是「卡住」。
+//   * **窗口是流量控制**：对端给的 window 是我们「还能发多少字节」，发超了
+//     服务端会断连；收到数据后要回 WINDOW_ADJUST 把额度还回去。
+//     本实现按每次读到数据就补等量额度（简单且安全）。
+//   * **want_reply**：pty-req / shell 一般要回执（CHANNEL_SUCCESS 99 或
+//     CHANNEL_FAILURE 100）。不回执会让 sshd 一直等，表现为「登录后没反应」。
+//   * stderr 走 SSH_MSG_CHANNEL_EXTENDED_DATA(95)，data_type_code=1。
+
+use util.buf.Buf;
+use util.buf.buf_new;
+use util.buf.buf_free;
+use util.buf.buf_append;
+use util.buf.buf_append_byte;
+use ssh.wire.wire_get_u32;
+use ssh.wire.wire_put_u32;
+use ssh.wire.wire_append_string;
+
+/// SSH_MSG_GLOBAL_REQUEST。
+export const MSG_GLOBAL_REQUEST: byte = 80 as byte;
+/// SSH_MSG_REQUEST_SUCCESS。
+export const MSG_REQUEST_SUCCESS: byte = 81 as byte;
+/// SSH_MSG_REQUEST_FAILURE。
+export const MSG_REQUEST_FAILURE: byte = 82 as byte;
+/// SSH_MSG_CHANNEL_OPEN。
+export const MSG_CHANNEL_OPEN: byte = 90 as byte;
+/// SSH_MSG_CHANNEL_OPEN_CONFIRMATION。
+export const MSG_CHANNEL_OPEN_CONFIRMATION: byte = 91 as byte;
+/// SSH_MSG_CHANNEL_OPEN_FAILURE。
+export const MSG_CHANNEL_OPEN_FAILURE: byte = 92 as byte;
+/// SSH_MSG_CHANNEL_WINDOW_ADJUST。
+export const MSG_CHANNEL_WINDOW_ADJUST: byte = 93 as byte;
+/// SSH_MSG_CHANNEL_DATA。
+export const MSG_CHANNEL_DATA: byte = 94 as byte;
+/// SSH_MSG_CHANNEL_EXTENDED_DATA。
+export const MSG_CHANNEL_EXTENDED_DATA: byte = 95 as byte;
+/// SSH_MSG_CHANNEL_EOF。
+export const MSG_CHANNEL_EOF: byte = 96 as byte;
+/// SSH_MSG_CHANNEL_CLOSE。
+export const MSG_CHANNEL_CLOSE: byte = 97 as byte;
+/// SSH_MSG_CHANNEL_REQUEST。
+export const MSG_CHANNEL_REQUEST: byte = 98 as byte;
+/// SSH_MSG_CHANNEL_SUCCESS。
+export const MSG_CHANNEL_SUCCESS: byte = 99 as byte;
+/// SSH_MSG_CHANNEL_FAILURE。
+export const MSG_CHANNEL_FAILURE: byte = 100 as byte;
+
+/// 会话通道状态。
+/// 字段：local_id 为我方 channel 号（收到的包用它）；remote_id 为对端 channel 号
+///       （发出去的包用它）；remote_window 为对端允许我们再发的字节数；
+///       remote_max_packet 为对端单包上限；open 表示已确认；eof 表示对端已发 EOF；
+///       close_sent/close_recv 用于避免重复 CLOSE。
+export struct SessionChannel {
+    local_id: u32,
+    remote_id: u32,
+    remote_window: u32,
+    remote_max_packet: u32,
+    open: bool,
+    eof: bool,
+    close_sent: bool,
+    close_recv: bool,
+    /// 最近一次请求的回执（0=未收到，99=成功，100=失败）。
+    last_reply: byte,
+}
+
+/// 我方 channel 号（固定 0，单通道会话足够）。
+export const CHANNEL_LOCAL_ID: u32 = 0u32;
+/// 我方声明接收窗口。
+export const CHANNEL_WINDOW: u32 = 2097152u32;
+/// 我方单包上限。
+export const CHANNEL_MAX_PACKET: u32 = 32768u32;
+
+/// 新建通道状态。
+/// 参数：无。
+/// 返回值：初始状态。
+export fn channel_new() SessionChannel {
+    return SessionChannel{
+        local_id: CHANNEL_LOCAL_ID,
+        remote_id: 0u32,
+        remote_window: 0u32,
+        remote_max_packet: 32768u32,
+        open: false,
+        eof: false,
+        close_sent: false,
+        close_recv: false,
+        last_reply: 0 as byte,
+    };
+}
+
+/// 构造 CHANNEL_OPEN("session")。
+/// 参数：out 为输出（会被重置）。
+/// 返回值：成功返回 true。
+export fn channel_build_open(out: &Buf) bool {
+    out.len = 0;
+    const r: !void = buf_append_byte(out, MSG_CHANNEL_OPEN);
+    _ = r catch { return false; };
+    var d: [byte: 9] = [0: 9];
+    wire_append_string(out, &d[0], 0);
+    out.len = 0;
+    const r2: !void = buf_append_byte(out, MSG_CHANNEL_OPEN);
+    _ = r2 catch { return false; };
+    var name: [byte: 7] = [115, 101, 115, 115, 105, 111, 110, 0];
+    wire_append_string(out, &name[0], 7);
+    wire_put_u32_into(out, CHANNEL_LOCAL_ID);
+    wire_put_u32_into(out, CHANNEL_WINDOW);
+    wire_put_u32_into(out, CHANNEL_MAX_PACKET);
+    return true;
+}
+
+/// 往缓冲追加 u32。
+/// 参数：b 为目标，v 为值。
+/// 返回值：无。
+fn wire_put_u32_into(b: &Buf, v: u32) void {
+    var tmp: [byte: 4] = [0: 4];
+    wire_put_u32(&tmp[0], v);
+    const r: !void = buf_append(b, &tmp[0], 4);
+    _ = r catch { };
+}
+
+/// 解析 CHANNEL_OPEN_CONFIRMATION。
+/// 参数：payload/n 为消息体，ch 为通道状态。
+/// 返回值：成功返回 true。
+export fn channel_parse_open_confirmation(payload: &const byte, n: usize, ch: &SessionChannel) bool {
+    if n < 17 || payload[0] != MSG_CHANNEL_OPEN_CONFIRMATION {
+        return false;
+    }
+    var pos: usize = 1;
+    const recip: usize = wire_get_u32(payload + pos) as usize;
+    pos = pos + 4;
+    const sender: usize = wire_get_u32(payload + pos) as usize;
+    pos = pos + 4;
+    const win: usize = wire_get_u32(payload + pos) as usize;
+    pos = pos + 4;
+    const mp: usize = wire_get_u32(payload + pos) as usize;
+    pos = pos + 4;
+    if recip != CHANNEL_LOCAL_ID as usize {
+        return false;
+    }
+    ch.remote_id = sender as u32;
+    ch.remote_window = win as u32;
+    ch.remote_max_packet = mp as u32;
+    ch.open = true;
+    return true;
+}
+
+/// 构造 pty-req 请求。
+/// 参数：out 为输出（会被重置）；term 为终端类型名（C 串）；cols/rows 为行列。
+/// 返回值：成功返回 true。
+export fn channel_build_pty_req(out: &Buf, ch: &const SessionChannel, term: &const byte,
+    cols: u32, rows: u32) bool {
+    out.len = 0;
+    const r: !void = buf_append_byte(out, MSG_CHANNEL_REQUEST);
+    _ = r catch { return false; };
+    wire_put_u32_into(out, ch.remote_id);
+    var nm: [byte: 8] = [112, 116, 121, 45, 114, 101, 113, 0];
+    wire_append_string(out, &nm[0], 7);
+    const w: !void = buf_append_byte(out, 1 as byte);   // want_reply = true
+    _ = w catch { return false; };
+    wire_append_cstr_str(out, term);
+    wire_put_u32_into(out, cols);
+    wire_put_u32_into(out, rows);
+    wire_put_u32_into(out, 0u32);   // width_pixels
+    wire_put_u32_into(out, 0u32);   // height_pixels
+    // terminal modes：一个空字符串（表示无特殊模式）
+    wire_append_string(out, &nm[0], 0);
+    return true;
+}
+
+/// 追加 C 串为 SSH string。
+/// 参数：b 为目标，s 为 C 串。
+/// 返回值：无。
+fn wire_append_cstr_str(b: &Buf, s: &const byte) void {
+    var l: usize = 0;
+    while s[l] != 0 && l < 1024 {
+        l = l + 1;
+    }
+    wire_append_string(b, s, l);
+}
+
+/// 构造 shell 或 exec 请求。
+/// 参数：out 为输出（会被重置）；ch 为通道；command 为 C 串（空表示 shell）。
+/// 返回值：成功返回 true。
+export fn channel_build_shell_or_exec(out: &Buf, ch: &const SessionChannel,
+    command: &const byte) bool {
+    var cl: usize = 0;
+    while command[cl] != 0 && cl < 4096 {
+        cl = cl + 1;
+    }
+    out.len = 0;
+    const r: !void = buf_append_byte(out, MSG_CHANNEL_REQUEST);
+    _ = r catch { return false; };
+    wire_put_u32_into(out, ch.remote_id);
+    if cl == 0 {
+        var sh: [byte: 6] = [115, 104, 101, 108, 108, 0];
+        wire_append_string(out, &sh[0], 5);
+    } else {
+        var ex: [byte: 5] = [101, 120, 101, 99, 0];
+        wire_append_string(out, &ex[0], 4);
+    }
+    const w: !void = buf_append_byte(out, 1 as byte);
+    _ = w catch { return false; };
+    if cl > 0 {
+        wire_append_string(out, command, cl);
+    }
+    return true;
+}
+
+/// 构造 env 请求（设置环境变量）。
+/// 参数：out 为输出（会被重置）；ch 为通道；name/value 为 C 串。
+/// 返回值：成功返回 true。
+export fn channel_build_env(out: &Buf, ch: &const SessionChannel, name: &const byte,
+    value: &const byte) bool {
+    out.len = 0;
+    const r: !void = buf_append_byte(out, MSG_CHANNEL_REQUEST);
+    _ = r catch { return false; };
+    wire_put_u32_into(out, ch.remote_id);
+    var en: [byte: 4] = [101, 110, 118, 0];
+    wire_append_string(out, &en[0], 3);
+    const w: !void = buf_append_byte(out, 0 as byte);   // want_reply = false
+    _ = w catch { return false; };
+    wire_append_cstr_str(out, name);
+    wire_append_cstr_str(out, value);
+    return true;
+}
+
+/// 构造 window-change 请求。
+/// 参数：out 为输出（会被重置）；ch 为通道；cols/rows 为行列。
+/// 返回值：成功返回 true。
+export fn channel_build_window_change(out: &Buf, ch: &const SessionChannel,
+    cols: u32, rows: u32) bool {
+    out.len = 0;
+    const r: !void = buf_append_byte(out, MSG_CHANNEL_REQUEST);
+    _ = r catch { return false; };
+    wire_put_u32_into(out, ch.remote_id);
+    var wn: [byte: 14] = [
+        119, 105, 110, 100, 111, 119, 45, 99, 104, 97, 110, 103, 101, 0,
+    ];
+    wire_append_string(out, &wn[0], 13);
+    const w: !void = buf_append_byte(out, 0 as byte);   // want_reply = false
+    _ = w catch { return false; };
+    wire_put_u32_into(out, cols);
+    wire_put_u32_into(out, rows);
+    wire_put_u32_into(out, 0u32);
+    wire_put_u32_into(out, 0u32);
+    return true;
+}
+
+/// 构造 CHANNEL_DATA。
+/// 参数：out 为输出（会被重置）；ch 为通道；data/n 为要发送的数据。
+/// 返回值：成功返回 true（窗口不足返回 false）。
+export fn channel_build_data(out: &Buf, ch: &SessionChannel, data: &const byte, n: usize) bool {
+    if n == 0 {
+        return false;
+    }
+    if ch.remote_window < n as u32 {
+        return false;
+    }
+    // 单包不得超过对端上限
+    var take: usize = n;
+    const mp: usize = ch.remote_max_packet as usize;
+    if mp > 0 && take > mp {
+        take = mp;
+    }
+    out.len = 0;
+    const r: !void = buf_append_byte(out, MSG_CHANNEL_DATA);
+    _ = r catch { return false; };
+    wire_put_u32_into(out, ch.remote_id);
+    wire_append_string(out, data, take);
+    return true;
+}
+
+/// 发送数据后扣减窗口。
+/// 参数：ch 为通道，n 为实际发送字节数。
+/// 返回值：无。
+export fn channel_consume_window(ch: &SessionChannel, n: usize) void {
+    if ch.remote_window >= n as u32 {
+        ch.remote_window = ch.remote_window - n as u32;
+    } else {
+        ch.remote_window = 0u32;
+    }
+}
+
+/// 构造 CHANNEL_WINDOW_ADJUST。
+/// 参数：out 为输出（会被重置）；ch 为通道；bytes 为归还的额度。
+/// 返回值：成功返回 true。
+export fn channel_build_window_adjust(out: &Buf, ch: &const SessionChannel, bytes: u32) bool {
+    out.len = 0;
+    const r: !void = buf_append_byte(out, MSG_CHANNEL_WINDOW_ADJUST);
+    _ = r catch { return false; };
+    wire_put_u32_into(out, ch.remote_id);
+    wire_put_u32_into(out, bytes);
+    return true;
+}
+
+/// 构造 CHANNEL_EOF。
+/// 参数：out 为输出（会被重置）；ch 为通道。
+/// 返回值：成功返回 true。
+export fn channel_build_eof(out: &Buf, ch: &SessionChannel) bool {
+    out.len = 0;
+    const r: !void = buf_append_byte(out, MSG_CHANNEL_EOF);
+    _ = r catch { return false; };
+    wire_put_u32_into(out, ch.remote_id);
+    ch.eof = true;
+    return true;
+}
+
+/// 构造 CHANNEL_CLOSE。
+/// 参数：out 为输出（会被重置）；ch 为通道。
+/// 返回值：成功返回 true。
+export fn channel_build_close(out: &Buf, ch: &SessionChannel) bool {
+    out.len = 0;
+    const r: !void = buf_append_byte(out, MSG_CHANNEL_CLOSE);
+    _ = r catch { return false; };
+    wire_put_u32_into(out, ch.remote_id);
+    ch.close_sent = true;
+    return true;
+}
+
+/// 处理一个通道相关报文。
+///
+/// 参数：payload/n 为消息体；ch 为通道；data_off/data_len 为 CHANNEL_DATA 的载荷位置
+///       （输出，无数据时 data_len=0）；is_stderr 表示数据来自扩展数据（stderr）。
+/// 返回值：报文已被识别并处理返回 true；不是通道报文返回 false。
+export fn channel_handle(payload: &const byte, n: usize, ch: &SessionChannel,
+    data_off: &usize, data_len: &usize, is_stderr: &bool) bool {
+    data_off[0] = 0;
+    data_len[0] = 0;
+    is_stderr[0] = false;
+    if n < 1 {
+        return false;
+    }
+    const t: byte = payload[0];
+    if t != MSG_CHANNEL_OPEN_CONFIRMATION && t != MSG_CHANNEL_OPEN_FAILURE &&
+        t != MSG_CHANNEL_WINDOW_ADJUST && t != MSG_CHANNEL_DATA &&
+        t != MSG_CHANNEL_EXTENDED_DATA && t != MSG_CHANNEL_EOF &&
+        t != MSG_CHANNEL_CLOSE && t != MSG_CHANNEL_SUCCESS &&
+        t != MSG_CHANNEL_FAILURE && t != MSG_CHANNEL_REQUEST {
+        return false;
+    }
+    if n < 5 {
+        return true;
+    }
+    if t == MSG_CHANNEL_WINDOW_ADJUST && n >= 9 {
+        const add: u32 = wire_get_u32(payload + 5);
+        ch.remote_window = ch.remote_window + add;
+        return true;
+    }
+    if t == MSG_CHANNEL_DATA && n >= 9 {
+        const l: usize = wire_get_u32(payload + 5) as usize;
+        if 9 + l <= n {
+            data_off[0] = 9;
+            data_len[0] = l;
+        }
+        return true;
+    }
+    if t == MSG_CHANNEL_EXTENDED_DATA && n >= 13 {
+        // uint32 data_type_code | string data
+        const l: usize = wire_get_u32(payload + 9) as usize;
+        if 13 + l <= n {
+            data_off[0] = 13;
+            data_len[0] = l;
+            is_stderr[0] = true;
+        }
+        return true;
+    }
+    if t == MSG_CHANNEL_EOF {
+        ch.eof = true;
+        return true;
+    }
+    if t == MSG_CHANNEL_CLOSE {
+        ch.close_recv = true;
+        return true;
+    }
+    if t == MSG_CHANNEL_SUCCESS || t == MSG_CHANNEL_FAILURE {
+        ch.last_reply = t;
+        return true;
+    }
+    return true;
+}

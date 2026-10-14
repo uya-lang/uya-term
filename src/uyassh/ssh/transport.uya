@@ -446,13 +446,6 @@ export fn transport_newkeys(t: &Transport, out: &KexOutcome, is_first: bool) boo
         tx_seq = 0;
         rx_seq = 0;
     }
-    di = 0;
-    di = 0;
-    di = 0;
-    di = 0;
-    di = 0;
-    di = 0;
-    di = 0;
     cipher_state_setup(&t.tx, &key_c2s[0], out.key_len, &iv_c2s[0], &mac_c2s[0], out.mac_len);
     cipher_state_setup(&t.rx, &key_s2c[0], out.key_len, &iv_s2c[0], &mac_s2c[0], out.mac_len);
     t.tx.seq = tx_seq;
