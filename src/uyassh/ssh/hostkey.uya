@@ -1,0 +1,354 @@
+// src/uyassh/ssh/hostkey.uya - 主机密钥 blob 解析与验签（RFC 4253 §6.6 / RFC 8709 / RFC 8332）
+//
+// 说明：KEX_ECDH_REPLY 里的 K_S 是 SSH 公钥 blob：string 算法名 + 算法相关字段。
+// 签名是 string 算法名 + string 签名值，覆盖的是交换哈希 H。
+//
+//   ssh-ed25519（RFC 8709）  blob = "ssh-ed25519" || string(32 字节公钥)；sig = 64 字节
+//   ssh-rsa   （RFC 4253）   blob = "ssh-rsa" || mpint(e) || mpint(n)；sig 为 RSA 签名
+//   rsa-sha2-256/512（8332） 签名算法名是 rsa-sha2-*，但 blob 里的算法名仍是 ssh-rsa
+//
+// 踩坑记录：
+//   * **rsa-sha2-256 的 blob 算法名是 "ssh-rsa"**，不是 "rsa-sha2-256"。按签名算法名去
+//     匹配 blob 会判「算法不符」，而这是 RFC 8332 明确规定的（签名算法只体现在签名里）。
+//   * Ed25519 验签要在**原始消息 H** 上做（不是先哈希）：RFC 8032 内部自己做 SHA-512。
+//     把 H 再哈希一次是经典错误，且签名验证会稳定失败。
+
+use std.crypto.ed25519;
+use std.crypto.sha512;
+use std.crypto.sha512.Sha256Ctx;
+use std.crypto.bigint;
+use std.crypto.bigint.BIGINT_LIMBS;
+use ssh.wire.wire_get_u32;
+
+/// 主机密钥算法种类。
+export enum HostKeyKind {
+    ed25519,
+    rsa,
+    unsupported,
+}
+
+/// 解析出的主机密钥。
+/// 字段：kind 为算法种类；ed_pub 为 ed25519 公钥（32 字节）；e/n 为 RSA 指数与模数
+///       （大端，e_len/n_len 为长度）。
+export struct HostKey {
+    kind: HostKeyKind,
+    alg_name: [byte: 32],
+    alg_len: usize,
+    ed_pub: [byte: 32],
+    e: [byte: 8],
+    e_len: usize,
+    n: [byte: 512],
+    n_len: usize,
+}
+
+/// 比较字节串与 C 串是否相等。
+/// 参数：a/an 为数据，b 为 C 串。
+/// 返回值：相等返回 true。
+fn hk_eq(a: &const byte, an: usize, b: &const byte) bool {
+    var bn: usize = 0;
+    while b[bn] != 0 {
+        bn = bn + 1;
+    }
+    if an != bn {
+        return false;
+    }
+    var i: usize = 0;
+    var same: bool = true;
+    while i < an {
+        if a[i] != b[i] {
+            same = false;
+        }
+        i = i + 1;
+    }
+    return same;
+}
+
+/// 解析主机密钥 blob。
+/// 参数：blob/blob_len 为 K_S；out 为解析结果。
+/// 返回值：成功（且算法受支持）返回 true。
+export fn hostkey_parse(blob: &const byte, blob_len: usize, out: &HostKey) bool {
+    out.kind = HostKeyKind.unsupported;
+    out.alg_len = 0;
+    out.e_len = 0;
+    out.n_len = 0;
+    if blob_len < 8 {
+        return false;
+    }
+    const name_len: usize = wire_get_u32(blob) as usize;
+    if name_len == 0 || name_len > 32 || 4 + name_len > blob_len {
+        return false;
+    }
+    const name: &const byte = blob + 4;
+    var i: usize = 0;
+    while i < name_len {
+        out.alg_name[i] = name[i];
+        i = i + 1;
+    }
+    out.alg_len = name_len;
+    var pos: usize = 4 + name_len;
+    if hk_eq(name, name_len, "ssh-ed25519") {
+        if pos + 4 > blob_len {
+            return false;
+        }
+        const pub_len: usize = wire_get_u32(blob + pos) as usize;
+        pos = pos + 4;
+        if pub_len != 32 || pos + 32 > blob_len {
+            return false;
+        }
+        i = 0;
+        while i < 32 {
+            out.ed_pub[i] = blob[pos + i];
+            i = i + 1;
+        }
+        out.kind = HostKeyKind.ed25519;
+        return true;
+    }
+    if hk_eq(name, name_len, "ssh-rsa") {
+        // mpint e
+        if pos + 4 > blob_len {
+            return false;
+        }
+        const elen: usize = wire_get_u32(blob + pos) as usize;
+        pos = pos + 4;
+        if pos + elen > blob_len {
+            return false;
+        }
+        var eoff: usize = 0;
+        while eoff < elen && blob[pos + eoff] == 0 {
+            eoff = eoff + 1;
+        }
+        const ekeep: usize = elen - eoff;
+        if ekeep > 8 {
+            return false;
+        }
+        i = 0;
+        while i < ekeep {
+            out.e[i] = blob[pos + eoff + i];
+            i = i + 1;
+        }
+        out.e_len = ekeep;
+        pos = pos + elen;
+        // mpint n
+        if pos + 4 > blob_len {
+            return false;
+        }
+        var nlen: usize = wire_get_u32(blob + pos) as usize;
+        pos = pos + 4;
+        if pos + nlen > blob_len {
+            return false;
+        }
+        var noff: usize = 0;
+        while noff < nlen && blob[pos + noff] == 0 {
+            noff = noff + 1;
+        }
+        const nkeep: usize = nlen - noff;
+        if nkeep == 0 || nkeep > 512 {
+            return false;
+        }
+        i = 0;
+        while i < nkeep {
+            out.n[i] = blob[pos + noff + i];
+            i = i + 1;
+        }
+        out.n_len = nkeep;
+        out.kind = HostKeyKind.rsa;
+        return true;
+    }
+    return false;
+}
+
+/// 解析签名 blob，得到签名算法名与签名值。
+/// 参数：sig/sig_len 为签名 blob；alg 为算法名输出（最多 32 字节）；alg_len 为长度输出；
+///       val/val_len 为签名值输出。
+/// 返回值：成功返回 true。
+export fn hostkey_parse_sig(sig: &const byte, sig_len: usize, alg: &byte, alg_len: &usize,
+    val: &byte, val_len: &usize) bool {
+    alg_len[0] = 0;
+    val_len[0] = 0;
+    if sig_len < 8 {
+        return false;
+    }
+    const name_len: usize = wire_get_u32(sig) as usize;
+    if name_len == 0 || name_len > 32 || 4 + name_len > sig_len {
+        return false;
+    }
+    var i: usize = 0;
+    while i < name_len {
+        alg[i] = sig[4 + i];
+        i = i + 1;
+    }
+    alg_len[0] = name_len;
+    var pos: usize = 4 + name_len;
+    if pos + 4 > sig_len {
+        return false;
+    }
+    const vlen: usize = wire_get_u32(sig + pos) as usize;
+    pos = pos + 4;
+    if pos + vlen > sig_len || vlen > 512 {
+        return false;
+    }
+    i = 0;
+    while i < vlen {
+        val[i] = sig[pos + i];
+        i = i + 1;
+    }
+    val_len[0] = vlen;
+    return true;
+}
+
+/// 验证主机密钥对交换哈希 H 的签名。
+///
+/// 参数：hk 为主机密钥；sig_alg/sig_alg_len 为**签名算法名**（如 rsa-sha2-256）；
+///       sig_val/sig_val_len 为签名值；h 为 32 字节交换哈希。
+/// 返回值：验签通过返回 true。
+export fn hostkey_verify(hk: &const HostKey, sig_alg: &const byte, sig_alg_len: usize,
+    sig_val: &const byte, sig_val_len: usize, h: &const byte) bool {
+    if hk.kind == HostKeyKind.ed25519 {
+        // RFC 8709：签名算法名必须是 ssh-ed25519，签名 64 字节，消息就是 H
+        if !hk_eq(sig_alg, sig_alg_len, "ssh-ed25519") {
+            return false;
+        }
+        if sig_val_len != 64 {
+            return false;
+        }
+        return ed25519.ed25519_verify(sig_val, h, 32, &hk.ed_pub[0]);
+    }
+    if hk.kind == HostKeyKind.rsa {
+        // 签名算法名可以是 rsa-sha2-256 / rsa-sha2-512（RFC 8332）。
+        // 注意 blob 里的算法名始终是 "ssh-rsa"，不受签名算法影响。
+        var hash: [byte: 64] = [0: 64];
+        var hash_len: usize = 32;
+        if hk_eq(sig_alg, sig_alg_len, "rsa-sha2-256") {
+            var ctx: Sha256Ctx = Sha256Ctx{};
+            ctx.init();
+            ctx.update(h[0: 32]);
+            var d: [byte: 32] = [0: 32];
+            ctx.final(d[0: 32]);
+            var i: usize = 0;
+            while i < 32 {
+                hash[i] = d[i];
+                i = i + 1;
+            }
+            hash_len = 32;
+        } else if hk_eq(sig_alg, sig_alg_len, "rsa-sha2-512") {
+            var d512: [byte: 64] = [0: 64];
+            sha512.sha512_digest(h[0: 32], d512[0: 64]);
+            var i: usize = 0;
+            while i < 64 {
+                hash[i] = d512[i];
+                i = i + 1;
+            }
+            hash_len = 64;
+        } else {
+            return false;
+        }
+        return rsa_pkcs1_v15_verify(&hk.n[0], hk.n_len, &hk.e[0], hk.e_len, &hash[0], hash_len,
+            sig_val, sig_val_len);
+    }
+    return false;
+}
+
+/// RSA PKCS#1 v1.5 验签：sig^e mod n == EMSA-PKCS1-v1_5(hash)。
+/// 参数：n/n_len 与 e/e_len 为模数与指数（大端），hash/hash_len 为摘要，
+///       sig/sig_len 为签名（大端，长度须等于 n_len）。
+/// 返回值：验签通过返回 true。
+export fn rsa_pkcs1_v15_verify(n: &const byte, n_len: usize, e: &const byte, e_len: usize,
+    hash: &const byte, hash_len: usize, sig: &const byte, sig_len: usize) bool {
+    if n_len == 0 || n_len > 512 || e_len == 0 || e_len > 8 {
+        return false;
+    }
+    if sig_len != n_len {
+        return false;
+    }
+    // 用自建的 Montgomery 大数算 sig^e mod n（e 很小，通常是 65537）
+    var nl: [u64: BIGINT_LIMBS] = [0: BIGINT_LIMBS];
+    var sl: [u64: BIGINT_LIMBS] = [0: BIGINT_LIMBS];
+    var outl: [u64: BIGINT_LIMBS] = [0: BIGINT_LIMBS];
+    bigint.bigint_from_be(&nl[0], n, n_len, BIGINT_LIMBS);
+    bigint.bigint_from_be(&sl[0], sig, sig_len, BIGINT_LIMBS);
+    if bigint.bigint_cmp(&sl[0], &nl[0], BIGINT_LIMBS) >= 0 {
+        return false;
+    }
+    const n0: u64 = bigint.bigint_n0inv(&nl[0]);
+    bigint.bigint_modexp_be(&outl[0], &sl[0], e, e_len, &nl[0], n0);
+    var em: [byte: 512] = [0: 512];
+    bigint.bigint_to_be(&em[0], &outl[0], BIGINT_LIMBS);
+    // em 的最后 n_len 字节是 EMSA 编码（高位补零）
+    const start: usize = 512 - n_len;
+    // 检查 EM = 0x00 || 0x01 || PS(0xFF...) || 0x00 || DigestInfo
+    if start + 2 > 512 {
+        return false;
+    }
+    if em[start] != 0 || em[start + 1] != 1 {
+        return false;
+    }
+    var sep: usize = start + 2;
+    while sep < 512 && em[sep] == 0xFF as byte {
+        sep = sep + 1;
+    }
+    if sep >= 512 || em[sep] != 0 {
+        return false;
+    }
+    const t_len: usize = 512 - sep - 1;
+    // DigestInfo 前缀（RFC 8017 §9.2）
+    // SHA-256: 30 31 30 0d 06 09 60 86 48 01 65 03 04 02 01 05 00 04 20 || H(32)
+    // SHA-512: 30 51 30 0d 06 09 60 86 48 01 65 03 04 02 03 05 00 04 40 || H(64)
+    if hash_len == 32 {
+        if t_len != 19 + 32 {
+            return false;
+        }
+        if !rsa_digestinfo_matches(&em[sep + 1], &em[0], 1) {
+            return false;
+        }
+        var i: usize = 0;
+        while i < 32 {
+            if em[sep + 1 + 19 + i] != hash[i] {
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+    if hash_len == 64 {
+        if t_len != 19 + 64 {
+            return false;
+        }
+        if !rsa_digestinfo_matches(&em[sep + 1], &em[0], 2) {
+            return false;
+        }
+        var i: usize = 0;
+        while i < 64 {
+            if em[sep + 1 + 19 + i] != hash[i] {
+                return false;
+            }
+            i = i + 1;
+        }
+        return true;
+    }
+    return false;
+}
+
+/// 校验 DigestInfo 的 19 字节前缀（SHA-256 或 SHA-512）。
+/// 参数：t 为 DigestInfo 起点，unused 为占位，kind 为 1=SHA-256、2=SHA-512。
+/// 返回值：匹配返回 true。
+fn rsa_digestinfo_matches(t: &const byte, unused: &const byte, kind: i32) bool {
+    _ = unused;
+    var sha256_pfx: [byte: 19] = [
+        0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01,
+        0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20,
+    ];
+    var sha512_pfx: [byte: 19] = [
+        0x30, 0x51, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01,
+        0x65, 0x03, 0x04, 0x02, 0x03, 0x05, 0x00, 0x04, 0x40,
+    ];
+    var i: usize = 0;
+    var same: bool = true;
+    while i < 19 {
+        const want: byte = if kind == 1 { sha256_pfx[i] } else { sha512_pfx[i] };
+        if t[i] != want {
+            same = false;
+        }
+        i = i + 1;
+    }
+    return same;
+}

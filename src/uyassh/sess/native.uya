@@ -1,0 +1,480 @@
+// src/uyassh/sess/native.uya - 用原生 SSH 客户端跑一条远程命令或交互 shell
+//
+// 说明：这是「自己实现 SSH」与「uyassh 命令行」之间的接缝。它负责：
+//   1. 从参数里解析 [user@]host 与 port
+//   2. 读取 ~/.ssh/id_rsa 与 ~/.ssh/known_hosts
+//   3. 调用 ssh/client.ssh_connect 完成握手与认证
+//   4. 开通道，按需申请 pty，然后 exec 或 shell
+//   5. 把命令行参数拼成远程命令（与 ssh(1) 一致：非选项参数用空格连接）
+//
+// 关键约束（与 OpenSSH 行为一致）：
+//   * 未知主机**默认拒绝**；只有显式 --accept-new 才放行，且要说清楚写进了哪里。
+//   * 密钥不一致（mismatch）**永远拒绝**，不给任何开关绕过。
+//   * 加密私钥不静默降级，明确报错。
+
+use ssh.client.SshSession;
+use ssh.client.ConnectParams;
+use ssh.client.ssh_connect;
+use ssh.client.ssh_open_session;
+use ssh.client.Stage;
+use ssh.transport.transport_send;
+use ssh.transport.transport_recv;
+use ssh.channel.channel_build_data;
+use ssh.channel.channel_build_window_adjust;
+use ssh.channel.channel_build_eof;
+use ssh.channel.channel_build_close;
+use ssh.channel.channel_handle;
+use ssh.channel.channel_consume_window;
+use ssh.privkey.PrivateKey;
+use ssh.privkey.KeyKind;
+use ssh.privkey.privkey_parse_pem;
+use util.buf.Buf;
+use util.buf.buf_new;
+use util.out.out_str;
+use util.out.out_i64;
+use util.out.out_bytes;
+use libc.sys_open;
+use libc.sys_read;
+use libc.sys_write;
+use libc.sys_close;
+use libc.sys_poll;
+use libc.O_RDONLY;
+use libc.POLLIN;
+use libc.getenv;
+
+/// 原生会话运行结果。
+export enum NativeResult {
+    ok,
+    connect_failed,
+    host_untrusted,
+    auth_failed,
+    channel_failed,
+    io_failed,
+    bad_args,
+}
+
+/// 一个原生会话请求。
+/// 字段：host 为 C 串主机；port 为端口；user 为 C 串用户名；
+///       pty 表示申请伪终端；command 为远程命令（C 串，空=交互 shell）；
+///       term 为终端类型；accept_new 表示允许接受未知主机。
+export struct NativeRequest {
+    host: [byte: 256],
+    port: u16,
+    user: [byte: 64],
+    pty: bool,
+    command: [byte: 4096],
+    term: [byte: 32],
+    accept_new: bool,
+}
+
+/// 新建请求（全零）。
+/// 参数：无。
+/// 返回值：初始请求。
+export fn native_request_new() NativeRequest {
+    return NativeRequest{
+        host: [0: 256],
+        port: 22,
+        user: [0: 64],
+        pty: true,
+        command: [0: 4096],
+        term: [0: 32],
+        accept_new: false,
+    };
+}
+
+/// 复制 C 串到定长数组。
+/// 参数：out 为目标，cap 为容量，src 为 C 串。
+/// 返回值：成功返回 true（超长返回 false）。
+fn copy_cstr(out: &byte, cap: usize, src: &const byte) bool {
+    var n: usize = 0;
+    while src[n] != 0 {
+        n = n + 1;
+    }
+    if n >= cap {
+        return false;
+    }
+    var i: usize = 0;
+    while i < n {
+        out[i] = src[i];
+        i = i + 1;
+    }
+    out[n] = 0 as byte;
+    return true;
+}
+
+/// 解析 [user@]host[:port] 到请求里。
+/// 参数：spec 为 C 串，req 为请求。
+/// 返回值：成功返回 true。
+export fn native_parse_target(spec: &const byte, user: &const byte, req: &NativeRequest) bool {
+    var n: usize = 0;
+    while spec[n] != 0 {
+        n = n + 1;
+    }
+    // 找 '@'
+    var at: i64 = -1;
+    var i: usize = 0;
+    while i < n {
+        if spec[i] == 64 as byte {
+            at = i as i64;
+        }
+        i = i + 1;
+    }
+    var hp: usize = 0;
+    if at >= 0 {
+        const ul: usize = at as usize;
+        if ul >= 64 {
+            return false;
+        }
+        var k: usize = 0;
+        while k < ul {
+            req.user[k] = spec[k];
+            k = k + 1;
+        }
+        req.user[ul] = 0 as byte;
+        hp = ul + 1;
+    } else {
+        if !copy_cstr(&req.user[0], 64, user) {
+            return false;
+        }
+    }
+    // 找 ':'
+    var colon: i64 = -1;
+    i = hp;
+    while i < n {
+        if spec[i] == 58 as byte {
+            colon = i as i64;
+        }
+        i = i + 1;
+    }
+    if colon >= 0 {
+        const hl: usize = (colon as usize) - hp;
+        if hl >= 256 {
+            return false;
+        }
+        var k: usize = 0;
+        while k < hl {
+            req.host[k] = spec[hp + k];
+            k = k + 1;
+        }
+        req.host[hl] = 0 as byte;
+        // 解析端口
+        var p: u32 = 0;
+        i = (colon as usize) + 1;
+        while i < n {
+            const c: byte = spec[i];
+            if c >= 48 && c <= 57 {
+                p = p * 10u32 + ((c - 48 as byte) as u32);
+            } else {
+                return false;
+            }
+            i = i + 1;
+        }
+        if p == 0 || p > 65535u32 {
+            return false;
+        }
+        req.port = p as u16;
+    } else {
+        const hl: usize = n - hp;
+        if hl >= 256 {
+            return false;
+        }
+        var k: usize = 0;
+        while k < hl {
+            req.host[k] = spec[hp + k];
+            k = k + 1;
+        }
+        req.host[hl] = 0 as byte;
+    }
+    return true;
+}
+
+/// 把多个 C 串用空格连接成一个命令（与 ssh(1) 一致）。
+/// 参数：args 为参数数组，count 为个数，out 为输出，cap 为容量。
+/// 返回值：成功返回 true。
+export fn native_join_command(args: &(&const byte), count: usize, out: &byte, cap: usize) bool {
+    var w: usize = 0;
+    var a: usize = 0;
+    while a < count {
+        const s: &const byte = args[a];
+        if w > 0 {
+            if w >= cap - 1 {
+                return false;
+            }
+            out[w] = 32 as byte;
+            w = w + 1;
+        }
+        var i: usize = 0;
+        while s[i] != 0 {
+            if w >= cap - 1 {
+                return false;
+            }
+            out[w] = s[i];
+            w = w + 1;
+            i = i + 1;
+        }
+        a = a + 1;
+    }
+    out[w] = 0 as byte;
+    return true;
+}
+
+/// 读取整个文件（供 known_hosts / 私钥用）。
+/// 参数：path 为 C 串路径，out 为输出，cap 为容量。
+/// 返回值：读到的字节数（0 表示失败或空）。
+fn read_all(path: &const byte, out: &byte, cap: usize) usize {
+    const fd: i32 = sys_open(path, O_RDONLY as i32, 0) catch { return 0; };
+    var total: usize = 0;
+    while total < cap {
+        var got: isize = 0;
+        const gr: !isize = sys_read(fd, out + total, cap - total);
+        got = gr catch { -1 as isize; };
+        if got <= 0 { break; }
+        total = total + (got as usize);
+    }
+    _ = sys_close(fd) catch { 0 as i32; };
+    return total;
+}
+
+/// 拼接 ~/.ssh/<name> 到缓冲。
+/// 参数：home 为家目录 C 串，name 为文件名 C 串，out 为输出，cap 为容量。
+/// 返回值：成功返回 true。
+fn ssh_path(home: &const byte, name: &const byte, out: &byte, cap: usize) bool {
+    var w: usize = 0;
+    var i: usize = 0;
+    while home[i] != 0 {
+        if w >= cap - 1 { return false; }
+        out[w] = home[i];
+        w = w + 1;
+        i = i + 1;
+    }
+    // "/.ssh/" —— **结尾的斜杠不能少**，否则会拼出
+    // "/home/user/.sshid_rsa" 这种路径，文件打不开而表现为「私钥加载失败」。
+    var suffix: [byte: 7] = [47, 46, 115, 115, 104, 47, 0];
+    i = 0;
+    while suffix[i] != 0 {
+        if w >= cap - 1 { return false; }
+        out[w] = suffix[i];
+        w = w + 1;
+        i = i + 1;
+    }
+    i = 0;
+    while name[i] != 0 {
+        if w >= cap - 1 { return false; }
+        out[w] = name[i];
+        w = w + 1;
+        i = i + 1;
+    }
+    out[w] = 0 as byte;
+    return true;
+}
+
+/// 取得家目录（优先 $HOME，其次 /home/<user> 形式由调用方给出）。
+/// 参数：out 为输出，cap 为容量。
+/// 返回值：成功返回 true。
+fn get_home(out: &byte, cap: usize) bool {
+    var name: [byte: 5] = [72, 79, 77, 69, 0];
+    const h: &byte = getenv(&name[0]);
+    if h == null {
+        return false;
+    }
+    return copy_cstr(out, cap, h);
+}
+
+/// 运行一次原生 SSH 会话。
+///
+/// 参数：req 为请求，result 给出失败原因。
+/// 返回值：成功返回 true。
+export fn native_run(req: &const NativeRequest, result: &NativeResult) bool {
+    result[0] = NativeResult.bad_args;
+    // ~/.ssh 路径
+    var home: [byte: 256] = [0: 256];
+    if !get_home(&home[0], 256) {
+        return false;
+    }
+    var keypath: [byte: 512] = [0: 512];
+    var khpath: [byte: 512] = [0: 512];
+    var keyname: [byte: 12] = [105, 100, 95, 101, 100, 50, 53, 53, 49, 57, 0, 0];
+    var rsa_name: [byte: 8] = [105, 100, 95, 114, 115, 97, 0, 0];
+    var khname: [byte: 14] = [107, 110, 111, 119, 110, 95, 104, 111, 115, 116, 115, 0, 0, 0];
+    var ptext: [byte: 12288] = [0: 12288];
+    var key: PrivateKey = PrivateKey{
+        kind: KeyKind.none, ed_seed: [0: 32], ed_pub: [0: 32], n: [0: 512], n_len: 0,
+        e: [0: 8], e_len: 0, d: [0: 512], d_len: 0, comment: [0: 128], comment_len: 0,
+        p_len: 0, p_probe: [0: 256], encrypted: false, ok: false,
+    };
+    // 优先 ed25519，其次 rsa
+    var ptot: usize = 0;
+    if ssh_path(&home[0], &keyname[0], &keypath[0], 512) {
+        ptot = read_all(&keypath[0], &ptext[0], 12288);
+        if ptot > 0 {
+            _ = privkey_parse_pem(&ptext[0], ptot, &key);
+        }
+    }
+    if !key.ok {
+        if ssh_path(&home[0], &rsa_name[0], &keypath[0], 512) {
+            ptot = read_all(&keypath[0], &ptext[0], 12288);
+            if ptot > 0 {
+                _ = privkey_parse_pem(&ptext[0], ptot, &key);
+            }
+        }
+    }
+    if !key.ok {
+        result[0] = NativeResult.auth_failed;
+        return false;
+    }
+    // known_hosts（可为空：那表示全部主机都未知）
+    var khtext: [byte: 32768] = [0: 32768];
+    var khlen: usize = 0;
+    if ssh_path(&home[0], &khname[0], &khpath[0], 512) {
+        khlen = read_all(&khpath[0], &khtext[0], 32768);
+    }
+    var p: ConnectParams = ConnectParams{
+        host: &req.host[0],
+        port: req.port,
+        user: &req.user[0],
+        known_hosts: &khtext[0],
+        known_hosts_len: khlen,
+        accept_new: req.accept_new,
+        key: &key,
+    };
+    var s: SshSession = ssh_session_new();
+    if !ssh_connect(&p, &s) {
+        result[0] = stage_to_result(s.stage);
+        return false;
+    }
+    if !ssh_open_session(&s, req.pty, &req.term[0], 80, 24, &req.command[0]) {
+        result[0] = stage_to_result(s.stage);
+        return false;
+    }
+    result[0] = NativeResult.ok;
+    // 交互循环：本机 stdin ↔ 远程通道
+    const pumped: bool = native_pump(&s);
+    return pumped;
+}
+
+
+
+
+/// 把运行结果转成可读文本（错误提示用）。
+/// 参数：r 为结果。
+/// 返回值：静态 C 串。
+export fn native_result_text(r: NativeResult) &const byte {
+    if r == NativeResult.ok {
+        return &OK_TEXT[0];
+    }
+    if r == NativeResult.connect_failed {
+        return &CONNECT_TEXT[0];
+    }
+    if r == NativeResult.host_untrusted {
+        return &HOST_TEXT[0];
+    }
+    if r == NativeResult.auth_failed {
+        return &AUTH_TEXT[0];
+    }
+    if r == NativeResult.channel_failed {
+        return &CHANNEL_TEXT[0];
+    }
+    if r == NativeResult.io_failed {
+        return &IO_TEXT[0];
+    }
+    return &ARGS_TEXT[0];
+}
+
+const OK_TEXT: [byte: 3] = [111, 107, 0];
+const CONNECT_TEXT: [byte: 13] = [230, 151, 160, 230, 179, 149, 232, 191, 158, 230, 142, 165, 0];
+const HOST_TEXT: [byte: 19] = [228, 184, 187, 230, 156, 186, 229, 175, 134, 233, 146, 165, 230, 156, 170, 233, 128, 154, 0];
+const AUTH_TEXT: [byte: 13] = [232, 174, 164, 232, 175, 129, 229, 164, 177, 232, 180, 165, 0];
+const CHANNEL_TEXT: [byte: 13] = [233, 128, 154, 233, 129, 147, 229, 164, 177, 232, 180, 165, 0];
+const IO_TEXT: [byte: 13] = [232, 175, 187, 229, 134, 153, 229, 164, 177, 232, 180, 165, 0];
+const ARGS_TEXT: [byte: 13] = [229, 143, 130, 230, 149, 176, 230, 151, 160, 230, 149, 136, 0];
+
+/// 把会话阶段映射为运行结果。
+/// 参数：st 为阶段。
+/// 返回值：对应结果。
+export fn stage_to_result(st: Stage) NativeResult {
+    if st == Stage.ok {
+        return NativeResult.ok;
+    }
+    if st == Stage.connect_failed {
+        return NativeResult.connect_failed;
+    }
+    if st == Stage.auth_failed {
+        return NativeResult.auth_failed;
+    }
+    if st == Stage.channel_failed {
+        return NativeResult.channel_failed;
+    }
+    if st == Stage.io_failed {
+        return NativeResult.io_failed;
+    }
+    if st == Stage.kex_failed {
+        return NativeResult.connect_failed;
+    }
+    return NativeResult.host_untrusted;
+}
+
+/// 本机 stdin 与远程通道之间搬运数据，直到对端关闭。
+///
+/// 参数：s 为已打开的会话。
+/// 返回值：正常结束返回 true。
+export fn native_pump(s: &SshSession) bool {
+    var outbuf: Buf = buf_new();
+    var inbuf: [byte: 8192] = [0: 8192];
+    var rounds: i64 = 0;
+    while rounds < 1000000 {
+        // 本机有输入？
+        var fds: [i32: 2] = [0, 0];
+        var ev: [i16: 2] = [1, 0];   // POLLIN on stdin
+        const pr: i32 = sys_poll(&fds[0], 1, 30) catch { 0 as i32; };
+        if pr > 0 {
+            const gr: !isize = sys_read(0, &inbuf[0], 8192);
+            var got: isize = 0;
+            got = gr catch { -1 as isize; };
+            if got <= 0 {
+                // 本机 stdin 结束：发 EOF 表示不再发送
+                _ = channel_build_eof(&outbuf, &s.ch);
+                if !transport_send(&s.t, outbuf.data, outbuf.len) {
+                    return false;
+                }
+            } else {
+                var off: usize = 0;
+                const n: usize = got as usize;
+                while off < n {
+                    const take: usize = n - off;
+                    if !channel_build_data(&outbuf, &s.ch, inbuf + off, take) {
+                        // 窗口不足：先把远端数据读掉，等 WINDOW_ADJUST
+                        break;
+                    }
+                    if !transport_send(&s.t, outbuf.data, outbuf.len) {
+                        return false;
+                    }
+                    channel_consume_window(&s.ch, take);
+                    off = off + take;
+                }
+            }
+        }
+        // 读远端数据（非阻塞式：靠 recv 内部的等待）
+        if !transport_recv(&s.t) {
+            return true;
+        }
+        var off2: usize = 0;
+        var len: usize = 0;
+        var err: bool = false;
+        _ = channel_handle(&s.t.payload[0], s.t.payload_len, &s.ch, &off2, &len, &err);
+        if len > 0 {
+            const wr: !isize = sys_write(1, s.t.payload + off2, len);
+            _ = wr catch { 0 as isize; };
+            _ = channel_build_window_adjust(&outbuf, &s.ch, len as u32);
+            if !transport_send(&s.t, outbuf.data, outbuf.len) {
+                return false;
+            }
+        }
+        if s.ch.close_recv {
+            _ = channel_build_close(&outbuf, &s.ch);
+            _ = transport_send(&s.t, outbuf.data, outbuf.len);
+            return true;
+        }
+        rounds = rounds + 1;
+    }
+    return true;
+}

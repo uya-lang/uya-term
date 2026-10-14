@@ -1,0 +1,204 @@
+// src/uyassh/ssh/wire.uya - SSH 二进制协议基本类型编解码（RFC 4251 §5）
+//
+// 说明：SSH 的 wire 格式是「大端、长度前缀」的紧凑编码：字符串带 u32 长度前缀，
+//       mpint 是大端补码整数（最高位为 1 时前面补 0x00，0 编码为空串），
+//       name-list 是逗号分隔的字符串。所有多字节整数都是**大端**。
+//
+// 本层只做纯编解码，不碰 socket、不做加密——密码学与传输在 ssh/packet.uya 之上。
+
+use util.buf.Buf;
+use util.buf.buf_append;
+use util.buf.buf_append_byte;
+use util.buf.read_be_u32;
+
+/// u32 写入大端。
+/// 参数：p 为目标缓冲，v 为值。
+/// 返回值：无。
+export fn wire_put_u32(p: &byte, v: u32) void {
+    p[0] = ((v >> 24) & 255u32) as byte;
+    p[1] = ((v >> 16) & 255u32) as byte;
+    p[2] = ((v >> 8) & 255u32) as byte;
+    p[3] = (v & 255u32) as byte;
+}
+
+/// 读大端 u32。
+/// 参数：p 为源数据。
+/// 返回值：值。
+export fn wire_get_u32(p: &const byte) u32 {
+    return ((p[0] as u32) << 24) | ((p[1] as u32) << 16) | ((p[2] as u32) << 8) | (p[3] as u32);
+}
+
+/// 读大端 u64。
+/// 参数：p 为源数据。
+/// 返回值：值。
+export fn wire_get_u64(p: &const byte) u64 {
+    var v: u64 = 0;
+    var i: usize = 0;
+    while i < 8 {
+        v = (v << 8) | (p[i] as u64);
+        i = i + 1;
+    }
+    return v;
+}
+
+/// 把 32 位值按大端追加到 Buf。
+/// 参数：b 为目标缓冲，v 为值。
+/// 返回值：无。
+export fn wire_append_u32(b: &Buf, v: u32) void {
+    var tmp: [byte: 4] = [0: 4];
+    wire_put_u32(&tmp[0], v);
+    const r: !void = buf_append(b, &tmp[0], 4);
+    _ = r catch { return; };
+}
+
+/// 把字节串按 SSH 字符串（u32 长度 + 内容）追加到 Buf。
+/// 参数：b 为目标缓冲，s 为内容，n 为长度。
+/// 返回值：无。
+export fn wire_append_string(b: &Buf, s: &const byte, n: usize) void {
+    wire_append_u32(b, n as u32);
+    if n == 0 {
+        return;
+    }
+    const r: !void = buf_append(b, s, n);
+    _ = r catch { return; };
+}
+
+/// 把以 '\0' 结尾的 C 串按 SSH 字符串追加。
+/// 参数：b 为目标缓冲，s 为内容。
+/// 返回值：无。
+export fn wire_append_cstr(b: &Buf, s: &const byte) void {
+    var n: usize = 0;
+    while s[n] != 0 {
+        n = n + 1;
+    }
+    wire_append_string(b, s, n);
+}
+
+/// 把字节串按 SSH mpint 追加：大端补码，最高位为 1 时前置 0x00；全零编码为空串。
+/// 参数：b 为目标缓冲，s 为大端无符号整数（输入视作非负）。
+/// 返回值：无。
+export fn wire_append_mpint(b: &Buf, s: &const byte, n: usize) void {
+    var start: usize = 0;
+    while start < n && s[start] == 0 {
+        start = start + 1;
+    }
+    const len: usize = n - start;
+    if len == 0 {
+        wire_append_u32(b, 0u32);
+        return;
+    }
+    const high_bit: bool = (s[start] & 128 as byte) != 0;
+    wire_append_u32(b, (len + (if high_bit { 1 } else { 0 })) as u32);
+    if high_bit {
+        buf_append_byte(b, 0 as byte) catch { return; };
+    }
+    buf_append(b, s + start, len) catch { return; };
+}
+
+/// 从缓冲游标读一个 SSH 字符串（u32 长度 + 内容），把内容指针与长度写回。
+/// 参数：buf/n 为输入数据，pos 为读写游标，out_ptr 为内容起始指针，
+///       out_len 为内容长度。
+/// 返回值：成功返回 true（越界/长度不合理返回 false）。
+export fn wire_read_string(buf: &const byte, n: usize, pos: &usize, out_ptr: &&const byte,
+    out_len: &usize) bool {
+    const p: usize = pos[0];
+    if p + 4 > n {
+        return false;
+    }
+    const len: usize = wire_get_u32(buf + p) as usize;
+    if p + 4 + len > n {
+        return false;
+    }
+    out_ptr[0] = buf + p + 4;
+    out_len[0] = len;
+    pos[0] = p + 4 + len;
+    return true;
+}
+
+/// 从缓冲游标读一个 u32。
+/// 参数：buf/n 为输入数据，pos 为读写游标，out 为输出值。
+/// 返回值：成功返回 true。
+export fn wire_read_u32_cursor(buf: &const byte, n: usize, pos: &usize, out: &u32) bool {
+    const p: usize = pos[0];
+    if p + 4 > n {
+        return false;
+    }
+    out[0] = wire_get_u32(buf + p);
+    pos[0] = p + 4;
+    return true;
+}
+
+/// 从缓冲游标读一个字节。
+/// 参数：buf/n 为输入数据，pos 为读写游标，out 为输出字节。
+/// 返回值：成功返回 true。
+export fn wire_read_byte_cursor(buf: &const byte, n: usize, pos: &usize, out: &byte) bool {
+    const p: usize = pos[0];
+    if p + 1 > n {
+        return false;
+    }
+    out[0] = buf[p];
+    pos[0] = p + 1;
+    return true;
+}
+
+/// 比较两个字节串是否相等。
+/// 参数：a/an 与 b/bn 为待比较数据。
+/// 返回值：相等返回 true。
+export fn wire_bytes_eq(a: &const byte, an: usize, b: &const byte, bn: usize) bool {
+    if an != bn {
+        return false;
+    }
+    var i: usize = 0;
+    var same: bool = true;
+    while i < an {
+        if a[i] != b[i] {
+            same = false;
+        }
+        i = i + 1;
+    }
+    return same;
+}
+
+/// 在逗号分隔的 name-list 中查找某个名字（精确匹配、不跨逗号）。
+/// 参数：list/list_len 为 name-list 内容，name 为待查名字（C 串）。
+/// 返回值：找到返回 true。
+export fn wire_namelist_has(list: &const byte, list_len: usize, name: &const byte) bool {
+    var name_len: usize = 0;
+    while name[name_len] != 0 {
+        name_len = name_len + 1;
+    }
+    if name_len == 0 {
+        return false;
+    }
+    var i: usize = 0;
+    while i < list_len {
+        // 取一段到下一个逗号
+        var j: usize = i;
+        while j < list_len && list[j] != 44 as byte {
+            j = j + 1;
+        }
+        const seg_len: usize = j - i;
+        if seg_len == name_len {
+            var same: bool = true;
+            var k: usize = 0;
+            while k < seg_len {
+                if list[i + k] != name[k] {
+                    same = false;
+                }
+                k = k + 1;
+            }
+            if same {
+                return true;
+            }
+        }
+        i = j + 1;
+    }
+    return false;
+}
+
+/// 把 name-list 写进缓冲（内容原样，带长度前缀）。
+/// 参数：b 为目标缓冲，names 为逗号分隔的名字串（C 串）。
+/// 返回值：无。
+export fn wire_append_namelist(b: &Buf, names: &const byte) void {
+    wire_append_cstr(b, names);
+}

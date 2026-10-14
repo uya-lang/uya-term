@@ -6,11 +6,20 @@ use std.runtime.saved_argv;
 
 use cli.cli.Options;
 use cli.cli.parse_args;
+use cli.cli.PtyMode;
 use cli.cli.print_help;
 use cli.cli.is_clip_invocation;
 use util.out.out_str;
+use libc.getenv;
 use sess.wrapper.wrapper_run;
 use clip.cmd.clip_run;
+use sess.native.NativeRequest;
+use sess.native.NativeResult;
+use sess.native.native_request_new;
+use sess.native.native_parse_target;
+use sess.native.native_join_command;
+use sess.native.native_run;
+use util.out.out_i64;
 
 const VERSION: &const byte = "uya-ssh 0.1.0 (uya-term)\n";
 
@@ -40,7 +49,120 @@ export fn main() i32 {
     if is_clip_invocation(&opts) {
         return run_clip(&opts);
     }
+    // --transport=native：只用原生，失败就失败，**绝不**悄悄改用系统 ssh。
+    // 这一点是安全相关的：如果未知主机被拒后回落系统 ssh，用户会以为
+    // 「原生校验通过了」，而实际是系统 ssh 用另一套 known_hosts 放行的。
+    if opts.transport == 1 {
+        return run_native_strict(&opts);
+    }
+    // --transport=auto：先用原生；**安全类失败绝不回落**，其余（连不上、
+    // 认证方式不支持等）才交给系统 ssh——这正是 auto 的意义。
+    // 之所以对安全类失败破例：回落会掩盖「主机未校验通过」这件事，
+    // 用户看到命令照样执行，会以为原生这条链路是可信的。
+    if opts.transport == 0 && opts.arg_count > 0 {
+        const rc: i32 = run_native(&opts);
+        if rc == NATIVE_FALLBACK || rc == NATIVE_TRY_SYSTEM {
+            return run_wrapper(&opts);
+        }
+        return rc;
+    }
     return run_wrapper(&opts);
+}
+
+/// 用原生 SSH 客户端跑一次会话。
+///
+/// 参数：opts 为命令行选项（第一个位置参数是目标，其余拼成远程命令）。
+/// 返回值：退出码；返回 -1 表示「原生不适用」，由调用方回落系统 ssh。
+const NATIVE_FALLBACK: i32 = -1;
+/// 原生失败但可以交给系统 ssh 重试（auto 模式下使用）。
+const NATIVE_TRY_SYSTEM: i32 = -2;
+
+/// 明确要求原生传输时的入口：任何失败都直接报错，不回落。
+/// 参数：opts 为选项。
+/// 返回值：退出码。
+fn run_native_strict(opts: &Options) i32 {
+    if opts.arg_count < 1 {
+        out_str("uyassh: 原生传输需要目标主机\n" as &const byte);
+        return 2;
+    }
+    const rc: i32 = run_native(opts);
+    if rc == NATIVE_FALLBACK {
+        out_str("uyassh: 无法解析目标（格式应为 [user@]host[:port]）\n" as &const byte);
+        return 2;
+    }
+    if rc == NATIVE_TRY_SYSTEM {
+        // 显式要求原生时**不回落**，如实报告失败。
+        out_str("uyassh: 原生 SSH 连接失败（--transport=native 不回退系统 ssh）\n" as &const byte);
+        return 3;
+    }
+    return rc;
+}
+
+/// 用原生 SSH 客户端跑一次会话。
+/// 参数：opts 为选项。
+/// 返回值：退出码；NATIVE_FALLBACK 表示「原生不适用」，可由调用方回落系统 ssh。
+fn run_native(opts: &Options) i32 {
+    if opts.arg_count < 1 {
+        return NATIVE_FALLBACK;
+    }
+    var req: NativeRequest = native_request_new();
+    req.pty = opts.pty_mode != PtyMode.never;
+    // 用户名：优先目标里的 user@，否则 $USER。
+    // **注意：不解析 ~/.ssh/config 的 User/HostName/Port 别名。**
+    // 例如 ssh config 里写了 `Host hk.ersunfu.cn / User root`，
+    // 直接 `uyassh --transport=native hk.ersunfu.cn` 会用 $USER 而不是 root，
+    // 表现为「认证失败」——而系统 ssh 却能用（它读了 config）。
+    // 需要时请显式写 `user@host`。
+    var uname: [byte: 5] = [85, 83, 69, 82, 0];
+    var uenv: [byte: 64] = [0: 64];
+    const uv: &byte = getenv(&uname[0]);
+    if uv != null {
+        var i: usize = 0;
+        while uv[i] != 0 && i < 63 {
+            uenv[i] = uv[i];
+            i = i + 1;
+        }
+        uenv[i] = 0 as byte;
+    }
+    // 目标里可能自带 user@host
+    if !native_parse_target(opts.args[0], &uenv[0], &req) {
+        return NATIVE_FALLBACK;
+    }
+    // 其余参数拼成远程命令
+    if opts.arg_count > 1 {
+        var empty: [byte: 1] = [0];
+        var rest: [&const byte: 64] = [&empty[0]: 64];
+        var k: usize = 1;
+        while k < opts.arg_count && k - 1 < 64 {
+            rest[k - 1] = opts.args[k];
+            k = k + 1;
+        }
+        if !native_join_command(&rest[0], opts.arg_count - 1, &req.command[0], 4096) {
+            return NATIVE_FALLBACK;
+        }
+    }
+    req.accept_new = opts.accept_new;
+    var res: NativeResult = NativeResult.ok;
+    if native_run(&req, &res) {
+        return 0;
+    }
+    // 安全类失败**不回落**，并给出可操作的提示；其余失败允许调用方回退系统 ssh。
+    if res == NativeResult.host_untrusted {
+        out_str("uyassh: 主机密钥未通过校验。\n" as &const byte);
+        out_str("  若确认这是首次连接，可加 --accept-new 接受。\n" as &const byte);
+        return 5;
+    }
+    // auto 模式允许回落的失败类型：连不上、没有可用私钥/认证失败、通道建不起来。
+    // 只有**安全类失败**（主机未知/不一致/被吊销）不回落——那种情况下回落
+    // 会让用户误以为原生这条链路是可信的。
+    if res == NativeResult.connect_failed || res == NativeResult.io_failed ||
+        res == NativeResult.auth_failed || res == NativeResult.channel_failed {
+        return NATIVE_TRY_SYSTEM;
+    }
+    out_str("uyassh: 原生 SSH 失败：" as &const byte);
+    out_str(native_result_text(res));
+    out_str("\n" as &const byte);
+    return 3;
 }
 
 /// 执行内建 clip 子命令（M2 实现）。

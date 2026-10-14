@@ -1,0 +1,464 @@
+// src/uyassh/ssh/transport.uya - 传输层：NEWKEYS 切换、加密读写、算法协商
+//
+// 说明：KEX 完成后双方各发 NEWKEYS(21)，**此后的所有报文都加密**。这一步是
+// 「KEX 成功」与「能登录」之间的门槛：KEX 全部算对、但没处理 NEWKEYS 的话，
+// 下一个请求会读到乱码，症状是「认证莫名失败」而看不出是加密没开。
+//
+// 密钥派生（RFC 4253 §7.2）：所有密钥都来自 KDF(K || H || letter || session_id)，
+// 其中 session_id = **第一次** KEX 的 H（重协商后 H 会变，但 session_id 不变）：
+//   'A' IV        client→server
+//   'B' IV        server→client
+//   'C' 加密密钥  client→server
+//   'D' 加密密钥  server→client
+//   'E' 完整性密钥 client→server
+//   'F' 完整性密钥 server→client
+//
+// 踩坑记录：
+//   * **NEWKEYS 之后的方向性**：客户端发的用 A/C/E，收到的用 B/D/F。
+//     两边都用同一组会让第一个加密包就解不开。
+//   * **会话 id 固定为首次 H**，不能在 rekey 时更新，否则认证签名失效。
+//   * 收到 SSH_MSG_KEXINIT(20) 表示对端发起**重协商**：此时不能再发业务数据，
+//     必须重新走一遍 KEX（本实现返回 reconnect 状态交由上层处理）。
+//   * SSH_MSG_IGNORE(2) 与 SSH_MSG_DEBUG(4) 要**静默丢弃**并继续读下一个包，
+//     不能当成错误——对端可能随时插入。
+
+use net.tcp.tcp_read_full;
+use net.tcp.tcp_write_full;
+use util.buf.Buf;
+use util.buf.buf_new;
+use util.buf.buf_free;
+use ssh.packet.CipherState;
+use ssh.packet.cipher_state_new;
+use ssh.packet.cipher_state_setup;
+use ssh.packet.packet_build;
+use ssh.packet.MAC_LEN;
+use ssh.packet.BLOCK_LEN;
+use ssh.packet.packet_ctr_xor;
+use ssh.packet.cipher_state_copy;
+use ssh.packet.packet_parse;
+use ssh.kdf.kdf_exchange_hash_curve25519;
+use ssh.kdf.kdf_derive;
+use ssh.kdf.kdf_secret_to_mpint;
+use ssh.kex.kex_build_kexinit;
+use ssh.kex.kex_build_ecdh_init;
+use ssh.kex.kex_parse_ecdh_reply;
+use ssh.kex.kex_compute_secret;
+
+/// 报文类型。
+export const MSG_DISCONNECT: byte = 1 as byte;
+/// SSH_MSG_IGNORE。
+export const MSG_IGNORE: byte = 2 as byte;
+/// SSH_MSG_DEBUG。
+export const MSG_DEBUG: byte = 4 as byte;
+/// SSH_MSG_SERVICE_REQUEST。
+export const MSG_SERVICE_REQUEST: byte = 5 as byte;
+/// SSH_MSG_SERVICE_ACCEPT。
+export const MSG_SERVICE_ACCEPT: byte = 6 as byte;
+/// SSH_MSG_KEXINIT。
+export const MSG_KEXINIT: byte = 20 as byte;
+/// SSH_MSG_NEWKEYS。
+export const MSG_NEWKEYS: byte = 21 as byte;
+/// SSH_MSG_EXT_INFO。
+export const MSG_EXT_INFO: byte = 7 as byte;
+
+/// 传输层状态。
+export struct Transport {
+    /// 连接 fd。
+    fd: i32,
+    /// 发送方向密码状态。
+    tx: CipherState,
+    /// 接收方向密码状态。
+    rx: CipherState,
+    /// 会话 id（首次 KEX 的 H）。
+    session_id: [byte: 32],
+    /// 交换哈希（重协商时会变）。
+    h: [byte: 32],
+    /// K 的 mpint 编码。
+    k_mpint: [byte: 40],
+    k_mpint_len: usize,
+    /// 加密是否已启用。
+    encrypted: bool,
+    /// 上次读取的报文载荷（有效数据在 payload[payload_off .. payload_off+payload_len)）。
+    payload: [byte: 8192],
+    payload_off: usize,
+    payload_len: usize,
+}
+
+/// 读取原始字节。
+/// 参数：fd 为连接，buf 为目标，n 为期望字节数。
+/// 返回值：实际读到的字节数（0 表示出错或对端关闭）。
+fn tp_read(fd: i32, buf: &byte, n: usize) usize {
+    const gr: !usize = tcp_read_full(fd, buf, n);
+    const got: usize = gr catch { 0 as usize; };
+    return got;
+}
+
+/// 写出全部字节。
+/// 参数：fd 为连接，buf/n 为数据。
+/// 返回值：成功返回 true。
+fn tp_write(fd: i32, buf: &const byte, n: usize) bool {
+    const wr: !usize = tcp_write_full(fd, buf, n);
+    const sent: usize = wr catch { 0 as usize; };
+    return sent == n;
+}
+
+/// 初始化传输层。
+/// 参数：fd 为已连接的套接字。
+/// 返回值：传输层状态。
+export fn transport_new(fd: i32) Transport {
+    var t: Transport = Transport{
+        fd: fd,
+        tx: cipher_state_new(),
+        rx: cipher_state_new(),
+        session_id: [0: 32],
+        h: [0: 32],
+        k_mpint: [0: 40],
+        k_mpint_len: 0,
+        encrypted: false,
+        payload: [0: 8192],
+        payload_off: 0,
+        payload_len: 0,
+    };
+    return t;
+}
+
+/// 版本交换：读对端版本行，发我方版本行。
+/// 参数：t 为传输层，out_vs 为对端版本行（不含 CR/LF），out_vs_len 为长度。
+/// 返回值：成功返回 true。
+export fn transport_version_exchange(t: &Transport, out_vs: &byte, out_vs_len: &usize) bool {
+    out_vs_len[0] = 0;
+    var raw: [byte: 256] = [0: 256];
+    var n: usize = 0;
+    var one: [byte: 1] = [0];
+    while n < 255 {
+        if tp_read(t.fd, &one[0], 1) == 0 {
+            break;
+        }
+        raw[n] = one[0];
+        n = n + 1;
+        if one[0] == 10 as byte {
+            break;
+        }
+    }
+    if n == 0 {
+        return false;
+    }
+    // 去掉 CR/LF：交换哈希里的版本串不含行尾（RFC 4253 §8）
+    var m: usize = n;
+    while m > 0 && (raw[m - 1] == 10 as byte || raw[m - 1] == 13 as byte) {
+        m = m - 1;
+    }
+    var i: usize = 0;
+    while i < m {
+        out_vs[i] = raw[i];
+        i = i + 1;
+    }
+    out_vs_len[0] = m;
+    // 我方版本行（不含 CR/LF，交换哈希用；发送时加 LF）
+    var vc: [byte: 32] = [
+        83, 83, 72, 45, 50, 46, 48, 45, 117, 121, 97, 115, 115, 104, 46, 49,
+        10, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0,
+    ];
+    return tp_write(t.fd, &vc[0], 17);
+}
+
+/// 发送一个明文报文（KEX 阶段用）。
+/// 参数：t 为传输层，payload/n 为载荷。
+/// 返回值：成功返回 true。
+export fn transport_send_plain(t: &Transport, payload: &const byte, n: usize) bool {
+    var out: Buf = buf_new();
+    defer { buf_free(&out); }
+    if !packet_build(&t.tx, payload, n, &out) {
+        return false;
+    }
+    return tp_write(t.fd, out.data, out.len);
+}
+
+/// 发送一个报文（自动按当前加密状态）。
+/// 参数：t 为传输层，payload/n 为载荷。
+/// 返回值：成功返回 true。
+export fn transport_send(t: &Transport, payload: &const byte, n: usize) bool {
+    var out: Buf = buf_new();
+    defer { buf_free(&out); }
+    if !packet_build(&t.tx, payload, n, &out) {
+        return false;
+    }
+    return tp_write(t.fd, out.data, out.len);
+}
+
+/// 接收一个报文，跳过 IGNORE/DEBUG。结果放在 t.payload。
+/// 参数：t 为传输层。
+/// 返回值：成功返回 true。
+export fn transport_recv(t: &Transport) bool {
+    t.payload_len = 0;
+    // 最多跳过 16 个 IGNORE/DEBUG，避免异常连接下的死循环
+    var skips: usize = 0;
+    while skips < 16 {
+        var raw: [byte: 8192] = [0: 8192];
+        // **加密后首个 block 必须整块读**：packet_length 本身也是密文（RFC 4253 §6），
+        // 只读 4/5 字节是读不出真实长度的。所以固定先读 16 字节一个块，
+        // 解密后才拿到长度，再按长度读剩余部分。
+        // （这一点错的话症状是「第一个加密包长度荒谬」→ 服务端报
+        //   Bad packet length → message authentication code incorrect。）
+        var first: usize = 5;
+        if t.rx.active {
+            first = BLOCK_LEN;
+        }
+        if tp_read(t.fd, &raw[0], first) != first {
+            return false;
+        }
+        var plen: usize = 0;
+        if t.rx.active {
+            // 试探性解密第一个块（后面 packet_parse 会从头正式解密，这里只是预览长度）
+            var head: [byte: 16] = [0: 16];
+            var hi: usize = 0;
+            while hi < 16 {
+                head[hi] = raw[hi];
+                hi = hi + 1;
+            }
+            var probe: CipherState = cipher_state_new();
+            cipher_state_copy(&probe, &t.rx);
+            packet_ctr_xor(&probe, &head[0], 16);
+            plen = (((head[0] as usize) << 24) | ((head[1] as usize) << 16) |
+                ((head[2] as usize) << 8) | (head[3] as usize));
+        } else {
+            plen = (((raw[0] as usize) << 24) | ((raw[1] as usize) << 16) |
+                ((raw[2] as usize) << 8) | (raw[3] as usize));
+        }
+        if plen < 5 || plen > 8000 + 32 {
+            return false;
+        }
+        var i: usize = 0;
+        // 剩余要读的字节：整包 + MAC - 已读的 first 字节
+        const need_total: usize = 4 + plen + (if t.rx.active { MAC_LEN } else { 0 });
+        if need_total > 8192 || need_total < first {
+            return false;
+        }
+        const rest: usize = need_total - first;
+        if rest > 0 {
+            const gotrest: usize = tp_read(t.fd, raw + first, rest);
+            if gotrest != rest {
+                return false;
+            }
+        }
+        var di: usize = 0;
+        var used: usize = 0;
+        var off: usize = 0;
+        var len: usize = 0;
+        if !packet_parse(&t.rx, &raw[0], need_total, &used, &off, &len) {
+            return false;
+        }
+        if len < 1 {
+            return false;
+        }
+        const mt: byte = raw[off];
+        if mt == MSG_IGNORE || mt == MSG_DEBUG {
+            skips = skips + 1;
+            continue;
+        }
+        if len > 8192 {
+            return false;
+        }
+        i = 0;
+        while i < len {
+            t.payload[i] = raw[off + i];
+            i = i + 1;
+        }
+        t.payload_off = 0;
+        t.payload_len = len;
+        return true;
+    }
+    return false;
+}
+
+/// 完成一次 KEX 并发送/接收 NEWKEYS，切换到加密态。
+///
+/// 参数：t 为传输层；i_c/i_c_len 为**我方** KEXINIT 原文。
+/// 返回值：成功返回 true。
+///
+/// 说明：调用前应已发送我方 KEXINIT。本函数读取对端 KEXINIT、做 ECDH、
+/// 验签（由调用方负责）并处理双向 NEWKEYS。为保持职责单一，验签所需的
+/// 数据（K_S、Q_S、签名）通过 out 参数传出，由调用方用 known_hosts 校验。
+export struct KexOutcome {
+    /// 对端 KEXINIT 原文（交换哈希用）。
+    i_s: [byte: 2048],
+    i_s_len: usize,
+    /// 对端主机公钥 blob。
+    k_s: [byte: 512],
+    k_s_len: usize,
+    /// 对端临时公钥 Q_S。
+    q_s: [byte: 32],
+    /// 主机密钥签名。
+    sig: [byte: 512],
+    sig_len: usize,
+    /// 交换哈希 H。
+    h: [byte: 32],
+    /// 共享秘密 mpint。
+    k_mpint: [byte: 40],
+    k_mpint_len: usize,
+    /// 会话 id（首次 KEX 的 H）。
+    session_id: [byte: 32],
+    /// 协商出的加密密钥长度（aes128-ctr=16，aes256-ctr=32）。
+    key_len: usize,
+    /// 协商出的 MAC 密钥长度（hmac-sha2-256=32）。
+    mac_len: usize,
+    /// 是否协商出 **strict KEX**（双方都公告 kex-strict-*-v00@openssh.com）。
+    /// 为真时 NEWKEYS 之后**序列号重置为 0**（这是 Terrapin 缓解措施的一部分）。
+    strict: bool,
+}
+
+/// 我方版本行（交换哈希用，不含 CR/LF）。
+const VC: [byte: 16] = [
+    83, 83, 72, 45, 50, 46, 48, 45, 117, 121, 97, 115, 115, 104, 46, 49,
+];
+/// 我方版本行长度。
+const VC_LEN: usize = 16;
+
+/// 执行 KEX（含对端版本串），安装密钥但不验签。
+///
+/// 参数：t 为传输层；v_s/v_s_len 为对端版本行；i_c/i_c_len 为我方 KEXINIT 原文；
+///       out 为交换结果。
+/// 返回值：成功返回 true。
+export fn transport_kex_with_vs(t: &Transport, v_s: &const byte, v_s_len: usize,
+    i_c: &const byte, i_c_len: usize, key_len: usize, mac_len: usize, strict: bool,
+    out: &KexOutcome) bool {
+    out.key_len = key_len;
+    out.mac_len = mac_len;
+    out.strict = strict;
+    out.i_s_len = 0;
+    out.k_s_len = 0;
+    out.sig_len = 0;
+    if !transport_recv(t) {
+        return false;
+    }
+    if t.payload_len < 1 || t.payload[0] != MSG_KEXINIT {
+        return false;
+    }
+    if t.payload_len > 2048 {
+        return false;
+    }
+    var i: usize = 0;
+    while i < t.payload_len {
+        out.i_s[i] = t.payload[i];
+        i = i + 1;
+    }
+    out.i_s_len = t.payload_len;
+    var priv: [byte: 32] = [0: 32];
+    var pub: [byte: 32] = [0: 32];
+    var init: Buf = buf_new();
+    defer { buf_free(&init); }
+    if !kex_build_ecdh_init(&init, &priv[0], &pub[0]) {
+        return false;
+    }
+    if !transport_send_plain(t, init.data, init.len) {
+        return false;
+    }
+    if !transport_recv(t) {
+        return false;
+    }
+    if t.payload_len < 1 || t.payload[0] != 31 as byte {
+        return false;
+    }
+    var q_s: [byte: 32] = [0: 32];
+    if !kex_parse_ecdh_reply(&t.payload[0], t.payload_len, &out.k_s[0], &out.k_s_len,
+        &q_s[0], &out.sig[0], &out.sig_len) {
+        return false;
+    }
+    i = 0;
+    while i < 32 {
+        out.q_s[i] = q_s[i];
+        i = i + 1;
+    }
+    var secret: [byte: 32] = [0: 32];
+    kex_compute_secret(&secret[0], &priv[0], &q_s[0]);
+    if !kdf_secret_to_mpint(&out.k_mpint[0], 40, &out.k_mpint_len, &secret[0]) {
+        return false;
+    }
+    kdf_exchange_hash_curve25519(&out.h[0], &VC[0], VC_LEN, v_s, v_s_len, i_c, i_c_len,
+        &out.i_s[0], out.i_s_len, &out.k_s[0], out.k_s_len, &pub[0], &q_s[0],
+        &out.k_mpint[0], out.k_mpint_len);
+    var di3: usize = 0;
+    di3 = 0;
+    di3 = 0;
+    di3 = 0;
+    di3 = 0;
+    return true;
+}
+
+/// 收发 NEWKEYS 并安装加密密钥。
+///
+/// 参数：t 为传输层；out 为含 K/H 的交换结果；is_first 表示是否首次 KEX
+///       （首次才写 session_id）。
+/// 返回值：成功返回 true。
+///
+/// 顺序：先发我方 NEWKEYS（明文），再读对端 NEWKEYS（明文），然后安装密钥。
+/// 装了 tx 密钥后发的包就是密文，因此必须在发完 NEWKEYS 之后再装。
+export fn transport_newkeys(t: &Transport, out: &KexOutcome, is_first: bool) bool {
+    var nk: [byte: 1] = [MSG_NEWKEYS];
+    if !transport_send_plain(t, &nk[0], 1) {
+        return false;
+    }
+    // 对端可能在 ECDH_REPLY 后紧跟 NEWKEYS；也可能还要等我们的 NEWKEYS。
+    // 这里按协议顺序读：先读一个包，若不是 NEWKEYS 则丢弃并再读一次。
+    var got_nk: bool = false;
+    var tries: usize = 0;
+    while tries < 4 {
+        if !transport_recv(t) {
+            return false;
+        }
+        if t.payload_len >= 1 && t.payload[0] == MSG_NEWKEYS {
+            got_nk = true;
+            break;
+        }
+        tries = tries + 1;
+    }
+    if !got_nk {
+        return false;
+    }
+    // 派生并安装密钥
+    if out.key_len == 0 || out.key_len > 32 || out.mac_len == 0 || out.mac_len > 64 {
+        return false;
+    }
+    var iv_c2s: [byte: 16] = [0: 16];
+    var iv_s2c: [byte: 16] = [0: 16];
+    var key_c2s: [byte: 32] = [0: 32];
+    var key_s2c: [byte: 32] = [0: 32];
+    var mac_c2s: [byte: 64] = [0: 64];
+    var mac_s2c: [byte: 64] = [0: 64];
+    kdf_derive(&iv_c2s[0], 16, &out.k_mpint[0], out.k_mpint_len, &out.h[0], 65 as byte, &out.h[0], 32);
+    kdf_derive(&iv_s2c[0], 16, &out.k_mpint[0], out.k_mpint_len, &out.h[0], 66 as byte, &out.h[0], 32);
+    kdf_derive(&key_c2s[0], out.key_len, &out.k_mpint[0], out.k_mpint_len, &out.h[0], 67 as byte, &out.h[0], 32);
+    kdf_derive(&key_s2c[0], out.key_len, &out.k_mpint[0], out.k_mpint_len, &out.h[0], 68 as byte, &out.h[0], 32);
+    kdf_derive(&mac_c2s[0], out.mac_len, &out.k_mpint[0], out.k_mpint_len, &out.h[0], 69 as byte, &out.h[0], 32);
+    kdf_derive(&mac_s2c[0], out.mac_len, &out.k_mpint[0], out.k_mpint_len, &out.h[0], 70 as byte, &out.h[0], 32);
+    // **序列号在 NEWKEYS 后不重置**（RFC 4253 §6.4：even if keys are renegotiated）。
+    // cipher_state_setup 会把 seq 归零、且 CTR 计数从新 IV 开始——CTR 重置是对的
+    // （新密钥配新 IV），但 seq 必须延续，否则 MAC 用的是错序号，
+    // 症状是「第一个加密包永远 MAC 校验失败」，看起来像密钥派生错了。
+    // strict KEX（kex-strict-*-v00@openssh.com，Terrapin 缓解）：
+    // NEWKEYS 之后双方都把序列号**重置为 0**。非 strict 模式则必须延续。
+    // 这个差异只在真实服务端上暴露：普通模式下 seq=3 才对，
+    // strict 模式下 seq=0 才对——而服务端不会告诉你它选了哪种，
+    // 只会在两者不一致时报 "message authentication code incorrect"。
+    var tx_seq: u32 = t.tx.seq;
+    var rx_seq: u32 = t.rx.seq;
+    if out.strict {
+        tx_seq = 0;
+        rx_seq = 0;
+    }
+    cipher_state_setup(&t.tx, &key_c2s[0], out.key_len, &iv_c2s[0], &mac_c2s[0], out.mac_len);
+    cipher_state_setup(&t.rx, &key_s2c[0], out.key_len, &iv_s2c[0], &mac_s2c[0], out.mac_len);
+    t.tx.seq = tx_seq;
+    t.rx.seq = rx_seq;
+    t.encrypted = true;
+    // 首次 KEX 的 H 即 session_id（重协商时保持不变）
+    if is_first {
+        var k: usize = 0;
+        while k < 32 {
+            t.session_id[k] = out.h[k];
+            out.session_id[k] = out.h[k];
+            k = k + 1;
+        }
+    }
+    return true;
+}

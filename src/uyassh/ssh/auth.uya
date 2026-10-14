@@ -1,0 +1,320 @@
+// src/uyassh/ssh/auth.uya - 用户认证：service request 与 publickey（RFC 4252）
+//
+// 说明：KEX 之后的流程是
+//   SSH_MSG_SERVICE_REQUEST(5)  "ssh-userauth"
+//   SSH_MSG_SERVICE_ACCEPT(6)
+//   SSH_MSG_USERAUTH_REQUEST(50)  user | "ssh-connection" | "publickey" | FALSE | alg | keyblob
+//   SSH_MSG_USERAUTH_PK_OK(60)    alg | keyblob          ← 服务端表示「这个公钥可用」
+//   SSH_MSG_USERAUTH_REQUEST(50)  user | "ssh-connection" | "publickey" | TRUE | alg | keyblob | signature
+//   SSH_MSG_USERAUTH_SUCCESS(52)
+//
+// 签名覆盖的是：
+//   string  session_id
+//   byte    SSH_MSG_USERAUTH_REQUEST(50)
+//   string  user
+//   string  "ssh-connection"
+//   string  "publickey"
+//   boolean TRUE
+//   string  alg
+//   string  keyblob
+//
+// 踩坑记录：
+//   * **签名的第一个字段是 session_id，不是交换哈希 H**。重协商后 H 会变而
+//     session_id 不变——用错会让「第一次登录成功、rekey 后失败」。
+//   * **两段式（先问 PK_OK）不是必须的**：可以直接发带签名的请求省一个来回。
+//     本实现两种都支持，默认直接发（少一次 RTT）。
+//   * **rsa-sha2-256 的签名算法名与 keyblob 里的算法名不同**：签名算法写
+//     rsa-sha2-256，而 keyblob 里仍是 "ssh-rsa"（RFC 8332 §3.1）。
+//   * RSA 私钥签名是 s = (EM)^d mod n，其中 EM 是 PKCS#1 v1.5 填充后的完整
+//     n 字节块。Ed25519 则直接对消息签名（它内部自己做哈希与填充）。
+
+use std.crypto.ed25519.ed25519_sign;
+use std.crypto.sha512.Sha256Ctx;
+use std.crypto.bigint;
+use std.crypto.bigint.BIGINT_LIMBS;
+use util.buf.Buf;
+use util.buf.buf_new;
+use util.buf.buf_free;
+use util.buf.buf_append;
+use util.buf.buf_append_byte;
+use ssh.wire.wire_append_u32;
+use ssh.wire.wire_append_string;
+use ssh.wire.wire_append_cstr;
+use ssh.privkey.PrivateKey;
+use ssh.privkey.KeyKind;
+use ssh.privkey.privkey_public_blob;
+
+/// 服务名 "ssh-userauth"。
+const SERVICE_USERAUTH: [byte: 12] = [115, 115, 104, 45, 117, 115, 101, 114, 97, 117, 116, 104];
+/// 服务类 "ssh-connection"。
+const SERVICE_CONNECTION: [byte: 14] = [115, 115, 104, 45, 99, 111, 110, 110, 101, 99, 116, 105, 111, 110];
+/// 认证方法 "publickey"。
+const METHOD_PUBLICKEY: [byte: 9] = [112, 117, 98, 108, 105, 99, 107, 101, 121];
+
+/// SSH_MSG_SERVICE_REQUEST。
+export const MSG_SERVICE_REQUEST: byte = 5 as byte;
+/// SSH_MSG_SERVICE_ACCEPT。
+export const MSG_SERVICE_ACCEPT: byte = 6 as byte;
+/// SSH_MSG_USERAUTH_REQUEST。
+export const MSG_USERAUTH_REQUEST: byte = 50 as byte;
+/// SSH_MSG_USERAUTH_FAILURE。
+export const MSG_USERAUTH_FAILURE: byte = 51 as byte;
+/// SSH_MSG_USERAUTH_SUCCESS。
+export const MSG_USERAUTH_SUCCESS: byte = 52 as byte;
+/// SSH_MSG_USERAUTH_PK_OK。
+export const MSG_USERAUTH_PK_OK: byte = 60 as byte;
+
+/// 认证结果。
+/// 字段：ok 表示成功；partial 表示服务端接受但还需继续（多因子）；
+///       methods/methods_len 为失败时服务端给出的可继续方法列表。
+export struct AuthResult {
+    ok: bool,
+    partial: bool,
+    methods: [byte: 128],
+    methods_len: usize,
+}
+
+/// 需要从中选择的签名算法名（按私钥类型给出）。
+/// 参数：key 为私钥。
+/// 返回值：算法名（C 串）；不支持时返回 null。
+export fn auth_sig_alg(key: &const PrivateKey) &const byte {
+    if key.kind == KeyKind.ed25519 {
+        return &ALG_ED25519[0];
+    }
+    if key.kind == KeyKind.rsa {
+        return &ALG_RSA_SHA2_256[0];  // 临时测试用 256
+    }
+    return null;
+}
+
+/// 签名算法名：ssh-ed25519。
+const ALG_ED25519: [byte: 12] = [115, 115, 104, 45, 101, 100, 50, 53, 53, 49, 57, 0];
+/// 签名算法名：rsa-sha2-256。
+const ALG_RSA_SHA2_256: [byte: 13] = [114, 115, 97, 45, 115, 104, 97, 50, 45, 50, 53, 54, 0];
+
+/// 构造 SERVICE_REQUEST("ssh-userauth")。
+/// 参数：out 为输出缓冲（会被重置）。
+/// 返回值：成功返回 true。
+export fn auth_build_service_request(out: &Buf) bool {
+    out.len = 0;
+    const r: !void = buf_append_byte(out, MSG_SERVICE_REQUEST);
+    _ = r catch { return false; };
+    const a: !void = buf_append_cstr(out, "ssh-userauth");
+    _ = a catch { return false; };
+    // 注意：这里要的是「string」语义（u32 长度前缀），不是 C 串
+    // 上面 buf_append_cstr 只写了内容，所以重建一次
+    out.len = 0;
+    const b: !void = buf_append_byte(out, MSG_SERVICE_REQUEST);
+    _ = b catch { return false; };
+    wire_append_string(out, &SERVICE_USERAUTH[0], 12);
+    return true;
+}
+
+/// 构造 publickey 认证请求（可直接带签名，也可先试探）。
+/// 参数：out 为输出缓冲（会被重置）；user 为用户名（C 串）；
+///       alg 为签名算法名（C 串）；keyblob/keyblob_len 为公钥 blob；
+///       with_sig 表示是否带签名；sig/sig_len 为签名（with_sig 为真时使用）。
+/// 返回值：成功返回 true。
+export fn auth_build_publickey(out: &Buf, user: &const byte, alg: &const byte,
+    keyblob: &const byte, keyblob_len: usize, with_sig: bool, sig: &const byte,
+    sig_len: usize) bool {
+    out.len = 0;
+    // 注意用 auth_append_str（= wire_append_string，带 u32 长度前缀）而不是
+    // buf_append_cstr（只写内容）——SSH 的所有字符串字段都带长度前缀。
+    const r2: !void = buf_append_byte(out, MSG_USERAUTH_REQUEST);
+    _ = r2 catch { return false; };
+    wire_append_cstr(out, user);
+    auth_append_str(out, &SERVICE_CONNECTION[0], 14);
+    auth_append_str(out, &METHOD_PUBLICKEY[0], 9);
+    const bl: !void = buf_append_byte(out, if with_sig { 1 as byte } else { 0 as byte });
+    _ = bl catch { return false; };
+    wire_append_cstr(out, alg);
+    wire_append_string(out, keyblob, keyblob_len);
+    if with_sig {
+        wire_append_string(out, sig, sig_len);
+    }
+    return true;
+}
+
+/// 追加一个 SSH string（u32 长度 + 内容）。
+/// 参数：b 为目标，s/n 为内容。
+/// 返回值：无。
+fn auth_append_str(b: &Buf, s: &const byte, n: usize) void {
+    wire_append_string(b, s, n);
+}
+
+/// 构造待签名数据（RFC 4252 §7）。
+/// 参数：out 为输出缓冲（会被重置）；session_id 为 32 字节会话 id；user 为用户名；
+///       alg 为签名算法名；keyblob/keyblob_len 为公钥 blob。
+/// 返回值：成功返回 true。
+export fn auth_sign_input(out: &Buf, session_id: &const byte, user: &const byte, alg: &const byte,
+    keyblob: &const byte, keyblob_len: usize) bool {
+    out.len = 0;
+    // **session_id 必须是 SSH string（u32 长度 + 32 字节）**，不是裸 32 字节。
+    // 这里漏掉长度前缀时，服务端会把后 4 字节当长度读，得到天文数字，
+    // 直接判签名无效（USERAUTH_FAILURE），而本地自测完全看不出来
+    // （签名与验签都用同一份错误输入，自洽通过）。
+    wire_append_string(out, session_id, 32);
+    const m: !void = buf_append_byte(out, MSG_USERAUTH_REQUEST);
+    _ = m catch { return false; };
+    wire_append_cstr(out, user);
+    auth_append_str(out, &SERVICE_CONNECTION[0], 14);
+    auth_append_str(out, &METHOD_PUBLICKEY[0], 9);
+    const t: !void = buf_append_byte(out, 1 as byte);
+    _ = t catch { return false; };
+    wire_append_cstr(out, alg);
+    wire_append_string(out, keyblob, keyblob_len);
+    return true;
+}
+
+/// 用私钥对一段数据签名。
+/// 参数：key 为私钥；data/n 为待签数据；alg 为签名算法名（C 串）；
+///       sig 为输出，cap 为容量，sig_len 为实际长度。
+/// 返回值：成功返回 true。
+export fn auth_sign(key: &const PrivateKey, data: &const byte, n: usize, alg: &const byte,
+    sig: &byte, cap: usize, sig_len: &usize) bool {
+    sig_len[0] = 0;
+    if !key.ok {
+        return false;
+    }
+    if key.kind == KeyKind.ed25519 {
+        if cap < 64 {
+            return false;
+        }
+        var out: [byte: 64] = [0: 64];
+        ed25519_sign(&out[0], data, n, &key.ed_seed[0], &key.ed_pub[0]);
+        var i: usize = 0;
+        while i < 64 {
+            sig[i] = out[i];
+            i = i + 1;
+        }
+        sig_len[0] = 64;
+        return true;
+    }
+    if key.kind == KeyKind.rsa {
+        // EM = 0x00 || 0x01 || 0xFF... || 0x00 || DigestInfo(hash)
+        // 再算 s = EM^d mod n
+        var hash: [byte: 32] = [0: 32];
+        var ctx: Sha256Ctx = Sha256Ctx{};
+        ctx.init();
+        ctx.update(data[0: n]);
+        var d32: [byte: 32] = [0: 32];
+        ctx.final(d32[0: 32]);
+        var i: usize = 0;
+        while i < 32 {
+            hash[i] = d32[i];
+            i = i + 1;
+        }
+        var em: [byte: 512] = [0: 512];
+        const k: usize = key.n_len;
+        if k < 32 + 19 + 11 || k > 512 {
+            return false;
+        }
+        em[0] = 0 as byte;
+        em[1] = 1 as byte;
+        i = 2;
+        while i < k - 32 - 19 - 1 {
+            em[i] = 0xff as byte;
+            i = i + 1;
+        }
+        em[i] = 0 as byte;
+        i = i + 1;
+        // DigestInfo(SHA-256)
+        var di: [byte: 19] = [
+            0x30, 0x31, 0x30, 0x0d, 0x06, 0x09, 0x60, 0x86, 0x48, 0x01,
+            0x65, 0x03, 0x04, 0x02, 0x01, 0x05, 0x00, 0x04, 0x20,
+        ];
+        var j: usize = 0;
+        while j < 19 {
+            em[i + j] = di[j];
+            j = j + 1;
+        }
+        i = i + 19;
+        j = 0;
+        while j < 32 {
+            em[i + j] = hash[j];
+            j = j + 1;
+        }
+        // s = em^d mod n
+        var nl: [u64: BIGINT_LIMBS] = [0: BIGINT_LIMBS];
+        var dl: [u64: BIGINT_LIMBS] = [0: BIGINT_LIMBS];
+        var ml: [u64: BIGINT_LIMBS] = [0: BIGINT_LIMBS];
+        var outl: [u64: BIGINT_LIMBS] = [0: BIGINT_LIMBS];
+        bigint.bigint_from_be(&nl[0], &key.n[0], key.n_len, BIGINT_LIMBS);
+        bigint.bigint_from_be(&dl[0], &key.d[0], key.d_len, BIGINT_LIMBS);
+        bigint.bigint_from_be(&ml[0], &em[0], k, BIGINT_LIMBS);
+        const n0: u64 = bigint.bigint_n0inv(&nl[0]);
+        bigint.bigint_modexp_be(&outl[0], &ml[0], &key.d[0], key.d_len, &nl[0], n0);
+        if cap < k {
+            return false;
+        }
+        var em2: [byte: 512] = [0: 512];
+        bigint.bigint_to_be(&em2[0], &outl[0], BIGINT_LIMBS);
+        // 取最后 k 字节
+        const skip: usize = 512 - k;
+        i = 0;
+        while i < k {
+            sig[i] = em2[skip + i];
+            i = i + 1;
+        }
+        sig_len[0] = k;
+        return true;
+    }
+    return false;
+}
+
+/// 组装待发送的签名 blob：string 算法名 + string 签名值。
+/// 参数：out 为输出缓冲（会被重置）；alg 为算法名（C 串）；sig/sig_len 为签名值。
+/// 返回值：成功返回 true。
+export fn auth_build_sig_blob(out: &Buf, alg: &const byte, sig: &const byte, sig_len: usize) bool {
+    out.len = 0;
+    wire_append_cstr(out, alg);
+    wire_append_string(out, sig, sig_len);
+    return true;
+}
+
+/// 解析服务端认证应答。
+/// 参数：payload/n 为消息体，out 为结果。
+/// 返回值：成功（消息号认识）返回 true。
+export fn auth_parse_response(payload: &const byte, n: usize, out: &AuthResult) bool {
+    out.ok = false;
+    out.partial = false;
+    out.methods_len = 0;
+    if n < 1 {
+        return false;
+    }
+    const t: byte = payload[0];
+    if t == MSG_USERAUTH_SUCCESS {
+        out.ok = true;
+        return true;
+    }
+    if t == MSG_USERAUTH_FAILURE {
+        // string 方法列表 | boolean partial
+        var pos: usize = 1;
+        if pos + 4 > n {
+            return false;
+        }
+        const l: usize = (((payload[pos] as usize) << 24) | ((payload[pos + 1] as usize) << 16) |
+            ((payload[pos + 2] as usize) << 8) | (payload[pos + 3] as usize));
+        pos = pos + 4;
+        if pos + l > n || l > 128 {
+            return false;
+        }
+        var i: usize = 0;
+        while i < l {
+            out.methods[i] = payload[pos + i];
+            i = i + 1;
+        }
+        out.methods_len = l;
+        pos = pos + l;
+        if pos < n {
+            out.partial = payload[pos] != 0;
+        }
+        return true;
+    }
+    if t == MSG_USERAUTH_PK_OK {
+        out.partial = true;
+        return true;
+    }
+    return false;
+}

@@ -1,0 +1,467 @@
+// src/uyassh/ssh/known_hosts.uya - known_hosts 匹配与策略（OpenSSH 格式）
+//
+// 说明：known_hosts 每行的形式是
+//     [marker] hostnames keytype base64-key [comment]
+// 其中 hostnames 可以是：
+//   * 明文列表：`host`、`host:port`、`[host]:port`，逗号分隔、支持 `*`/`?` 通配
+//   * **哈希条目**：`|1|base64(salt)|base64(HMAC-SHA1(salt, hostname))`
+//
+// 踩坑记录（实测）：
+//   * 现代 OpenSSH 默认 `HashKnownHosts yes`，所以**本机 known_hosts 全是哈希条目**
+//     （实测 65/65 行）。不实现 HMAC-SHA1 匹配的话，每台机器都会被判成「未知主机」，
+//     而症状看起来像是「known_hosts 没读到」，容易往文件路径上排查。
+//   * 哈希条目的**被哈希串是「主机名的规范化形式」**：非 22 端口时要写成
+//     `[host]:port`；把裸 `host` 拿去哈希会匹配不上。
+//   * marker（`@cert-authority` / `@revoked`）出现在行首，必须先剥掉再解析主机列表。
+//   * 明文条目里的通配符匹配是 **fnmatch 风格**（`*` 任意串、`?` 单字符），
+//     不能退化成「前缀比较」。
+
+use std.crypto.sha1.sha1_digest;
+use util.buf.Buf;
+use util.buf.buf_new;
+use util.buf.buf_free;
+use util.buf.buf_append;
+use ssh.wire.wire_get_u32;
+
+/// 匹配结果。
+export enum HostKeyStatus {
+    /// 有匹配且密钥一致。
+    ok,
+    /// 有匹配但密钥不一致（可能是中间人，也可能换了机器）。
+    mismatch,
+    /// 有该主机的其他类型条目但当前类型没有（例如只有 rsa、来了 ed25519）。
+    other_type,
+    /// 完全未知。
+    unknown,
+}
+
+/// 解析结果输出。
+/// 字段：status 为匹配状态；revoked 表示命中的是 @revoked 条目；
+///       ca 表示命中的是 @cert-authority 条目。
+export struct HostCheck {
+    status: HostKeyStatus,
+    revoked: bool,
+    ca: bool,
+}
+
+/// base64 解码（严格）。
+/// 参数：src/src_len 为文本，out 为输出，cap 为容量，n_out 为长度。
+/// 返回值：成功返回 true。
+fn kh_b64_decode(src: &const byte, src_len: usize, out: &byte, cap: usize, n_out: &usize) bool {
+    n_out[0] = 0;
+    var acc: u32 = 0;
+    var bits: i32 = 0;
+    var total: usize = 0;
+    var i: usize = 0;
+    while i < src_len {
+        const c: byte = src[i];
+        i = i + 1;
+        if c == 10 as byte || c == 13 as byte || c == 32 as byte || c == 61 as byte {
+            continue;
+        }
+        var v: u32 = 0;
+        if c >= 65 && c <= 90 {
+            v = (c - 65 as byte) as u32;
+        } else if c >= 97 && c <= 122 {
+            v = ((c - 97 as byte) as u32) + 26u32;
+        } else if c >= 48 && c <= 57 {
+            v = ((c - 48 as byte) as u32) + 52u32;
+        } else if c == 43 as byte {
+            v = 62u32;
+        } else if c == 47 as byte {
+            v = 63u32;
+        } else {
+            return false;
+        }
+        acc = (acc << 6) | v;
+        bits = bits + 6;
+        if bits >= 8 {
+            bits = bits - 8;
+            if total >= cap {
+                return false;
+            }
+            out[total] = ((acc >> ((bits as i32))) & 255u32) as byte;
+            total = total + 1;
+        }
+    }
+    n_out[0] = total;
+    return true;
+}
+
+/// HMAC-SHA1（known_hosts 哈希条目用）。
+/// 参数：key/key_len 为密钥（salt），msg/n 为消息，out 为 20 字节输出。
+/// 返回值：无。
+export fn kh_hmac_sha1(key: &const byte, key_len: usize, msg: &const byte, n: usize, out: &byte) void {
+    var kbuf: [byte: 64] = [0: 64];
+    if key_len > 64 {
+        var kh: [byte: 20] = [0: 20];
+        var kd: [byte: 64] = [0: 64];
+        var kk: usize = 0;
+        while kk < key_len && kk < 64 {
+            kd[kk] = key[kk];
+            kk = kk + 1;
+        }
+        sha1_digest(kd[0: 64], kh[0: 20]);
+        kk = 0;
+        while kk < 20 {
+            kbuf[kk] = kh[kk];
+            kk = kk + 1;
+        }
+    } else {
+        var kk: usize = 0;
+        while kk < key_len {
+            kbuf[kk] = key[kk];
+            kk = kk + 1;
+        }
+    }
+    var ipad: [byte: 64] = [0: 64];
+    var opad: [byte: 64] = [0: 64];
+    var i: usize = 0;
+    while i < 64 {
+        ipad[i] = kbuf[i] ^ (0x36 as byte);
+        opad[i] = kbuf[i] ^ (0x5c as byte);
+        i = i + 1;
+    }
+    // inner = SHA1(ipad || msg)，用 64 + n 的拼接缓冲
+    var inner: [byte: 1024] = [0: 1024];
+    i = 0;
+    while i < 64 {
+        inner[i] = ipad[i];
+        i = i + 1;
+    }
+    var take: usize = n;
+    if take > 1024 - 64 {
+        take = 1024 - 64;
+    }
+    i = 0;
+    while i < take {
+        inner[64 + i] = msg[i];
+        i = i + 1;
+    }
+    var ih: [byte: 20] = [0: 20];
+    sha1_digest(inner[0: 64 + take], ih[0: 20]);
+    var outer: [byte: 84] = [0: 84];
+    i = 0;
+    while i < 64 {
+        outer[i] = opad[i];
+        i = i + 1;
+    }
+    i = 0;
+    while i < 20 {
+        outer[64 + i] = ih[i];
+        i = i + 1;
+    }
+    sha1_digest(outer[0: 84], out[0: 20]);
+}
+
+/// 构造哈希条目里的被哈希主机串：非 22 端口写成 `[host]:port`，否则用裸 host。
+/// 参数：out 为输出，cap 为容量，n_out 为长度，host 为裸主机名，port 为端口。
+/// 返回值：成功返回 true。
+export fn kh_hash_host(out: &byte, cap: usize, n_out: &usize, host: &const byte, port: u16) bool {
+    var hl: usize = 0;
+    while host[hl] != 0 {
+        hl = hl + 1;
+    }
+    if port == 22 {
+        if hl > cap {
+            return false;
+        }
+        var i: usize = 0;
+        while i < hl {
+            out[i] = host[i];
+            i = i + 1;
+        }
+        n_out[0] = hl;
+        return true;
+    }
+    // [host]:port
+    var need: usize = hl + 3;
+    var pv: u16 = port;
+    var digits: usize = 0;
+    while pv > 0 {
+        digits = digits + 1;
+        pv = pv / 10;
+    }
+    if digits == 0 {
+        digits = 1;
+    }
+    need = need + digits;
+    if need > cap {
+        return false;
+    }
+    var w: usize = 0;
+    out[w] = 91 as byte; // '['
+    w = w + 1;
+    var i: usize = 0;
+    while i < hl {
+        out[w + i] = host[i];
+        i = i + 1;
+    }
+    w = w + hl;
+    out[w] = 93 as byte; // ']'
+    w = w + 1;
+    out[w] = 58 as byte; // ':'
+    w = w + 1;
+    // 端口十进制
+    var buf: [byte: 8] = [0: 8];
+    var idx: usize = 0;
+    var v: u16 = port;
+    while v > 0 {
+        buf[idx] = ((v % 10u16) + 48u16) as byte;
+        idx = idx + 1;
+        v = v / 10u16;
+    }
+    var j: usize = 0;
+    while j < idx {
+        out[w + j] = buf[idx - 1 - j];
+        j = j + 1;
+    }
+    w = w + idx;
+    n_out[0] = w;
+    return true;
+}
+
+/// 通配匹配（fnmatch 风格：`*` 任意串、`?` 单字符）。
+/// 参数：pat/pn 为模式，s/sn 为待匹配串。
+/// 返回值：匹配返回 true。
+fn kh_glob(pat: &const byte, pn: usize, s: &const byte, sn: usize) bool {
+    var pi: usize = 0;
+    var si: usize = 0;
+    var star_p: i32 = -1;
+    var star_s: usize = 0;
+    while si < sn {
+        if pi < pn && (pat[pi] == 63 as byte || pat[pi] == s[si]) {
+            pi = pi + 1;
+            si = si + 1;
+        } else if pi < pn && pat[pi] == 42 as byte {
+            star_p = (pi as i32);
+            pi = pi + 1;
+            star_s = si;
+        } else if star_p >= 0 {
+            pi = (star_p as usize) + 1;
+            star_s = star_s + 1;
+            si = star_s;
+        } else {
+            return false;
+        }
+    }
+    while pi < pn && pat[pi] == 42 as byte {
+        pi = pi + 1;
+    }
+    return pi == pn;
+}
+
+/// 判断一个明文 hosts 字段（逗号分隔）是否匹配给定的规范化主机串。
+/// 参数：list/ln 为字段，h/hn 为规范化主机串。
+/// 返回值：匹配返回 true。
+fn kh_match_plain(list: &const byte, ln: usize, h: &const byte, hn: usize) bool {
+    var i: usize = 0;
+    while i < ln {
+        var j: usize = i;
+        while j < ln && list[j] != 44 as byte {
+            j = j + 1;
+        }
+        if kh_glob(list + i, j - i, h, hn) {
+            return true;
+        }
+        i = j + 1;
+    }
+    return false;
+}
+
+/// 在整份 known_hosts 内容里查找主机：返回匹配状态。
+///
+/// 参数：text/text_len 为 known_hosts 全文，host 为裸主机名（C 串），port 为端口，
+///       key_type/key_type_len 为当前主机密钥算法名（如 ssh-ed25519），
+///       key_blob/key_blob_len 为当前主机公钥 blob，out 为结果。
+/// 返回值：无（结果写在 out）。
+export fn known_hosts_check(text: &const byte, text_len: usize, host: &const byte, port: u16,
+    key_type: &const byte, key_type_len: usize, key_blob: &const byte, key_blob_len: usize,
+    out: &HostCheck) void {
+    out.status = HostKeyStatus.unknown;
+    out.revoked = false;
+    out.ca = false;
+    // 规范化主机串（哈希条目用它）
+    var hb: [byte: 512] = [0: 512];
+    var hn: usize = 0;
+    if !kh_hash_host(&hb[0], 512, &hn, host, port) {
+        return;
+    }
+    var line_start: usize = 0;
+    while line_start < text_len {
+        // 取一行
+        var line_end: usize = line_start;
+        while line_end < text_len && text[line_end] != 10 as byte {
+            line_end = line_end + 1;
+        }
+        const llen: usize = line_end - line_start;
+        if llen > 0 && text[line_start] != 35 as byte {
+            var p: usize = line_start;
+            var end: usize = line_end;
+            // 剥 marker
+            var is_revoked: bool = false;
+            var is_ca: bool = false;
+            if llen > 1 && text[p] == 64 as byte {
+                // @cert-authority 或 @revoked
+                var m: usize = p;
+                while m < end && text[m] != 32 as byte {
+                    m = m + 1;
+                }
+                // 判前缀
+                if m - p >= 8 {
+                    var is_ca_name: bool = true;
+                    var ca_str: [byte: 15] = [64, 99, 101, 114, 116, 45, 97, 117, 116, 104, 111, 114, 105, 116, 121];
+                    var ci: usize = 0;
+                    while ci < 15 {
+                        if text[p + ci] != ca_str[ci] {
+                            is_ca_name = false;
+                        }
+                        ci = ci + 1;
+                    }
+                    if is_ca_name {
+                        is_ca = true;
+                    }
+                }
+                if m - p >= 8 {
+                    var rev_str: [byte: 8] = [64, 114, 101, 118, 111, 107, 101, 100];
+                    var ri: usize = 0;
+                    var is_rev_name: bool = true;
+                    while ri < 8 {
+                        if text[p + ri] != rev_str[ri] {
+                            is_rev_name = false;
+                        }
+                        ri = ri + 1;
+                    }
+                    if is_rev_name {
+                        is_revoked = true;
+                    }
+                }
+                p = m + 1;
+            }
+            // hosts 字段
+            var hs: usize = p;
+            while hs < end && text[hs] != 32 as byte {
+                hs = hs + 1;
+            }
+            const hlen: usize = hs - p;
+            var matched: bool = false;
+            if hlen > 0 {
+                if text[p] == 124 as byte {
+                    // 哈希条目 |1|salt|hash
+                    if hlen > 3 && text[p + 1] == 49 as byte && text[p + 2] == 124 as byte {
+                        var q: usize = p + 3;
+                        var salt_end: usize = q;
+                        while salt_end < hs && text[salt_end] != 124 as byte {
+                            salt_end = salt_end + 1;
+                        }
+                        if salt_end < hs {
+                            var salt: [byte: 64] = [0: 64];
+                            var sn: usize = 0;
+                            var hashv: [byte: 32] = [0: 32];
+                            var hvn: usize = 0;
+                            if kh_b64_decode(text + q, salt_end - q, &salt[0], 64, &sn) {
+                                if kh_b64_decode(text + salt_end + 1, hs - salt_end - 1, &hashv[0], 32, &hvn) {
+                                    if hvn == 20 {
+                                        var mac: [byte: 20] = [0: 20];
+                                        kh_hmac_sha1(&salt[0], sn, &hb[0], hn, &mac[0]);
+                                        var same: bool = true;
+                                        var k: usize = 0;
+                                        while k < 20 {
+                                            if mac[k] != hashv[k] {
+                                                same = false;
+                                            }
+                                            k = k + 1;
+                                        }
+                                        matched = same;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                } else {
+                    matched = kh_match_plain(text + p, hlen, &hb[0], hn);
+                }
+            }
+            if matched {
+                // 取 keytype 与 blob
+                var kp: usize = hs + 1;
+                while kp < end && text[kp] == 32 as byte {
+                    kp = kp + 1;
+                }
+                var kt_end: usize = kp;
+                while kt_end < end && text[kt_end] != 32 as byte {
+                    kt_end = kt_end + 1;
+                }
+                var bp: usize = kt_end + 1;
+                while bp < end && text[bp] == 32 as byte {
+                    bp = bp + 1;
+                }
+                var bp_end: usize = bp;
+                while bp_end < end && text[bp_end] != 32 as byte {
+                    bp_end = bp_end + 1;
+                }
+                const ktl: usize = kt_end - kp;
+                const bl: usize = bp_end - bp;
+                if is_revoked {
+                    out.revoked = true;
+                    out.status = HostKeyStatus.mismatch;
+                } else if is_ca {
+                    out.ca = true;
+                } else if ktl == key_type_len && bl > 0 {
+                    // 类型是否相同
+                    var same_type: bool = true;
+                    var t: usize = 0;
+                    while t < ktl {
+                        if text[kp + t] != key_type[t] {
+                            same_type = false;
+                        }
+                        t = t + 1;
+                    }
+                    if same_type {
+                        var blob: [byte: 1024] = [0: 1024];
+                        var bln: usize = 0;
+                        if kh_b64_decode(text + bp, bl, &blob[0], 1024, &bln) {
+                            if bln == key_blob_len {
+                                var same_key: bool = true;
+                                var b: usize = 0;
+                                while b < bln {
+                                    if blob[b] != key_blob[b] {
+                                        same_key = false;
+                                    }
+                                    b = b + 1;
+                                }
+                                if same_key {
+                                    out.status = HostKeyStatus.ok;
+                                    return;
+                                }
+                                out.status = HostKeyStatus.mismatch;
+                                return;
+                            }
+                            out.status = HostKeyStatus.mismatch;
+                            return;
+                        }
+                    }
+                } else if ktl > 0 {
+                    // 同一主机、不同类型
+                    if out.status == HostKeyStatus.unknown {
+                        out.status = HostKeyStatus.other_type;
+                    }
+                }
+            }
+        }
+        line_start = line_end + 1;
+    }
+}
+
+/// 判断策略是否允许：ok 或（未知且 accept_new）才继续。
+/// 参数：st 为匹配状态，accept_new 表示是否允许接受新主机。
+/// 返回值：允许继续返回 true。
+export fn known_hosts_allows(st: HostKeyStatus, accept_new: bool) bool {
+    if st == HostKeyStatus.ok {
+        return true;
+    }
+    if st == HostKeyStatus.unknown {
+        return accept_new;
+    }
+    return false;
+}

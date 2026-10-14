@@ -1,0 +1,453 @@
+// src/uyassh/ssh/privkey.uya - 用户私钥解析（OpenSSH openssh-key-v1 格式）
+//
+// 说明：OpenSSH 的私钥文件（`-----BEGIN OPENSSH PRIVATE KEY-----`）是 base64 包裹的
+// 二进制结构：
+//
+//   "openssh-key-v1\0"
+//   string ciphername        （未加密时为 "none"）
+//   string kdfname           （未加密时为 "none"）
+//   string kdfoptions
+//   u32    nkeys             （通常 1）
+//   string publickey_blob
+//   string encrypted_private_section
+//
+// 未加密时 private section 是：
+//   u32 checkint1 | u32 checkint2 | privatekey 列表 | padding(1,2,3…)
+//   privatekey = string keytype + 算法相关字段 + string comment
+//
+//   ssh-ed25519: string pub(32) | string priv(64 = seed32 || pub32)
+//   ssh-rsa    : mpint n | mpint e | mpint d | mpint iqmp | mpint p | mpint q
+//
+// 踩坑记录：
+//   * **RSA 的字段顺序是 n, e, d, iqmp, p, q**（不是常见的 n,e,d,p,q）。iqmp 夹在
+//     中间，按「p 在 d 之后」去读会把 iqmp 当 p，得到的密钥完全不能用。
+//   * n/e/p/q 是 **mpint**，最高位为 1 时会有前导 0x00，必须剥掉再当大端数用。
+//   * 加密私钥（ciphername != "none"）本实现**明确报错**，不做静默降级——
+//     静默当成空密钥会让人以为「密钥读了但认证失败」，排查方向全错。
+
+use util.buf.Buf;
+use util.buf.buf_new;
+use util.buf.buf_free;
+use util.buf.buf_append;
+use ssh.wire.wire_get_u32;
+
+/// 私钥种类。
+export enum KeyKind {
+    none,
+    ed25519,
+    rsa,
+}
+
+/// 解析结果。
+/// 字段：kind 为种类；ed_seed 为 ed25519 的 32 字节种子；n/e/d 为 RSA 的大端数
+///       （n_len/e_len/d_len 为长度）；comment 为注释；encrypted 表示私钥被口令加密。
+export struct PrivateKey {
+    kind: KeyKind,
+    ed_seed: [byte: 32],
+    ed_pub: [byte: 32],
+    n: [byte: 512],
+    n_len: usize,
+    e: [byte: 8],
+    e_len: usize,
+    d: [byte: 512],
+    d_len: usize,
+    comment: [byte: 128],
+    comment_len: usize,
+    /// p 的长度与首字节（本实现不做 CRT，但保留它们用于钉住「字段顺序正确」）。
+    p_len: usize,
+    p_probe: [byte: 256],
+    encrypted: bool,
+    ok: bool,
+}
+
+/// base64 解码（严格：忽略换行，拒绝非法字符）。
+/// 参数：src/src_len 为输入文本，out 为输出，cap 为容量，n_out 为解出字节数。
+/// 返回值：成功返回 true。
+fn pk_b64_decode(src: &const byte, src_len: usize, out: &byte, cap: usize, n_out: &usize) bool {
+    n_out[0] = 0;
+    var acc: u32 = 0;
+    var bits: i32 = 0;
+    var total: usize = 0;
+    var i: usize = 0;
+    while i < src_len {
+        const c: byte = src[i];
+        i = i + 1;
+        if c == 10 as byte || c == 13 as byte || c == 32 as byte {
+            continue;
+        }
+        if c == 61 as byte {
+            // '=' 填充：忽略
+            continue;
+        }
+        var v: u32 = 0;
+        if c >= 65 && c <= 90 {
+            v = (c - 65 as byte) as u32;
+        } else if c >= 97 && c <= 122 {
+            v = ((c - 97 as byte) as u32) + 26u32;
+        } else if c >= 48 && c <= 57 {
+            v = ((c - 48 as byte) as u32) + 52u32;
+        } else if c == 43 as byte {
+            v = 62u32;
+        } else if c == 47 as byte {
+            v = 63u32;
+        } else {
+            return false;
+        }
+        acc = (acc << 6) | v;
+        bits = bits + 6;
+        if bits >= 8 {
+            bits = bits - 8;
+            if total >= cap {
+                return false;
+            }
+            out[total] = ((acc >> ((bits as i32))) & 255u32) as byte;
+            total = total + 1;
+        }
+    }
+    n_out[0] = total;
+    return true;
+}
+
+/// 从游标读一个 SSH string，返回内容副本。
+/// 参数：buf/n 为输入，pos 为游标，out 为目标，cap 为容量，n_out 为长度，strip_leading_zero 表示剥掉前导 0x00。
+/// 返回值：成功返回 true。
+fn pk_read_str(buf: &const byte, n: usize, pos: &usize, out: &byte, cap: usize, n_out: &usize,
+    strip_leading_zero: bool) bool {
+    const p: usize = pos[0];
+    if p + 4 > n {
+        return false;
+    }
+    const len: usize = wire_get_u32(buf + p) as usize;
+    if p + 4 + len > n {
+        return false;
+    }
+    var off: usize = 0;
+    var keep: usize = len;
+    if strip_leading_zero {
+        while off < len && buf[p + 4 + off] == 0 {
+            off = off + 1;
+        }
+        keep = len - off;
+    }
+    if keep > cap {
+        return false;
+    }
+    var i: usize = 0;
+    while i < keep {
+        out[i] = buf[p + 4 + off + i];
+        i = i + 1;
+    }
+    n_out[0] = keep;
+    pos[0] = p + 4 + len;
+    return true;
+}
+
+/// 比较字节串与 C 串。
+/// 参数：a/an 为数据，b 为 C 串。
+/// 返回值：相等返回 true。
+fn pk_eq(a: &const byte, an: usize, b: &const byte) bool {
+    var bn: usize = 0;
+    while b[bn] != 0 {
+        bn = bn + 1;
+    }
+    if an != bn {
+        return false;
+    }
+    var i: usize = 0;
+    var same: bool = true;
+    while i < an {
+        if a[i] != b[i] {
+            same = false;
+        }
+        i = i + 1;
+    }
+    return same;
+}
+
+/// 解析 PEM 文本形式的私钥（整份文件内容）。
+/// 参数：text/text_len 为文件内容，out 为解析结果。
+/// 返回值：成功（且算法受支持、未加密）返回 true。
+export fn privkey_parse_pem(text: &const byte, text_len: usize, out: &PrivateKey) bool {
+    out.kind = KeyKind.none;
+    out.ok = false;
+    out.encrypted = false;
+    out.n_len = 0;
+    out.e_len = 0;
+    out.d_len = 0;
+    out.comment_len = 0;
+    // 定位 BEGIN ... END 之间的 base64 体
+    var start: usize = 0;
+    var found_begin: bool = false;
+    var i: usize = 0;
+    while i + 36 <= text_len {
+        if text[i] == 45 as byte && text[i + 1] == 45 as byte && text[i + 2] == 45 as byte &&
+            text[i + 3] == 45 as byte && text[i + 4] == 45 as byte {
+            // 找本行结尾
+            var j: usize = i + 5;
+            while j < text_len && text[j] != 10 as byte {
+                j = j + 1;
+            }
+            // 判断是 BEGIN 还是 END
+            var is_end: bool = false;
+            var k: usize = i + 5;
+            while k + 2 < j {
+                if text[k] == 69 as byte && text[k + 1] == 78 as byte && text[k + 2] == 68 as byte {
+                    is_end = true;
+                }
+                k = k + 1;
+            }
+            if is_end {
+                break;
+            }
+            start = j + 1;
+            found_begin = true;
+            break;
+        }
+        i = i + 1;
+    }
+    if !found_begin {
+        return false;
+    }
+    // 找到 END 行起点
+    var end: usize = start;
+    while end < text_len {
+        if text[end] == 45 as byte && end + 4 < text_len && text[end + 1] == 45 as byte &&
+            text[end + 2] == 45 as byte && text[end + 3] == 45 as byte && text[end + 4] == 45 as byte {
+            break;
+        }
+        end = end + 1;
+    }
+    var raw: [byte: 8192] = [0: 8192];
+    var raw_len: usize = 0;
+    if !pk_b64_decode(text + start, end - start, &raw[0], 8192, &raw_len) {
+        return false;
+    }
+    return privkey_parse_blob(&raw[0], raw_len, out);
+}
+
+/// 解析已解 base64 的 openssh-key-v1 二进制。
+/// 参数：raw/raw_len 为二进制，out 为解析结果。
+/// 返回值：成功返回 true。
+export fn privkey_parse_blob(raw: &const byte, raw_len: usize, out: &PrivateKey) bool {
+    // 魔数 "openssh-key-v1\0"（15 字节）
+    var magic: [byte: 15] = [
+        111, 112, 101, 110, 115, 115, 104, 45, 107, 101, 121, 45, 118, 49, 0,
+    ];
+    if raw_len < 15 {
+        return false;
+    }
+    var i: usize = 0;
+    while i < 15 {
+        if raw[i] != magic[i] {
+        return false;
+        }
+        i = i + 1;
+    }
+    var pos: usize = 15;
+    // publickey_blob 可达数百字节（RSA-4096 为 535），缓冲必须够大；
+    // 这里原先给 256，导致「读公钥 blob」这一步恒失败——而错误路径只报解析失败，
+    // 看不出是缓冲不够。
+    var tmp: [byte: 1024] = [0: 1024];
+    var tl: usize = 0;
+    // ciphername
+    if !pk_read_str(raw, raw_len, &pos, &tmp[0], 1024, &tl, false) {
+        return false;
+    }
+    if !pk_eq(&tmp[0], tl, "none") {
+        // 加密私钥：明确报错，不静默降级
+        out.encrypted = true;
+        out.ok = false;
+        return false;
+    }
+    // kdfname
+    if !pk_read_str(raw, raw_len, &pos, &tmp[0], 1024, &tl, false) {
+        return false;
+    }
+    // kdfoptions
+    if !pk_read_str(raw, raw_len, &pos, &tmp[0], 1024, &tl, false) {
+        return false;
+    }
+    // nkeys
+    if pos + 4 > raw_len {
+        return false;
+    }
+    const nkeys: usize = wire_get_u32(raw + pos) as usize;
+    pos = pos + 4;
+    if nkeys != 1 {
+        return false;
+    }
+    // publickey_blob（跳过）
+    if !pk_read_str(raw, raw_len, &pos, &tmp[0], 1024, &tl, false) {
+        return false;
+    }
+    // encrypted_private_section
+    const sp: usize = pos;
+    if sp + 4 > raw_len {
+        return false;
+    }
+    const slen: usize = wire_get_u32(raw + sp) as usize;
+    if sp + 4 + slen > raw_len {
+        return false;
+    }
+    var ppos: usize = sp + 4;
+    const pend: usize = sp + 4 + slen;
+    // checkint1 == checkint2
+    if ppos + 8 > pend {
+        return false;
+    }
+    const c1: u32 = wire_get_u32(raw + ppos);
+    const c2: u32 = wire_get_u32(raw + ppos + 4);
+    if c1 != c2 {
+        return false;
+    }
+    ppos = ppos + 8;
+    // keytype
+    if !pk_read_str(raw, pend, &ppos, &tmp[0], 1024, &tl, false) {
+        return false;
+    }
+    if pk_eq(&tmp[0], tl, "ssh-ed25519") {
+        // string pub(32) | string priv(64)
+        if !pk_read_str(raw, pend, &ppos, &out.ed_pub[0], 32, &tl, false) {
+        return false;
+        }
+        if tl != 32 {
+        return false;
+        }
+        var priv: [byte: 64] = [0: 64];
+        var pl: usize = 0;
+        if !pk_read_str(raw, pend, &ppos, &priv[0], 64, &pl, false) {
+        return false;
+        }
+        if pl != 64 {
+        return false;
+        }
+        i = 0;
+        while i < 32 {
+            out.ed_seed[i] = priv[i];
+            i = i + 1;
+        }
+        out.kind = KeyKind.ed25519;
+    } else if pk_eq(&tmp[0], tl, "ssh-rsa") {
+        // **顺序是 n, e, d, iqmp, p, q**
+        if !pk_read_str(raw, pend, &ppos, &out.n[0], 512, &out.n_len, true) {
+        return false;
+        }
+        if !pk_read_str(raw, pend, &ppos, &out.e[0], 8, &out.e_len, true) {
+        return false;
+        }
+        if !pk_read_str(raw, pend, &ppos, &out.d[0], 512, &out.d_len, true) {
+        return false;
+        }
+        // iqmp / p / q：本实现不做 CRT 签名，因此不需要它们，**但必须按顺序读掉**
+        // （漏读一个会让 p/q 与注释全部错位）。p 的长度与首字节留作可观测证据，
+        // 供单元测试钉住「字段顺序确实按 n,e,d,iqmp,p,q」。
+        if !pk_read_str(raw, pend, &ppos, &tmp[0], 1024, &tl, true) {
+            return false;
+        }
+        if !pk_read_str(raw, pend, &ppos, &out.p_probe[0], 256, &out.p_len, true) {
+            return false;
+        }
+        if !pk_read_str(raw, pend, &ppos, &tmp[0], 1024, &tl, true) {
+            return false;
+        }
+        if out.n_len == 0 || out.e_len == 0 || out.d_len == 0 {
+            return false;
+        }
+        out.kind = KeyKind.rsa;
+    } else {
+        return false;
+    }
+    // comment
+    if !pk_read_str(raw, pend, &ppos, &out.comment[0], 128, &out.comment_len, false) {
+        out.comment_len = 0;
+    }
+    out.ok = true;
+    return true;
+}
+
+/// 由私钥推导公钥 blob（string "ssh-ed25519" + string pub，或 "ssh-rsa" + mpint e + mpint n）。
+/// 参数：key 为已解析的私钥，out 为输出，cap 为容量，n_out 为长度。
+/// 返回值：成功返回 true。
+export fn privkey_public_blob(key: &const PrivateKey, out: &byte, cap: usize, n_out: &usize) bool {
+    n_out[0] = 0;
+    if !key.ok {
+        return false;
+    }
+    var w: usize = 0;
+    if key.kind == KeyKind.ed25519 {
+        if cap < 4 + 11 + 4 + 32 {
+            return false;
+        }
+        pk_put_u32(out, 0, 11u32);
+        var name: [byte: 11] = [115, 115, 104, 45, 101, 100, 50, 53, 53, 49, 57];
+        var i: usize = 0;
+        while i < 11 {
+            out[4 + i] = name[i];
+            i = i + 1;
+        }
+        pk_put_u32(out, 15, 32u32);
+        i = 0;
+        while i < 32 {
+            out[19 + i] = key.ed_pub[i];
+            i = i + 1;
+        }
+        n_out[0] = 51;
+        return true;
+    }
+    if key.kind == KeyKind.rsa {
+        w = 0;
+        if cap < 4 + 7 + 4 + 8 + 4 + 512 {
+            return false;
+        }
+        pk_put_u32(out, w, 7u32);
+        w = w + 4;
+        var rname: [byte: 7] = [115, 115, 104, 45, 114, 115, 97, 0];
+        var i: usize = 0;
+        while i < 7 {
+            out[w + i] = rname[i];
+            i = i + 1;
+        }
+        w = w + 7;
+        // mpint e
+        var eh: bool = (key.e[0] & 128 as byte) != 0;
+        pk_put_u32(out, w, (key.e_len + (if eh { 1 } else { 0 })) as u32);
+        w = w + 4;
+        if eh {
+            out[w] = 0 as byte;
+            w = w + 1;
+        }
+        i = 0;
+        while i < key.e_len {
+            out[w + i] = key.e[i];
+            i = i + 1;
+        }
+        w = w + key.e_len;
+        // mpint n
+        var nh: bool = (key.n[0] & 128 as byte) != 0;
+        pk_put_u32(out, w, (key.n_len + (if nh { 1 } else { 0 })) as u32);
+        w = w + 4;
+        if nh {
+            out[w] = 0 as byte;
+            w = w + 1;
+        }
+        i = 0;
+        while i < key.n_len {
+            out[w + i] = key.n[i];
+            i = i + 1;
+        }
+        w = w + key.n_len;
+        n_out[0] = w;
+        return true;
+    }
+    return false;
+}
+
+/// 大端写 u32。
+/// 参数：p 为目标，off 为偏移，v 为值。
+/// 返回值：无。
+fn pk_put_u32(p: &byte, off: usize, v: u32) void {
+    p[off] = ((v >> 24) & 255u32) as byte;
+    p[off + 1] = ((v >> 16) & 255u32) as byte;
+    p[off + 2] = ((v >> 8) & 255u32) as byte;
+    p[off + 3] = (v & 255u32) as byte;
+}

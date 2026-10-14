@@ -1,0 +1,372 @@
+// src/uyassh/ssh/kex.uya - 密钥交换：KEXINIT 协商与 curve25519-sha256（RFC 4253 §7 / RFC 8731）
+//
+// 说明：握手分两步——
+//   1) 双方互发 KEXINIT（SSH_MSG_KEXINIT=20），各自列出算法偏好，按「客户端偏好优先」
+//      选出双方都支持的第一项；
+//   2) curve25519-sha256：客户端发 SSH_MSG_KEX_ECDH_INIT(30) 带临时公钥 Q_C，
+//      服务端回 SSH_MSG_KEX_ECDH_REPLY(31) 带 K_S（主机密钥）、Q_S、签名；
+//      客户端算出共享秘密 K、拼出交换哈希 H、验签，再发 SSH_MSG_NEWKEYS(21)。
+//
+// 踩坑记录：
+//   * **KEXINIT 有 16 字节 cookie 与末尾的 bool + u32**：少写 reserved 会让后续
+//     name-list 全部错位（错误信息却是「算法协商失败」，方向完全错）。
+//   * **first_kex_packet_follows 为真时，若猜测的算法与对方不一致，要丢弃对方的
+//     下一个包**（RFC 4253 §7.1）。本实现始终发 false，但解析时要读掉这 1 字节。
+//   * **算法名列表的匹配是「客户端顺序优先」，不是字符串比较**：用错方向会让
+//     双方选出不同的算法，症状是 NEWKEYS 后立刻解密失败。
+
+use util.buf.Buf;
+use ssh.wire.wire_get_u32;
+use util.buf.buf_new;
+use util.buf.buf_free;
+use util.buf.buf_append;
+use util.buf.buf_append_byte;
+use util.buf.buf_reserve;
+use util.buf.cstr_len;
+use ssh.wire.wire_append_u32;
+use ssh.wire.wire_append_cstr;
+use ssh.wire.wire_append_namelist;
+use ssh.wire.wire_namelist_has;
+use ssh.wire.wire_read_string;
+use ssh.wire.wire_read_u32_cursor;
+use ssh.wire.wire_read_byte_cursor;
+use std.crypto.curve25519;
+use std.crypto.curve25519.x25519_scalarmult;
+use std.crypto.sha512;
+use std.crypto.sha512.Sha256Ctx;
+use util.rand.fill_random;
+
+/// SSH_MSG_KEXINIT。
+export const MSG_KEXINIT: byte = 20 as byte;
+/// SSH_MSG_NEWKEYS。
+export const MSG_NEWKEYS: byte = 21 as byte;
+/// SSH_MSG_KEX_ECDH_INIT。
+export const MSG_KEX_ECDH_INIT: byte = 30 as byte;
+/// SSH_MSG_KEX_ECDH_REPLY。
+export const MSG_KEX_ECDH_REPLY: byte = 31 as byte;
+
+/// 本实现公告的 KEX 算法（客户端顺序即偏好顺序）。
+export const KEX_ALGS: &const byte = "curve25519-sha256,curve25519-sha256@libssh.org,kex-strict-c-v00@openssh.com";
+
+/// 公告的主机密钥算法。
+export const HOSTKEY_ALGS: &const byte = "ssh-ed25519,rsa-sha2-256,rsa-sha2-512";
+
+/// 公告的加密算法。
+export const CIPHER_ALGS: &const byte = "aes128-ctr,aes256-ctr";
+
+/// 公告的 MAC 算法。
+export const MAC_ALGS: &const byte = "hmac-sha2-256";
+
+/// 公告的压缩算法（none 是协议强制的必选）。
+export const COMP_ALGS: &const byte = "none";
+
+/// 协商结果。
+/// 字段：kex/hostkey/cipher_c2s/cipher_s2c/mac_c2s/mac_s2c 为首选算法名在各自列表中的
+///       索引（-1 表示无交集）；每一个都是「客户端偏好序里第一个双方都支持的」。
+export struct Negotiated {
+    kex_idx: i32,
+    hostkey_idx: i32,
+    cipher_c2s_idx: i32,
+    cipher_s2c_idx: i32,
+    mac_c2s_idx: i32,
+    mac_s2c_idx: i32,
+    comp_c2s_idx: i32,
+    comp_s2c_idx: i32,
+    ok: bool,
+}
+
+/// 构造 KEXINIT 载荷（不含包头的消息体）。
+/// 参数：out 为输出缓冲（会被重置）。
+/// 返回值：成功返回 true。
+export fn kex_build_kexinit(out: &Buf) bool {
+    out.len = 0;
+    const r: !void = buf_reserve(out, 512);
+    _ = r catch { return false; };
+    const a0: !void = buf_append_byte(out, MSG_KEXINIT);
+    _ = a0 catch { return false; };
+    // 16 字节 cookie：防重放，必须随机
+    var cookie: [byte: 16] = [0: 16];
+    const cr: !void = fill_random(&cookie[0], 16);
+    _ = cr catch { return false; };
+    const ac: !void = buf_append(out, &cookie[0], 16);
+    _ = ac catch { return false; };
+    wire_append_namelist(out, KEX_ALGS);
+    wire_append_namelist(out, HOSTKEY_ALGS);
+    wire_append_namelist(out, CIPHER_ALGS);   // enc c2s
+    wire_append_namelist(out, CIPHER_ALGS);   // enc s2c
+    wire_append_namelist(out, MAC_ALGS);      // mac c2s
+    wire_append_namelist(out, MAC_ALGS);      // mac s2c
+    wire_append_namelist(out, COMP_ALGS);     // comp c2s
+    wire_append_namelist(out, COMP_ALGS);     // comp s2c
+    var empty_lang: [byte: 1] = [0];
+    wire_append_namelist(out, &empty_lang[0]);   // lang c2s（空）
+    wire_append_namelist(out, &empty_lang[0]);   // lang s2c（空）
+    const a1: !void = buf_append_byte(out, 0 as byte);   // first_kex_packet_follows = false
+    _ = a1 catch { return false; };
+    wire_append_u32(out, 0u32);                          // reserved
+    return true;
+}
+
+/// 在一个 name-list 里找「客户端偏好序中第一个双方都支持的」名字。
+/// 参数：client_list/client_len 为客户端偏好的逗号分隔列表，
+///       server_ptr/server_len 为服务端列表。
+/// 返回值：找到返回索引（按客户端顺序），否则 -1。
+fn kex_pick(client_list: &const byte, client_len: usize, server_ptr: &const byte,
+    server_len: usize) i32 {
+    var idx: i32 = 0;
+    var i: usize = 0;
+    while i < client_len {
+        var j: usize = i;
+        while j < client_len && client_list[j] != 44 as byte {
+            j = j + 1;
+        }
+        // 逐个试客户端第 idx 个名字：用 wire_namelist_has 比对（它按逗号分段精确匹配）
+        if kex_name_in(client_list + i, j - i, server_ptr, server_len) {
+            return idx;
+        }
+        idx = idx + 1;
+        i = j + 1;
+    }
+    return 0 - 1;
+}
+
+/// 判断单个名字是否出现在服务端列表里（精确分段匹配）。
+/// 参数：name/name_len 为待查名字，list/list_len 为服务端列表。
+/// 返回值：找到返回 true。
+fn kex_name_in(name: &const byte, name_len: usize, list: &const byte, list_len: usize) bool {
+    var i: usize = 0;
+    while i < list_len {
+        var j: usize = i;
+        while j < list_len && list[j] != 44 as byte {
+            j = j + 1;
+        }
+        if j - i == name_len {
+            var same: bool = true;
+            var k: usize = 0;
+            while k < name_len {
+                if name[k] != list[i + k] {
+                    same = false;
+                }
+                k = k + 1;
+            }
+            // 防止前缀误判：长度已相等，无需额外检查
+            if same {
+                return true;
+            }
+        }
+        i = j + 1;
+    }
+    return false;
+}
+
+/// 解析对方的 KEXINIT 载荷并协商算法。
+/// 参数：payload/n 为对端 KEXINIT 的消息体（含首字节 20），out 为协商结果。
+/// 返回值：成功返回 true。
+export fn kex_parse_kexinit(payload: &const byte, n: usize, out: &Negotiated) bool {
+    out.kex_idx = -1;
+    out.hostkey_idx = -1;
+    out.cipher_c2s_idx = -1;
+    out.cipher_s2c_idx = -1;
+    out.mac_c2s_idx = -1;
+    out.mac_s2c_idx = -1;
+    out.comp_c2s_idx = -1;
+    out.comp_s2c_idx = -1;
+    out.ok = false;
+    if n < 17 {
+        return false;
+    }
+    if payload[0] != MSG_KEXINIT {
+        return false;
+    }
+    var pos: usize = 17; // 消息号(1) + cookie(16)
+    var p: &const byte = null;
+    var l: usize = 0;
+    // 依序读 10 个 name-list
+    if !wire_read_string(payload, n, &pos, &p, &l) {
+        return false;
+    }
+    const srv_kex_p: &const byte = p;
+    const srv_kex_l: usize = l;
+    if !wire_read_string(payload, n, &pos, &p, &l) {
+        return false;
+    }
+    const srv_hk_p: &const byte = p;
+    const srv_hk_l: usize = l;
+    if !wire_read_string(payload, n, &pos, &p, &l) {
+        return false;
+    }
+    const srv_c1_p: &const byte = p;
+    const srv_c1_l: usize = l;
+    if !wire_read_string(payload, n, &pos, &p, &l) {
+        return false;
+    }
+    const srv_c2_p: &const byte = p;
+    const srv_c2_l: usize = l;
+    if !wire_read_string(payload, n, &pos, &p, &l) {
+        return false;
+    }
+    const srv_m1_p: &const byte = p;
+    const srv_m1_l: usize = l;
+    if !wire_read_string(payload, n, &pos, &p, &l) {
+        return false;
+    }
+    const srv_m2_p: &const byte = p;
+    const srv_m2_l: usize = l;
+    if !wire_read_string(payload, n, &pos, &p, &l) {
+        return false;
+    }
+    const srv_x1_p: &const byte = p;
+    const srv_x1_l: usize = l;
+    if !wire_read_string(payload, n, &pos, &p, &l) {
+        return false;
+    }
+    const srv_x2_p: &const byte = p;
+    const srv_x2_l: usize = l;
+    // 两个 lang 列表直接跳过
+    if !wire_read_string(payload, n, &pos, &p, &l) {
+        return false;
+    }
+    if !wire_read_string(payload, n, &pos, &p, &l) {
+        return false;
+    }
+    // first_kex_packet_follows + reserved
+    var b: byte = 0;
+    if !wire_read_byte_cursor(payload, n, &pos, &b) {
+        return false;
+    }
+    var rsv: u32 = 0;
+    if !wire_read_u32_cursor(payload, n, &pos, &rsv) {
+        return false;
+    }
+    out.kex_idx = kex_pick(KEX_ALGS, cstr_len(KEX_ALGS), srv_kex_p, srv_kex_l);
+    out.hostkey_idx = kex_pick(HOSTKEY_ALGS, cstr_len(HOSTKEY_ALGS), srv_hk_p, srv_hk_l);
+    out.cipher_c2s_idx = kex_pick(CIPHER_ALGS, cstr_len(CIPHER_ALGS), srv_c1_p, srv_c1_l);
+    out.cipher_s2c_idx = kex_pick(CIPHER_ALGS, cstr_len(CIPHER_ALGS), srv_c2_p, srv_c2_l);
+    out.mac_c2s_idx = kex_pick(MAC_ALGS, cstr_len(MAC_ALGS), srv_m1_p, srv_m1_l);
+    out.mac_s2c_idx = kex_pick(MAC_ALGS, cstr_len(MAC_ALGS), srv_m2_p, srv_m2_l);
+    out.comp_c2s_idx = kex_pick(COMP_ALGS, cstr_len(COMP_ALGS), srv_x1_p, srv_x1_l);
+    out.comp_s2c_idx = kex_pick(COMP_ALGS, cstr_len(COMP_ALGS), srv_x2_p, srv_x2_l);
+    out.ok = out.kex_idx >= 0 && out.hostkey_idx >= 0 && out.cipher_c2s_idx >= 0 &&
+        out.cipher_s2c_idx >= 0 && out.mac_c2s_idx >= 0 && out.mac_s2c_idx >= 0 &&
+        out.comp_c2s_idx >= 0 && out.comp_s2c_idx >= 0;
+    return out.ok;
+}
+
+/// 生成客户端临时密钥对并构造 KEX_ECDH_INIT 载荷。
+/// 参数：out 为输出缓冲（会被重置），priv 为 32 字节私钥输出，pub 为 32 字节公钥输出。
+/// 返回值：成功返回 true。
+export fn kex_build_ecdh_init(out: &Buf, priv: &byte, pub: &byte) bool {
+    var seed: [byte: 32] = [0: 32];
+    const r: !void = fill_random(&seed[0], 32);
+    _ = r catch { return false; };
+    var i: usize = 0;
+    while i < 32 {
+        priv[i] = seed[i];
+        i = i + 1;
+    }
+    curve25519.x25519_base(pub, priv);
+    out.len = 0;
+    const rr: !void = buf_reserve(out, 40);
+    _ = rr catch { return false; };
+    const a0: !void = buf_append_byte(out, MSG_KEX_ECDH_INIT);
+    _ = a0 catch { return false; };
+    // Q_C 作为字符串（32 字节）发送
+    wire_append_u32(out, 32u32);
+    const a1: !void = buf_append(out, pub, 32);
+    _ = a1 catch { return false; };
+    return true;
+}
+
+/// 从 KEX_ECDH_REPLY 取出 K_S、Q_S 与签名。
+/// 参数：payload/n 为对端消息体；ks/ks_len 为主机密钥 blob；qs 为 32 字节服务器临时公钥；
+///       sig/sig_len 为签名 blob。
+/// 返回值：成功返回 true（并置 out_ks_len/out_sig_len 等长度）。
+export fn kex_parse_ecdh_reply(payload: &const byte, n: usize, ks: &byte, ks_len: &usize,
+    qs: &byte, sig: &byte, sig_len: &usize) bool {
+    if n < 1 || payload[0] != MSG_KEX_ECDH_REPLY {
+        return false;
+    }
+    var pos: usize = 1;
+    var p: &const byte = null;
+    var l: usize = 0;
+    // K_S
+    if !wire_read_string(payload, n, &pos, &p, &l) {
+        return false;
+    }
+    if l > 512 {
+        return false;
+    }
+    if p == null {
+        return false;
+    }
+    var i: usize = 0;
+    while i < l {
+        ks[i] = p[i];
+        i = i + 1;
+    }
+    ks_len[0] = l;
+    // Q_S
+    if !wire_read_string(payload, n, &pos, &p, &l) {
+        return false;
+    }
+    if l != 32 || p == null {
+        return false;
+    }
+    i = 0;
+    while i < 32 {
+        qs[i] = p[i];
+        i = i + 1;
+    }
+    // signature
+    if !wire_read_string(payload, n, &pos, &p, &l) {
+        return false;
+    }
+    if l > 512 || p == null {
+        return false;
+    }
+    i = 0;
+    while i < l {
+        sig[i] = p[i];
+        i = i + 1;
+    }
+    sig_len[0] = l;
+    return true;
+}
+
+/// 计算共享秘密 K（X25519 标量乘，结果按 RFC 8731 作为大端整数交给 mpint 编码）。
+/// 参数：k_out 为 32 字节小端共享秘密输出，priv 为客户端私钥，qs 为服务器临时公钥。
+/// 返回值：无。
+export fn kex_compute_secret(k_out: &byte, priv: &const byte, qs: &const byte) void {
+    x25519_scalarmult(k_out, priv, qs);
+}
+
+/// 检查对端 KEXINIT 是否公告了 strict KEX（`kex-strict-s-v00@openssh.com`）。
+///
+/// 说明：strict KEX 是 OpenSSH 针对 Terrapin（CVE-2023-48795）的缓解措施。
+/// **只要客户端也公告了** `kex-strict-c-v00@openssh.com`，双方就进入 strict 模式，
+/// 此时 NEWKEYS 之后**序列号重置为 0**。反过来，若客户端不公告，
+/// OpenSSH 服务端不会启用 strict（但它仍会在 KEXINIT 里列出 s-v00 标记）。
+///
+/// 参数：payload/n 为对端 KEXINIT 载荷。
+/// 返回值：对端公告了 strict 返回 true。
+export fn kex_peer_supports_strict(payload: &const byte, n: usize) bool {
+    if n < 17 || payload[0] != MSG_KEXINIT {
+        return false;
+    }
+    // kex 算法列表：msg(1) + cookie(16) 之后的第一个 string
+    var pos: usize = 17;
+    if pos + 4 > n {
+        return false;
+    }
+    const l: usize = wire_get_u32(payload + pos) as usize;
+    pos = pos + 4;
+    if pos + l > n {
+        return false;
+    }
+    // "kex-strict-s-v00@openssh.com" = 28 字节
+    var strict_name: [byte: 28] = [
+        107, 101, 120, 45, 115, 116, 114, 105, 99, 116, 45, 115, 45, 118, 48, 48,
+        64, 111, 112, 101, 110, 115, 115, 104, 46, 99, 111, 109,
+    ];
+    return kex_name_in(&strict_name[0], 28, payload + pos, l);
+}

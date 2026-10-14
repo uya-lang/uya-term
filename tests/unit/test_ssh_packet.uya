@@ -1,0 +1,232 @@
+// tests/unit/test_ssh_packet.uya - SSH 二进制包协议与加密套件单元测试
+//
+// 覆盖：
+//   * 未加密组包/解析往返（padding 长度满足 (packet_length+4) % 8 == 0）
+//   * 加密组包/解析往返（AES-128-CTR + HMAC-SHA256，块对齐 16）
+//   * MAC 校验失败必须被拒绝（否定型用例：篡改一个密文字节）
+//   * **AES-CTR 跨包连续**：两个包连发，第二个包不能靠「重置计数器」碰巧解对
+//     （把 CTR 每包重置的实现会在这里红——这是本文件最要紧的一条）
+//   * 序号递增与复位
+//
+// 期望的密钥/IV 用固定值（不依赖随机），使失败可复现。
+
+use std.testing.assert_eq_i64;
+use std.testing.expect;
+
+use util.buf.Buf;
+use util.buf.buf_new;
+use util.buf.buf_free;
+
+use ssh.packet.CipherState;
+use ssh.packet.cipher_state_new;
+use ssh.packet.cipher_state_setup;
+use ssh.packet.cipher_state_reset_seq;
+use ssh.packet.packet_build;
+use ssh.packet.packet_parse;
+use ssh.packet.packet_mac_eq;
+use ssh.packet.packet_ctr_xor;
+use ssh.packet.MAC_LEN;
+use ssh.packet.BLOCK_LEN;
+
+/// 构造固定密钥/IV 的收发状态对（发送用 A，接收用 B，密钥相同、序号各自独立）。
+/// 参数：send 为发送状态输出，recv 为接收状态输出。
+/// 返回值：无。
+fn make_pair(send: &CipherState, recv: &CipherState) void {
+    var key: [byte: 16] = [
+        0x00, 0x01, 0x02, 0x03, 0x04, 0x05, 0x06, 0x07,
+        0x08, 0x09, 0x0a, 0x0b, 0x0c, 0x0d, 0x0e, 0x0f,
+    ];
+    var iv: [byte: 16] = [
+        0x10, 0x11, 0x12, 0x13, 0x14, 0x15, 0x16, 0x17,
+        0x18, 0x19, 0x1a, 0x1b, 0x1c, 0x1d, 0x1e, 0x1f,
+    ];
+    var mackey: [byte: 32] = [
+        0x20, 0x21, 0x22, 0x23, 0x24, 0x25, 0x26, 0x27,
+        0x28, 0x29, 0x2a, 0x2b, 0x2c, 0x2d, 0x2e, 0x2f,
+        0x30, 0x31, 0x32, 0x33, 0x34, 0x35, 0x36, 0x37,
+        0x38, 0x39, 0x3a, 0x3b, 0x3c, 0x3d, 0x3e, 0x3f,
+    ];
+    cipher_state_setup(send, &key[0], 16, &iv[0], &mackey[0], 32);
+    cipher_state_setup(recv, &key[0], 16, &iv[0], &mackey[0], 32);
+}
+
+test "ssh_packet_plaintext_roundtrip" {
+    var send: CipherState = cipher_state_new();
+    var recv: CipherState = cipher_state_new();
+    var payload: [byte: 10] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    var out: Buf = buf_new();
+    defer { buf_free(&out); }
+    try expect(packet_build(&send, &payload[0], 10, &out));
+    // 未加密时 (packet_length + 4) 必须是 8 的倍数
+    const plen: usize = ((out.data[0] as usize) << 24) | ((out.data[1] as usize) << 16) |
+        ((out.data[2] as usize) << 8) | (out.data[3] as usize);
+    try assert_eq_i64(((plen + 4) % 8) as i64, 0);
+    var used: usize = 0;
+    var off: usize = 0;
+    var len: usize = 0;
+    try expect(packet_parse(&recv, out.data, out.len, &used, &off, &len));
+    try assert_eq_i64(len as i64, 10);
+    var i: usize = 0;
+    while i < 10 {
+        try assert_eq_i64(out.data[off + i] as i64, payload[i] as i64);
+        i = i + 1;
+    }
+    try assert_eq_i64(used as i64, out.len as i64);
+}
+
+test "ssh_packet_encrypted_roundtrip" {
+    var send: CipherState = cipher_state_new();
+    var recv: CipherState = cipher_state_new();
+    make_pair(&send, &recv);
+    // 载荷随机化（每次不同），覆盖不同 padding
+    var payload: [byte: 37] = [];
+    var i: usize = 0;
+    while i < 37 {
+        payload[i] = (((i * 7 + 3) % (251 as usize)) as! byte).value;
+        i = i + 1;
+    }
+    var out: Buf = buf_new();
+    defer { buf_free(&out); }
+    try expect(packet_build(&send, &payload[0], 37, &out));
+    // 加密后总长 = 4 + packet_len + MAC
+    try assert_eq_i64((out.len % BLOCK_LEN) as i64, (MAC_LEN % BLOCK_LEN) as i64);
+    var used: usize = 0;
+    var off: usize = 0;
+    var len: usize = 0;
+    try expect(packet_parse(&recv, out.data, out.len, &used, &off, &len));
+    try assert_eq_i64(len as i64, 37);
+    i = 0;
+    while i < 37 {
+        try assert_eq_i64(out.data[off + i] as i64, payload[i] as i64);
+        i = i + 1;
+    }
+}
+
+test "ssh_packet_two_packets_ctr_is_continuous" {
+    // 最要紧的一条：AES-CTR 必须跨包连续。
+    // 若实现每包重置计数器，第二个包解出来就是垃圾（第一个包永远对，所以只测一个包发现不了）。
+    var send: CipherState = cipher_state_new();
+    var recv: CipherState = cipher_state_new();
+    make_pair(&send, &recv);
+    var p1: [byte: 20] = [];
+    var p2: [byte: 20] = [];
+    var i: usize = 0;
+    while i < 20 {
+        p1[i] = (((i + 1) % (256 as usize)) as! byte).value;
+        p2[i] = (((i + 101) % (256 as usize)) as! byte).value;
+        i = i + 1;
+    }
+    var o1: Buf = buf_new();
+    defer { buf_free(&o1); }
+    var o2: Buf = buf_new();
+    defer { buf_free(&o2); }
+    try expect(packet_build(&send, &p1[0], 20, &o1));
+    try expect(packet_build(&send, &p2[0], 20, &o2));
+    // 两段密文不能相同（载荷不同）
+    try expect(!packet_mac_eq(o1.data, o2.data, 8));
+    var used: usize = 0;
+    var off: usize = 0;
+    var len: usize = 0;
+    try expect(packet_parse(&recv, o1.data, o1.len, &used, &off, &len));
+    try assert_eq_i64(len as i64, 20);
+    i = 0;
+    while i < 20 {
+        try assert_eq_i64(o1.data[off + i] as i64, p1[i] as i64);
+        i = i + 1;
+    }
+    try expect(packet_parse(&recv, o2.data, o2.len, &used, &off, &len));
+    try assert_eq_i64(len as i64, 20);
+    i = 0;
+    while i < 20 {
+        try assert_eq_i64(o2.data[off + i] as i64, p2[i] as i64);
+        i = i + 1;
+    }
+}
+
+test "ssh_packet_tampered_ciphertext_rejected" {
+    var send: CipherState = cipher_state_new();
+    var recv: CipherState = cipher_state_new();
+    make_pair(&send, &recv);
+    var payload: [byte: 16] = [];
+    var i: usize = 0;
+    while i < 16 {
+        payload[i] = (((i * 3 + 1) % (256 as usize)) as! byte).value;
+        i = i + 1;
+    }
+    var out: Buf = buf_new();
+    defer { buf_free(&out); }
+    try expect(packet_build(&send, &payload[0], 16, &out));
+    // 篡改密文中间一个字节 → MAC 必须失配
+    out.data[8] = out.data[8] ^ (0x40 as byte);
+    var used: usize = 0;
+    var off: usize = 0;
+    var len: usize = 0;
+    try expect(!packet_parse(&recv, out.data, out.len, &used, &off, &len));
+}
+
+test "ssh_packet_seq_increments_and_resets" {
+    var send: CipherState = cipher_state_new();
+    make_pair(&send, &send);
+    var payload: [byte: 4] = [1, 2, 3, 4];
+    var out: Buf = buf_new();
+    defer { buf_free(&out); }
+    try assert_eq_i64(send.seq as i64, 0);
+    try expect(packet_build(&send, &payload[0], 4, &out));
+    try assert_eq_i64(send.seq as i64, 1);
+    try expect(packet_build(&send, &payload[0], 4, &out));
+    try assert_eq_i64(send.seq as i64, 2);
+    cipher_state_reset_seq(&send);
+    try assert_eq_i64(send.seq as i64, 0);
+}
+
+test "ssh_packet_mac_covers_seq" {
+    // 同样载荷但序号不同 → MAC 不同（MAC 覆盖 seq，不是只覆盖载荷）
+    var a: CipherState = cipher_state_new();
+    var b: CipherState = cipher_state_new();
+    make_pair(&a, &b);
+    var payload: [byte: 8] = [9, 9, 9, 9, 9, 9, 9, 9];
+    var mac_a: [byte: 32] = [0: 32];
+    packet_mac(&a, 0, &payload[0], 8, &mac_a[0]);
+    var mac_b: [byte: 32] = [0: 32];
+    packet_mac(&b, 1, &payload[0], 8, &mac_b[0]);
+    try expect(!packet_mac_eq(&mac_a[0], &mac_b[0], 32));
+}
+
+test "ssh_packet_ctr_keystream_is_continuous" {
+    // 直接验 CTR 流：两段连续异或等于一次异或
+    var s: CipherState = cipher_state_new();
+    var key: [byte: 16] = [0: 16];
+    var iv: [byte: 16] = [0: 16];
+    var mk: [byte: 32] = [0: 32];
+    cipher_state_setup(&s, &key[0], 16, &iv[0], &mk[0], 32);
+    var a: [byte: 20] = [];
+    var i: usize = 0;
+    while i < 20 {
+        a[i] = (((i * 11 + 2) % (256 as usize)) as! byte).value;
+        i = i + 1;
+    }
+    // 备份后两段式异或
+    var b: [byte: 20] = [0: 20];
+    i = 0;
+    while i < 20 {
+        b[i] = a[i];
+        i = i + 1;
+    }
+    packet_ctr_xor(&s, &b[0], 7);
+    packet_ctr_xor(&s, &b[7], 13);
+    // 一次性异或同一密钥/IV
+    var s2: CipherState = cipher_state_new();
+    cipher_state_setup(&s2, &key[0], 16, &iv[0], &mk[0], 32);
+    var c: [byte: 20] = [0: 20];
+    i = 0;
+    while i < 20 {
+        c[i] = a[i];
+        i = i + 1;
+    }
+    packet_ctr_xor(&s2, &c[0], 20);
+    i = 0;
+    while i < 20 {
+        try assert_eq_i64(b[i] as i64, c[i] as i64);
+        i = i + 1;
+    }
+}
