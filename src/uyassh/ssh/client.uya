@@ -70,6 +70,7 @@ use ssh.channel.MSG_REQUEST_SUCCESS;
 use ssh.channel.MSG_GLOBAL_REQUEST;
 use ssh.channel.channel_handle;
 
+
 /// 连接阶段的结果。
 export enum Stage {
     /// 全部成功。
