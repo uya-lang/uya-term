@@ -1,0 +1,175 @@
+// src/uyassh/ssh/kdf.uya - SSH 密钥派生（RFC 4253 §7.2）与交换哈希（§8）
+//
+// 说明：KEX 完成后，双方用同一个共享秘密 K 与交换哈希 H 派生出四个方向的密钥/IV/MAC 密钥：
+//
+//   IV  C→S = HASH(K || H || "A" || session_id)      IV  S→C = HASH(K || H || "B" || session_id)
+//   密钥 C→S = HASH(K || H || "C" || session_id)      密钥 S→C = HASH(K || H || "D" || session_id)
+//   MAC C→S = HASH(K || H || "E" || session_id)      MAC S→C = HASH(K || H || "F" || session_id)
+//
+//   * K 按 **mpint** 编码（不是裸字节：最高位为 1 时要补 0x00，全零编码为空串）
+//   * H 与 session_id 是**裸哈希字节**，不加长度前缀
+//   * 需要的密钥比哈希输出长时继续扩展：K1 = HASH(K||H||X||sid)，K2 = HASH(K||H||K1)，…
+//
+// 踩坑记录：
+//   * **session_id 是「第一个」KEX 的 H**，重协商时不再更新——用错会让重协商后全盘乱码。
+//   * K 必须按 mpint 而不是裸大端：X25519 的共享秘密最高位常常是 1，漏补 0x00 会让
+//     双方算出的密钥不同（表现为 NEWKEYS 后第一个包 MAC 就错）。
+
+use std.crypto.sha512;
+use std.crypto.Sha256Ctx;
+use util.buf.Buf;
+use util.buf.buf_new;
+use util.buf.buf_free;
+use util.buf.buf_append;
+
+/// 派生长度上限（本实现最多支持到 SHA-256 输出的若干倍，够 SSH 的 32 字节密钥与 MAC）。
+const KDF_MAX: usize = 128;
+
+/// 计算交换哈希 H = HASH(V_C || V_S || I_C || I_S || K_S || e || f || K)（curve25519 版，§8）。
+///
+/// 参数：h 为 32 字节输出；v_c/v_s 为版本串（不含 CR LF）；i_c/i_s 为 KEXINIT 载荷；
+///       k_s 为服务器主机密钥 blob；q_c/q_s 为双方临时公钥（32 字节）；
+///       k_mpint 为共享秘密的 mpint 编码。
+/// 返回值：无。
+export fn kdf_exchange_hash_curve25519(h: &byte, v_c: &const byte, v_c_len: usize,
+    v_s: &const byte, v_s_len: usize, i_c: &const byte, i_c_len: usize,
+    i_s: &const byte, i_s_len: usize, k_s: &const byte, k_s_len: usize,
+    q_c: &const byte, q_s: &const byte, k_mpint: &const byte, k_mpint_len: usize) void {
+    // 用 Buf 拼接：SSH 的哈希输入都是「长度前缀 + 内容」的混合，逐段 append 最不易错。
+    var b: Buf = buf_new();
+    defer { buf_free(&b); }
+    var tmp: [byte: 4] = [0: 4];
+    _ = kdf_put_u32(&b, v_c_len as u32) catch { return; };
+    _ = buf_append(&b, v_c, v_c_len) catch { return; };
+    _ = kdf_put_u32(&b, v_s_len as u32) catch { return; };
+    _ = buf_append(&b, v_s, v_s_len) catch { return; };
+    _ = kdf_put_u32(&b, i_c_len as u32) catch { return; };
+    _ = buf_append(&b, i_c, i_c_len) catch { return; };
+    _ = kdf_put_u32(&b, i_s_len as u32) catch { return; };
+    _ = buf_append(&b, i_s, i_s_len) catch { return; };
+    _ = kdf_put_u32(&b, k_s_len as u32) catch { return; };
+    _ = buf_append(&b, k_s, k_s_len) catch { return; };
+    _ = kdf_put_u32(&b, 32u32) catch { return; };
+    _ = buf_append(&b, q_c, 32) catch { return; };
+    _ = kdf_put_u32(&b, 32u32) catch { return; };
+    _ = buf_append(&b, q_s, 32) catch { return; };
+    // K 已经是 mpint 编码，但作为「字符串」入哈希：前缀是它自身的字节数
+    _ = kdf_put_u32(&b, k_mpint_len as u32) catch { return; };
+    _ = buf_append(&b, k_mpint, k_mpint_len) catch { return; };
+    _ = tmp;
+    var ctx: Sha256Ctx = Sha256Ctx{};
+    ctx.init();
+    ctx.update(b.data[0: b.len]);
+    var digest: [byte: 32] = [0: 32];
+    ctx.final(digest[0: 32]);
+    var i: usize = 0;
+    while i < 32 {
+        h[i] = digest[i];
+        i = i + 1;
+    }
+}
+
+/// 把 u32 按大端追加到 Buf。
+/// 参数：b 为目标缓冲，v 为值。
+/// 返回值：无；分配失败返回错误。
+fn kdf_put_u32(b: &Buf, v: u32) !void {
+    var tmp: [byte: 4] = [0: 4];
+    tmp[0] = ((v >> 24) & 255u32) as byte;
+    tmp[1] = ((v >> 16) & 255u32) as byte;
+    tmp[2] = ((v >> 8) & 255u32) as byte;
+    tmp[3] = (v & 255u32) as byte;
+    try buf_append(b, &tmp[0], 4);
+}
+
+/// 派生一段密钥材料：out = HASH(K_mpint || H || letter || session_id)，不足 need 时继续扩展。
+/// 参数：out 为输出；need 为需要的字节数；k_mpint/k_len 为共享秘密的 mpint 编码；
+///       h 为 32 字节交换哈希；letter 为 'A'..'F' 之一；sid/sid_len 为会话 id。
+/// 返回值：无。
+export fn kdf_derive(out: &byte, need: usize, k_mpint: &const byte, k_len: usize,
+    h: &const byte, letter: byte, sid: &const byte, sid_len: usize) void {
+    if need > KDF_MAX {
+        return;
+    }
+    var produced: usize = 0;
+    // 第一段：K || H || letter || session_id
+    var ctx: Sha256Ctx = Sha256Ctx{};
+    ctx.init();
+    ctx.update(k_mpint[0: k_len]);
+    ctx.update(h[0: 32]);
+    var lbuf: [byte: 1] = [letter];
+    ctx.update(lbuf[0: 1]);
+    ctx.update(sid[0: sid_len]);
+    var block: [byte: 32] = [0: 32];
+    ctx.final(block[0: 32]);
+    var take: usize = need;
+    if take > 32 {
+        take = 32;
+    }
+    var i: usize = 0;
+    while i < take {
+        out[i] = block[i];
+        i = i + 1;
+    }
+    produced = take;
+    // 后续段：K || H || K1 || …（RFC 4253 §7.2 的扩展规则）
+    while produced < need {
+        var next: Sha256Ctx = Sha256Ctx{};
+        next.init();
+        next.update(k_mpint[0: k_len]);
+        next.update(h[0: 32]);
+        next.update(out[0: produced]);
+        var blk2: [byte: 32] = [0: 32];
+        next.final(blk2[0: 32]);
+        take = need - produced;
+        if take > 32 {
+            take = 32;
+        }
+        i = 0;
+        while i < take {
+            out[produced + i] = blk2[i];
+            i = i + 1;
+        }
+        produced = produced + take;
+    }
+}
+
+/// 把 X25519 共享秘密按 mpint 编码（去掉前导零，最高位为 1 时补 0x00）。
+/// 参数：out 为输出缓冲，cap 为容量，n_out 为实际写入长度；
+///       secret 为 32 字节小端共享秘密（RFC 7748 输出即小端）。
+/// 返回值：成功返回 true。
+export fn kdf_secret_to_mpint(out: &byte, cap: usize, n_out: &usize, secret: &const byte) bool {
+    // X25519 输出是小端，mpint 要大端：先反转
+    var be: [byte: 33] = [0: 33];
+    var i: usize = 0;
+    while i < 32 {
+        be[i] = secret[31 - i];
+        i = i + 1;
+    }
+    // 去前导零（但全零要保留为空串，表示整数 0）
+    var start: usize = 0;
+    while start < 32 && be[start] == 0 {
+        start = start + 1;
+    }
+    const len: usize = 32 - start;
+    if len == 0 {
+        n_out[0] = 0;
+        return cap >= 0;
+    }
+    const high: bool = (be[start] & 128 as byte) != 0;
+    const total: usize = len + (if high { 1 } else { 0 });
+    if total > cap {
+        return false;
+    }
+    var off: usize = 0;
+    if high {
+        out[0] = 0 as byte;
+        off = 1;
+    }
+    i = 0;
+    while i < len {
+        out[off + i] = be[start + i];
+        i = i + 1;
+    }
+    n_out[0] = total;
+    return true;
+}
