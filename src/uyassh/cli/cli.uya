@@ -39,6 +39,13 @@ export struct Options {
     transport: i32,
     /// 是否允许接受未知主机（写入 known_hosts）。默认拒绝。
     accept_new: bool,
+    /// `--program=` 是否被显式写过。
+    ///
+    /// 这个位不是为了「记住一个值」，而是为了**别把包装目标当成主机名**：
+    /// `--program=/bin/cat` 时位置参数根本不是主机，auto 模式若照旧先试原生，
+    /// 就会拿 `/bin/cat`（或测试里的 app 路径）去做一次 DNS 解析再失败，
+    /// 白等 5 秒才回落到包装器。显式给了 --program 就说明用户要的是包装器。
+    program_set: bool,
 }
 
 /// 解析命令行参数。
@@ -60,6 +67,7 @@ export fn parse_args(argc: i32, argv: &(&const byte)) !Options {
         ctrl_v_import_set: false,
         transport: 0,
         accept_new: false,
+        program_set: false,
     };
     var i: i32 = 1;
     var passthrough: bool = false;
@@ -108,6 +116,7 @@ export fn parse_args(argc: i32, argv: &(&const byte)) !Options {
             }
         } else if starts_with(a, "--program=") {
             opts.program = a + 10;
+            opts.program_set = true;
         } else if cstr_eq(a, "clip") {
             return parse_clip(opts, argc, argv, i);
         } else if cstr_eq(a, "ssh") {

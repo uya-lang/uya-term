@@ -21,25 +21,44 @@ use ssh.transport.transport_send;
 use ssh.transport.transport_recv;
 use ssh.channel.channel_build_data;
 use ssh.channel.channel_build_window_adjust;
+use ssh.channel.channel_build_window_change;
 use ssh.channel.channel_build_eof;
 use ssh.channel.channel_build_close;
 use ssh.channel.channel_handle;
 use ssh.channel.channel_consume_window;
+use ssh.channel.SessionChannel;
 use ssh.privkey.PrivateKey;
 use ssh.privkey.KeyKind;
 use ssh.privkey.privkey_parse_pem;
 use util.buf.Buf;
 use util.buf.buf_new;
+use util.buf.buf_free;
+use util.buf.buf_reserve;
+use util.buf.buf_append;
+use util.buf.buf_drop_prefix;
 use util.out.out_str;
 use util.out.out_i64;
 use util.out.out_bytes;
+use util.out.err_str;
+use term.termios.Termios;
+use term.termios.WinSize;
+use term.termios.term_is_tty;
+use term.termios.term_enter_raw;
+use term.termios.term_restore;
+use term.termios.term_winsize_or_default;
+use term.sigrec.sigrec_arm;
+use term.sigrec.sigrec_disarm;
+use term.sigrec.sigrec_install;
 use libc.sys_open;
 use libc.sys_read;
 use libc.sys_write;
 use libc.sys_close;
 use libc.sys_poll;
+use libc.PollFd;
 use libc.O_RDONLY;
 use libc.POLLIN;
+use libc.POLLHUP;
+use libc.POLLERR;
 use libc.getenv;
 
 /// 原生会话运行结果。
@@ -50,6 +69,10 @@ export enum NativeResult {
     auth_failed,
     channel_failed,
     io_failed,
+    /// 会话**已经建立**（远端命令已开始执行）之后才出的错。
+    /// 这一类绝不能回落到系统 ssh：那会把同一条命令再执行一遍，
+    /// 而用户只看到「重试了一次」——对 `rm`/`dd` 这类命令是不可接受的。
+    session_failed,
     bad_args,
 }
 
@@ -282,10 +305,11 @@ fn get_home(out: &byte, cap: usize) bool {
 
 /// 运行一次原生 SSH 会话。
 ///
-/// 参数：req 为请求，result 给出失败原因。
+/// 参数：req 为请求，result 给出失败原因，exit_code 为远端命令退出码（输出）。
 /// 返回值：成功返回 true。
-export fn native_run(req: &const NativeRequest, result: &NativeResult) bool {
+export fn native_run(req: &const NativeRequest, result: &NativeResult, exit_code: &i32) bool {
     result[0] = NativeResult.bad_args;
+    exit_code[0] = 0;
     // ~/.ssh 路径
     var home: [byte: 256] = [0: 256];
     if !get_home(&home[0], 256) {
@@ -342,14 +366,53 @@ export fn native_run(req: &const NativeRequest, result: &NativeResult) bool {
         result[0] = stage_to_result(s.stage);
         return false;
     }
-    if !ssh_open_session(&s, req.pty, &req.term[0], 80, 24, &req.command[0]) {
+    // 窗口尺寸用**本地真实尺寸**（远端 `stty size` 要看到对的值，
+    // 写死 80x24 会让远端 TUI 按错误的宽度排版）。
+    var ws: WinSize = term_winsize_or_default(0);
+    // TERM 从环境取：申请 pty 时告诉远端这是什么终端。空串会让远端回落到
+    // `dumb`（没有颜色、没有光标控制），TUI 程序直接跑不起来。
+    var termbuf: [byte: 32] = [0: 32];
+    const term_name: &const byte = native_term_name(&req.term[0], &termbuf[0], 32);
+    if !ssh_open_session(&s, req.pty, term_name, ws.ws_col as u32, ws.ws_row as u32,
+        &req.command[0]) {
         result[0] = stage_to_result(s.stage);
         return false;
     }
     result[0] = NativeResult.ok;
     // 交互循环：本机 stdin ↔ 远程通道
-    const pumped: bool = native_pump(&s);
+    const pumped: bool = native_pump(&s, exit_code);
+    if !pumped {
+        // 到这里远端命令**已经开始跑了**，所以是 session_failed 而不是 io_failed：
+        // 上层据此禁止回落系统 ssh（回落 = 同一条命令执行两遍）。
+        result[0] = NativeResult.session_failed;
+    }
     return pumped;
+}
+
+/// 取远端要用的终端类型名：请求里给了就用，否则读 $TERM，再没有就用 xterm。
+///
+/// 参数：req_term 为请求里的 TERM（可为空串），out/cap 为兜底输出缓冲。
+/// 返回值：指向有效 C 串的指针。
+///
+/// 说明：不这么做的话远端看到的是空 TERM → 回落 `dumb`，表现为「远端 TUI 一片
+/// 灰白、方向键乱跳」，而本机终端明明支持得很好。
+fn native_term_name(req_term: &const byte, out: &byte, cap: usize) &const byte {
+    if req_term[0] != 0 {
+        return req_term;
+    }
+    var name: [byte: 5] = [84, 69, 82, 77, 0];
+    const env: &byte = getenv(&name[0]);
+    if env != null && env[0] != 0 {
+        return env;
+    }
+    var fb: [byte: 6] = [120, 116, 101, 114, 109, 0];
+    var i: usize = 0;
+    while i < 5 && i + 1 < cap {
+        out[i] = fb[i];
+        i = i + 1;
+    }
+    out[i] = 0 as byte;
+    return out;
 }
 
 
@@ -377,6 +440,9 @@ export fn native_result_text(r: NativeResult) &const byte {
     if r == NativeResult.io_failed {
         return &IO_TEXT[0];
     }
+    if r == NativeResult.session_failed {
+        return &SESSION_TEXT[0];
+    }
     return &ARGS_TEXT[0];
 }
 
@@ -386,6 +452,12 @@ const HOST_TEXT: [byte: 19] = [228, 184, 187, 230, 156, 186, 229, 175, 134, 233,
 const AUTH_TEXT: [byte: 13] = [232, 174, 164, 232, 175, 129, 229, 164, 177, 232, 180, 165, 0];
 const CHANNEL_TEXT: [byte: 13] = [233, 128, 154, 233, 129, 147, 229, 164, 177, 232, 180, 165, 0];
 const IO_TEXT: [byte: 13] = [232, 175, 187, 229, 134, 153, 229, 164, 177, 232, 180, 165, 0];
+/// “会话中断（命令已开始执行）” = 会话(9B) 中断(6B) …按 UTF-8 逐字节写出。
+const SESSION_TEXT: [byte: 40] = [
+    228, 188, 154, 232, 175, 157, 228, 184, 173, 230, 150, 173, 239, 188, 136, 229,
+    145, 189, 228, 187, 164, 229, 183, 178, 229, 188, 128, 229, 167, 139, 230, 137,
+    167, 232, 161, 140, 239, 188, 137, 0,
+];
 const ARGS_TEXT: [byte: 13] = [229, 143, 130, 230, 149, 176, 230, 151, 160, 230, 149, 136, 0];
 
 /// 把会话阶段映射为运行结果。
@@ -412,69 +484,224 @@ export fn stage_to_result(st: Stage) NativeResult {
     }
     return NativeResult.host_untrusted;
 }
-
 /// 本机 stdin 与远程通道之间搬运数据，直到对端关闭。
 ///
-/// 参数：s 为已打开的会话。
-/// 返回值：正常结束返回 true。
-export fn native_pump(s: &SshSession) bool {
+/// 参数：s 为已打开的会话，exit_code 为远端退出码（输出）。
+/// 返回值：正常结束返回 true；连接异常中断返回 false。
+///
+/// 这函数是本文件的历史重灾区，四条要点都踩过：
+///   * **pollfd 必须真的填**：曾经写成 `[i32: 2]` 且 events 全零的数组。
+///     events=0 的意思是「这个 fd 我只关心错误/挂断」，于是 stdin 可读**永远
+///     不报**，`sys_read(0,…)` 一次都没执行过 —— 交互会话按键无反应、管道输入
+///     的 `cat` 永久挂住，全都由此而来。strace 里长得像
+///     `poll([{fd=0, events=0}], 1, 30) = 0 (Timeout)` 就是它。
+///   * **stdin EOF 后不能退出**：那时远端可能还在产出（`cat` 收完 EOF 才输出、
+///     `sort` 要等输入完），必须继续泵远端数据直到对端 CLOSE。
+///   * **发不完的输入要留在缓冲里**：对端窗口会被打满，剩下的字节必须等
+///     WINDOW_ADJUST 回来再发；此前的写法是 `break` 后**直接丢弃**剩余输入。
+///   * **收包失败 ≠ 正常结束**：只有见过 CLOSE/EOF 才算正常收尾，否则要如实
+///     报 io_failed，不能把截断当成成功（那会把「输出没了一半」伪装成正常退出）。
+export fn native_pump(s: &SshSession, exit_code: &i32) bool {
     var outbuf: Buf = buf_new();
+    defer { buf_free(&outbuf); }
     var inbuf: [byte: 8192] = [0: 8192];
+    // 待发往远端的输入（窗口不够时留下的尾巴）。
+    var pending: Buf = buf_new();
+    defer { buf_free(&pending); }
+    var stdin_open: bool = true;
+    var eof_sent: bool = false;
+    // 是否已见过对端的 EOF/CLOSE（区分「正常收尾」与「连接断了」）。
+    var saw_eof: bool = false;
+    // 本机终端进 raw 模式（与 OpenSSH 一致：Ctrl-C 等控制字符当字节转发，
+    // 由远端 pty 的行规程去解释）。仅在 fd 0 确实是终端时做。
+    var term_saved: Termios = Termios{};
+    var term_active: bool = false;
+    const is_tty: bool = term_is_tty(0);
+    if is_tty {
+        sigrec_install();
+        const entered: !void = term_enter_raw(0, &term_saved);
+        _ = entered catch { };
+        term_active = true;
+        sigrec_arm(0, &term_saved);
+    }
+    var last_ws: WinSize = term_winsize_or_default(0);
     var rounds: i64 = 0;
-    while rounds < 1000000 {
-        // 本机有输入？
-        var fds: [i32: 2] = [0, 0];
-        var ev: [i16: 2] = [1, 0];   // POLLIN on stdin
-        const pr: i32 = sys_poll(&fds[0], 1, 30) catch { 0 as i32; };
-        if pr > 0 {
-            const gr: !isize = sys_read(0, &inbuf[0], 8192);
-            var got: isize = 0;
-            got = gr catch { -1 as isize; };
-            if got <= 0 {
-                // 本机 stdin 结束：发 EOF 表示不再发送
-                _ = channel_build_eof(&outbuf, &s.ch);
-                if !transport_send(&s.t, outbuf.data, outbuf.len) {
-                    return false;
-                }
-            } else {
-                var off: usize = 0;
-                const n: usize = got as usize;
-                while off < n {
-                    const take: usize = n - off;
-                    if !channel_build_data(&outbuf, &s.ch, inbuf + off, take) {
-                        // 窗口不足：先把远端数据读掉，等 WINDOW_ADJUST
-                        break;
-                    }
-                    if !transport_send(&s.t, outbuf.data, outbuf.len) {
-                        return false;
-                    }
-                    channel_consume_window(&s.ch, take);
-                    off = off + take;
-                }
+    // 上限只是防御性的：正常情况下靠对端 CLOSE 退出。
+    while rounds < 100000000 {
+        rounds = rounds + 1;
+        // 尺寸变化：下发 window-change（远端 TUI 才能跟着重排）。
+        if term_active {
+            const now_ws: WinSize = term_winsize_or_default(0);
+            if now_ws.ws_row != last_ws.ws_row || now_ws.ws_col != last_ws.ws_col {
+                // 逐字段赋值：整结构体赋值在循环里会被当成「移动」而无法通过类型检查。
+                last_ws.ws_row = now_ws.ws_row;
+                last_ws.ws_col = now_ws.ws_col;
+                last_ws.ws_xpixel = now_ws.ws_xpixel;
+                last_ws.ws_ypixel = now_ws.ws_ypixel;
+                native_send_window_change(s, &last_ws, &outbuf);
             }
         }
-        // 读远端数据（非阻塞式：靠 recv 内部的等待）
-        if !transport_recv(&s.t) {
-            return true;
-        }
-        var off2: usize = 0;
-        var len: usize = 0;
-        var err: bool = false;
-        _ = channel_handle(&s.t.payload[0], s.t.payload_len, &s.ch, &off2, &len, &err);
-        if len > 0 {
-            const wr: !isize = sys_write(1, s.t.payload + off2, len);
-            _ = wr catch { 0 as isize; };
-            _ = channel_build_window_adjust(&outbuf, &s.ch, len as u32);
-            if !transport_send(&s.t, outbuf.data, outbuf.len) {
+        // 有未发完的输入且窗口允许：优先续发（先还债再收新数据）。
+        if pending.len > 0 {
+            if !native_flush_pending(s, &pending, &outbuf) {
+                native_restore_term(term_active, &term_saved);
                 return false;
             }
+        }
+        // 同时等本地输入与远端数据。socket 一定等（否则远端数据会被拖延），
+        // 本机 stdin 在 EOF 之后不再等（再等它只会空转）。
+        var fds: [PollFd: 2] = [PollFd{ fd: 0, events: 0, revents: 0 }: 2];
+        fds[0].fd = 0;
+        fds[0].events = POLLIN;
+        fds[1].fd = s.t.fd;
+        fds[1].events = POLLIN;
+        const nfds: usize = 2;
+        const pr: i32 = sys_poll(&fds[0], nfds, 50) catch { 0 as i32; };
+        if pr > 0 {
+            const local_rev: i32 = fds[0].revents as i32;
+            if stdin_open && (local_rev & (POLLIN as i32)) != 0 {
+                const gr: !isize = sys_read(0, &inbuf[0], 8192);
+                var got: isize = 0;
+                got = gr catch { -1 as isize; };
+                if got <= 0 {
+                    // 本机 stdin 结束：只发一次 EOF，之后**继续**泵远端输出。
+                    stdin_open = false;
+                } else {
+                    const appended: !void = buf_append(&pending, &inbuf[0], got as usize);
+                    _ = appended catch {
+                        native_restore_term(term_active, &term_saved);
+                        return false;
+                    };
+                    if !native_flush_pending(s, &pending, &outbuf) {
+                        native_restore_term(term_active, &term_saved);
+                        return false;
+                    }
+                }
+            }
+            if (local_rev & ((POLLHUP as i32) | (POLLERR as i32))) != 0 {
+                stdin_open = false;
+            }
+            const sock_rev: i32 = fds[1].revents as i32;
+            if (sock_rev & (POLLIN as i32)) != 0 {
+                if !native_pump_remote(s, &outbuf, &saw_eof, exit_code) {
+                    native_restore_term(term_active, &term_saved);
+                    return false;
+                }
+            }
+            if (sock_rev & ((POLLHUP as i32) | (POLLERR as i32))) != 0 {
+                break;
+            }
+        }
+        // stdin 已结束且还没告诉远端：发 CHANNEL_EOF，让 cat/sort 之类收尾。
+        if !stdin_open && !eof_sent && pending.len == 0 {
+            _ = channel_build_eof(&outbuf, &s.ch);
+            if !transport_send(&s.t, outbuf.data, outbuf.len) {
+                native_restore_term(term_active, &term_saved);
+                return false;
+            }
+            eof_sent = true;
         }
         if s.ch.close_recv {
             _ = channel_build_close(&outbuf, &s.ch);
             _ = transport_send(&s.t, outbuf.data, outbuf.len);
+            if s.ch.exit_status_set {
+                exit_code[0] = s.ch.exit_status;
+            }
+            native_restore_term(term_active, &term_saved);
             return true;
         }
-        rounds = rounds + 1;
+        // 对端发了 EOF 但还没 CLOSE：不再有输入可等，收完剩余数据即可。
+        if s.ch.eof && !stdin_open && pending.len == 0 {
+            saw_eof = true;
+        }
+    }
+    // 走到这里只有两种可能：对端挂断，或者轮次上限。都没见到 CLOSE 的话
+    // 不能假装成功——按 io_failed 如实上报。
+    native_restore_term(term_active, &term_saved);
+    if s.ch.exit_status_set {
+        exit_code[0] = s.ch.exit_status;
+    }
+    return saw_eof || s.ch.close_recv;
+}
+
+/// 恢复本机终端属性（幂等）。
+/// 参数：active 表示是否进过 raw 模式，saved 为保存的属性。
+/// 返回值：无。
+fn native_restore_term(active: bool, saved: &const Termios) void {
+    if !active {
+        return;
+    }
+    const restored: !void = term_restore(0, saved);
+    _ = restored catch { };
+    sigrec_disarm();
+}
+
+/// 把待发缓冲里能发的字节发出去（受对端 window 与单包上限约束）。
+///
+/// 参数：s 为会话，pending 为待发缓冲，outbuf 为组包临时缓冲。
+/// 返回值：发送成功（含「窗口不足、一个字节都还没发」）返回 true；
+///         连接出错返回 false。
+///
+/// 说明：发不出去的字节**留在 pending 里**，等 WINDOW_ADJUST 回来再续；
+/// 一定要按 `sent` 推进缓冲，否则会按「以为发出去的字节数」丢掉数据。
+fn native_flush_pending(s: &SshSession, pending: &Buf, outbuf: &Buf) bool {
+    while pending.len > 0 {
+        var sent: usize = 0;
+        const built: bool = channel_build_data(outbuf, &s.ch, pending.data, pending.len, &sent);
+        if !built || sent == 0 {
+            // 窗口不足（或单包上限为 0）：留着，下一轮再试。
+            return true;
+        }
+        if !transport_send(&s.t, outbuf.data, outbuf.len) {
+            return false;
+        }
+        channel_consume_window(&s.ch, sent);
+        buf_drop_prefix(pending, sent);
     }
     return true;
+}
+
+/// 读一个远端报文并把数据写本地、按量归还窗口。
+///
+/// 参数：s 为会话，outbuf 为组包临时缓冲，saw_eof 标记是否见过对端 EOF，
+///       exit_code 为退出码输出（收到 exit-status 时更新）。
+/// 返回值：读到并处理成功（含「读到的是控制类报文」）返回 true。
+fn native_pump_remote(s: &SshSession, outbuf: &Buf, saw_eof: &bool, exit_code: &i32) bool {
+    if !transport_recv(&s.t) {
+        return false;
+    }
+    var off2: usize = 0;
+    var len: usize = 0;
+    var err: bool = false;
+    _ = channel_handle(&s.t.payload[0], s.t.payload_len, &s.ch, &off2, &len, &err);
+    if len > 0 {
+        // 标准输出与 stderr 都写到 fd 1：本地终端是同一个屏幕，
+        // 而 SSH 的 stderr（扩展数据）同样是给人看的。
+        const wr: !isize = sys_write(1, s.t.payload + off2, len);
+        _ = wr catch { 0 as isize; };
+        // 按实际收到的字节数归还窗口，否则收满 CHANNEL_WINDOW 之后
+        // 远端会一直停在「等窗口」上（表现为输出中途卡住不动）。
+        _ = channel_build_window_adjust(outbuf, &s.ch, len as u32);
+        if !transport_send(&s.t, outbuf.data, outbuf.len) {
+            return false;
+        }
+    }
+    if s.ch.exit_status_set {
+        exit_code[0] = s.ch.exit_status;
+    }
+    if s.ch.eof {
+        saw_eof[0] = true;
+    }
+    return true;
+}
+
+/// 下发一次 window-change。
+/// 参数：s 为会话，ws 为新的窗口尺寸，outbuf 为组包缓冲。
+/// 返回值：无（失败静默：尺寸没同步上不该中断会话）。
+fn native_send_window_change(s: &SshSession, ws: &const WinSize, outbuf: &Buf) void {
+    if ws.ws_row == 0 || ws.ws_col == 0 {
+        return;
+    }
+    _ = channel_build_window_change(outbuf, &s.ch, ws.ws_col as u32, ws.ws_row as u32);
+    _ = transport_send(&s.t, outbuf.data, outbuf.len);
 }

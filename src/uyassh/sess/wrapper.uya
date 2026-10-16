@@ -20,6 +20,9 @@ use term.termios.Termios;
 use term.termios.term_enter_raw;
 use term.termios.term_restore;
 use term.termios.term_is_tty;
+use term.sigrec.sigrec_install;
+use term.sigrec.sigrec_arm;
+use term.sigrec.sigrec_disarm;
 use util.out.err_str;
 use util.buf.cstr_eq;
 
@@ -111,6 +114,11 @@ export fn wrapper_run(opts: &Options) i32 {
             return 4;
         };
         state.term_active = true;
+        // 装上「被信号打死也要把终端恢复回来」的钩子：进程被 SIGTERM/SIGHUP
+        // 直接干掉时，正常路径上的 wrapper_restore_terminal 不会执行，
+        // 用户会回到一个无回显的 shell（敲什么都看不见，只能 `reset`）。
+        sigrec_install();
+        sigrec_arm(0, &state.term_saved);
     }
     const code: i32 = wrapper_run_pty(opts, &state);
     wrapper_restore_terminal(&state);
@@ -224,4 +232,6 @@ export fn wrapper_restore_terminal(state: &WrapperState) void {
     const restored: !void = term_restore(state.local_fd, &state.term_saved);
     _ = restored catch { return; };
     state.term_active = false;
+    // 正常路径已经恢复过了：解除信号钩子的登记，免得它再去写一次。
+    sigrec_disarm();
 }

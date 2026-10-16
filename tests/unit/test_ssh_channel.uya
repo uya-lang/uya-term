@@ -1,0 +1,226 @@
+// tests/unit/test_ssh_channel.uya - 会话通道单元测试
+//
+// 覆盖（都是实测踩过的坑，逐条钉住）：
+//   * **WINDOW_ADJUST 必须被处理**：sshd 的 CHANNEL_OPEN_CONFIRMATION 里
+//     window 常常是 0，真正的发送窗口靠随后那个独立的 WINDOW_ADJUST 补上。
+//     顺带钉住「确认包里的 window 确实可能为 0」这个事实——如果哪天有人
+//     觉得 window=0 是不可能出现的协议错，这条例用会提醒他为什么不能这么想。
+//   * **channel_build_data 的 sent 必须如实**：对端 window 只够发一半时，
+//     载荷要按 window 裁，sent 要回报**实际**装进去的字节数；调用方按 n 推进
+//     偏移会静默丢掉后半段输入。
+//   * **exit-status 解析**：这是唯一能拿到远端退出码的地方（不解析它，
+//     `exit 7` 到本地就变成 0）；负数退出码要按有符号读。
+//   * 畸形/截断的 exit-status 报文不能崩、也不能把退出码改坏（否定型用例）。
+
+use std.testing.assert_eq_i64;
+use std.testing.expect;
+
+use util.buf.Buf;
+use util.buf.buf_new;
+use util.buf.buf_free;
+use util.buf.buf_append_byte;
+use util.buf.buf_append;
+
+use ssh.channel.SessionChannel;
+use ssh.channel.channel_new;
+use ssh.channel.channel_build_data;
+use ssh.channel.channel_build_window_adjust;
+use ssh.channel.channel_consume_window;
+use ssh.channel.channel_handle;
+use ssh.channel.MSG_CHANNEL_REQUEST;
+use ssh.channel.MSG_CHANNEL_WINDOW_ADJUST;
+use ssh.channel.MSG_CHANNEL_DATA;
+use ssh.channel.MSG_CHANNEL_EOF;
+use ssh.channel.MSG_CHANNEL_CLOSE;
+
+/// 构造一条 CHANNEL_REQUEST("exit-status", code) 报文。
+/// 参数：out 为目标缓冲，code 为退出码。
+/// 返回值：无。
+fn build_exit_status(out: &Buf, code: u32) void {
+    out.len = 0;
+    _ = buf_append_byte(out, MSG_CHANNEL_REQUEST) catch { return; };
+    // recipient = 0（我方 channel 号）
+    var recip: [byte: 4] = [0, 0, 0, 0];
+    _ = buf_append(out, &recip[0], 4) catch { return; };
+    // string "exit-status"
+    var name: [byte: 15] = [
+        0, 0, 0, 11, 101, 120, 105, 116, 45, 115, 116, 97, 116, 117, 115,
+    ];
+    _ = buf_append(out, &name[0], 15) catch { return; };
+    // want_reply = false
+    _ = buf_append_byte(out, 0 as byte) catch { return; };
+    var tail: [byte: 4] = [0, 0, 0, 0];
+    tail[0] = ((code >> 24) & 255u32) as byte;
+    tail[1] = ((code >> 16) & 255u32) as byte;
+    tail[2] = ((code >> 8) & 255u32) as byte;
+    tail[3] = (code & 255u32) as byte;
+    _ = buf_append(out, &tail[0], 4) catch { return; };
+}
+
+/// 构造一条 WINDOW_ADJUST 报文。
+/// 参数：out 为目标缓冲，bytes 为归还的额度。
+/// 返回值：无。
+fn build_window_adjust(out: &Buf, bytes: u32) void {
+    out.len = 0;
+    _ = buf_append_byte(out, MSG_CHANNEL_WINDOW_ADJUST) catch { return; };
+    var b: [byte: 4] = [0, 0, 0, 0];
+    b[0] = ((bytes >> 24) & 255u32) as byte;
+    b[1] = ((bytes >> 16) & 255u32) as byte;
+    b[2] = ((bytes >> 8) & 255u32) as byte;
+    b[3] = (bytes & 255u32) as byte;
+    // recipient
+    _ = buf_append(out, &b[0], 4) catch { return; };
+    // 归还在 recipient 之后：同一份字节复制到末尾即可（值相同不影响本用例）
+    _ = buf_append(out, &b[0], 4) catch { return; };
+}
+
+test "channel_window_adjust_is_applied" {
+    // sshd 的确认包里 window 可能是 0；发送窗口靠 WINDOW_ADJUST 补上。
+    // 这里就是从 0 开始，验证 WINDOW_ADJUST 确实被加进了 remote_window。
+    var ch: SessionChannel = channel_new();
+    try assert_eq_i64(ch.remote_window as i64, 0);
+    var b: Buf = buf_new();
+    defer { buf_free(&b); }
+    build_window_adjust(&b, 2097152u32);
+    var off: usize = 0;
+    var len: usize = 0;
+    var err: bool = false;
+    try expect(channel_handle(b.data, b.len, &ch, &off, &len, &err));
+    try assert_eq_i64(ch.remote_window as i64, 2097152);
+}
+
+test "channel_build_data_reports_sent_and_clips_to_window" {
+    var ch: SessionChannel = channel_new();
+    ch.remote_window = 4u32;
+    ch.remote_max_packet = 32768u32;
+    var b: Buf = buf_new();
+    defer { buf_free(&b); }
+    var payload: [byte: 10] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
+    var sent: usize = 0;
+    // 窗口只有 4：要么整条拒绝，要么裁到 4 —— 但**绝不能**报「发了 10」。
+    const built: bool = channel_build_data(&b, &ch, &payload[0], 10, &sent);
+    if built {
+        try expect(sent <= 4);
+        // 报文里的字符串长度必须与 sent 一致
+        const l: i64 = ((b.data[5] as i64) << 24) | ((b.data[6] as i64) << 16) |
+            ((b.data[7] as i64) << 8) | (b.data[8] as i64);
+        try assert_eq_i64(l, sent as i64);
+    } else {
+        try assert_eq_i64(sent as i64, 0);
+    }
+}
+
+test "channel_build_data_rejects_without_window" {
+    var ch: SessionChannel = channel_new();
+    ch.remote_window = 0u32;
+    var b: Buf = buf_new();
+    defer { buf_free(&b); }
+    var payload: [byte: 3] = [1, 2, 3];
+    var sent: usize = 99;
+    try expect(!channel_build_data(&b, &ch, &payload[0], 3, &sent));
+    // 窗口为 0 时不能谎报发送量
+    try assert_eq_i64(sent as i64, 0);
+}
+
+test "channel_consume_window_never_underflows" {
+    var ch: SessionChannel = channel_new();
+    ch.remote_window = 5u32;
+    channel_consume_window(&ch, 100);
+    try assert_eq_i64(ch.remote_window as i64, 0);
+}
+
+test "channel_exit_status_is_parsed" {
+    var ch: SessionChannel = channel_new();
+    try expect(!ch.exit_status_set);
+    var b: Buf = buf_new();
+    defer { buf_free(&b); }
+    build_exit_status(&b, 7u32);
+    var off: usize = 0;
+    var len: usize = 0;
+    var err: bool = false;
+    try expect(channel_handle(b.data, b.len, &ch, &off, &len, &err));
+    try expect(ch.exit_status_set);
+    try assert_eq_i64(ch.exit_status as i64, 7);
+}
+
+test "channel_exit_status_negative_is_signed" {
+    // sshd 在命令被信号终止时会发负值（如 0xFFFFFFFF = -1）；
+    // 按无符号读会把 -1 变成 4294967295，退出码就荒谬了。
+    var ch: SessionChannel = channel_new();
+    var b: Buf = buf_new();
+    defer { buf_free(&b); }
+    build_exit_status(&b, 4294967295u32);
+    var off: usize = 0;
+    var len: usize = 0;
+    var err: bool = false;
+    try expect(channel_handle(b.data, b.len, &ch, &off, &len, &err));
+    try expect(ch.exit_status_set);
+    try assert_eq_i64(ch.exit_status as i64, -1);
+}
+
+test "channel_truncated_exit_status_does_not_corrupt" {
+    // 截断的请求必须被安全忽略：不能崩，也不能把退出码写成一个垃圾值。
+    var ch: SessionChannel = channel_new();
+    var b: Buf = buf_new();
+    defer { buf_free(&b); }
+    build_exit_status(&b, 7u32);
+    var off: usize = 0;
+    var len: usize = 0;
+    var err: bool = false;
+    // 只留到名字开头（不足 13 字节）
+    try expect(channel_handle(b.data, 10, &ch, &off, &len, &err));
+    try expect(!ch.exit_status_set);
+    // 名字完整但退出码字段被截掉
+    try expect(channel_handle(b.data, 15, &ch, &off, &len, &err));
+    try expect(!ch.exit_status_set);
+}
+
+test "channel_eof_and_close_flags" {
+    var ch: SessionChannel = channel_new();
+    var b: Buf = buf_new();
+    defer { buf_free(&b); }
+    var off: usize = 0;
+    var len: usize = 0;
+    var err: bool = false;
+    _ = buf_append_byte(&b, MSG_CHANNEL_EOF) catch {};
+    var id: [byte: 4] = [0, 0, 0, 0];
+    _ = buf_append(&b, &id[0], 4) catch {};
+    try expect(channel_handle(b.data, b.len, &ch, &off, &len, &err));
+    try expect(ch.eof);
+    try expect(!ch.close_recv);
+    b.len = 0;
+    _ = buf_append_byte(&b, MSG_CHANNEL_CLOSE) catch {};
+    _ = buf_append(&b, &id[0], 4) catch {};
+    try expect(channel_handle(b.data, b.len, &ch, &off, &len, &err));
+    try expect(ch.close_recv);
+}
+
+test "channel_data_offset_and_length" {
+    var ch: SessionChannel = channel_new();
+    var b: Buf = buf_new();
+    defer { buf_free(&b); }
+    _ = buf_append_byte(&b, MSG_CHANNEL_DATA) catch {};
+    var head: [byte: 8] = [0, 0, 0, 0, 0, 0, 0, 3];
+    _ = buf_append(&b, &head[0], 8) catch {};
+    var body: [byte: 3] = [65, 66, 67];
+    _ = buf_append(&b, &body[0], 3) catch {};
+    var off: usize = 0;
+    var len: usize = 0;
+    var err: bool = false;
+    try expect(channel_handle(b.data, b.len, &ch, &off, &len, &err));
+    try assert_eq_i64(len as i64, 3);
+    try assert_eq_i64(b.data[off] as i64, 65);
+}
+
+test "channel_non_channel_message_is_rejected" {
+    var ch: SessionChannel = channel_new();
+    var b: Buf = buf_new();
+    defer { buf_free(&b); }
+    _ = buf_append_byte(&b, 20 as byte) catch {};   // KEXINIT 不是通道报文
+    var pad: [byte: 5] = [0, 0, 0, 0, 0];
+    _ = buf_append(&b, &pad[0], 5) catch {};
+    var off: usize = 0;
+    var len: usize = 0;
+    var err: bool = false;
+    try expect(!channel_handle(b.data, b.len, &ch, &off, &len, &err));
+}

@@ -1,0 +1,73 @@
+// src/uyassh/term/sigrec.uya - 致命信号下恢复终端属性
+//
+// 背景：进入 raw 模式后，本程序一旦被 SIGTERM/SIGHUP/SIGINT 打死，
+// 正常路径上的 term_restore 就再也没机会跑——用户回到 shell 时终端还处在
+// 无回显、无行缓冲的状态（敲什么都看不见，只能 `reset`）。这是「包装器」
+// 这类程序的经典事故，OpenSSH 用同一套办法避免（信号处理器里恢复 termios，
+// 再用默认动作重新自杀，从而如实保留「被信号终止」的语义）。
+//
+// 实现要点：
+//   * handler 里**只做**两件事：写回 termios、把信号设回默认并重发。
+//     任何更复杂的动作（打印、分配内存）都不满足异步信号安全。
+//   * 因此待恢复的属性放在**模块级全局**里，由主流程在进 raw 模式前填好；
+//     handler 只读它、不分配。
+//   * 重启信号前必须先 `signal(sig, SIG_DFL)`，否则默认动作会被我们自己的
+//     handler 再拦一次，变成死循环（进程永远退不出去）。
+
+use libc.signal;
+use libc.SIG_DFL;
+use libc.SIGHUP;
+use libc.SIGINT;
+use libc.SIGTERM;
+use libc.SIGQUIT;
+use libc.SIG_ERR;
+use libc.kill;
+use libc.getpid;
+use term.termios.Termios;
+use term.termios.term_restore;
+
+/// 进入 raw 模式前保存的属性（handler 只读）。
+var sigrec_saved: Termios = Termios{};
+/// 待恢复的 fd（-1 表示当前不需要恢复）。
+var sigrec_fd: i32 = -1;
+
+/// 登记「退出时要把哪个 fd 恢复成什么属性」。
+/// 参数：fd 为终端 fd，saved 为进入 raw 模式前保存的属性。
+/// 返回值：无。
+export fn sigrec_arm(fd: i32, saved: &const Termios) void {
+    sigrec_saved = *saved;
+    sigrec_fd = fd;
+}
+
+/// 解除登记（正常退出路径已经自己恢复过终端时调用）。
+/// 参数：无。
+/// 返回值：无。
+export fn sigrec_disarm() void {
+    sigrec_fd = -1;
+}
+
+/// 信号处理器：恢复终端，然后按默认动作重新自杀。
+/// 参数：signum 为收到的信号号。
+/// 返回值：无（本函数正常路径下不会返回）。
+fn sigrec_handler(signum: i32) void {
+    if sigrec_fd >= 0 {
+        const restored: !void = term_restore(sigrec_fd, &sigrec_saved);
+        _ = restored catch { };
+        sigrec_fd = -1;
+    }
+    _ = signal(signum, SIG_DFL as &void);
+    _ = kill(getpid(), signum);
+}
+
+/// 为致命信号安装恢复钩子。
+/// 参数：无。
+/// 返回值：无（安装失败静默继续——这只是尽力而为的兜底，不该阻止程序启动）。
+export fn sigrec_install() void {
+    const h: &void = &sigrec_handler as &void;
+    if signal(SIGTERM, h) == SIG_ERR as &void {
+        return;
+    }
+    _ = signal(SIGHUP, h);
+    _ = signal(SIGINT, h);
+    _ = signal(SIGQUIT, h);
+}

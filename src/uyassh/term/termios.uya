@@ -33,8 +33,7 @@ const IFLAG_IGNPAR: u32 = 0x00000004;
 const IFLAG_ISTRIP: u32 = 0x00000020;
 const OFLAG_OPOST: u32 = 0x00000001;
 const LFLAG_ISIG: u32 = 0x00000001;
-const LFLAG_ICANON: u32 = 0x00000002;
-const LFLAG_ECHO: u32 = 0x00000008;
+const LFLAG_ICANON: u32 = 0x00000002;const LFLAG_ECHO: u32 = 0x00000008;
 const LFLAG_ECHOE: u32 = 0x00000010;
 const LFLAG_ECHOK: u32 = 0x00000020;
 const LFLAG_ECHONL: u32 = 0x00000040;
@@ -103,12 +102,18 @@ export fn term_set_winsize(fd: i32, ws: &const WinSize) !void {
     }
 }
 
-/// 把 attrs 就地改成 raw 模式（保留输出处理与信号，交给我们自己转发）。
+/// 把 attrs 就地改成 raw 模式（保留输出处理，交给我们自己转发）。
 /// 参数：attrs 为待修改的终端属性。
 /// 返回值：无。
+///
+/// 说明：**必须一并清掉 ISIG**。ISIG 开着时，本地内核会把 Ctrl-C 变成给
+/// **我们自己**的 SIGINT（默认动作：进程立刻消失）——用户按 Ctrl-C 想中断的
+/// 是远端的命令，结果死的是本地 ssh 客户端：远端 `sleep 30` 变成孤儿，
+/// 终端还留在 raw 模式里。OpenSSH 的做法正是关掉 ISIG、把 0x03 当普通字节
+/// 转发，远端 pty 的行规程再把它变成远端的 SIGINT。
 export fn term_make_raw(attrs: &Termios) void {
     const iflag_clear: u32 = IFLAG_IXON | IFLAG_ICRNL | IFLAG_INLCR | IFLAG_BRKINT | IFLAG_IGNBRK | IFLAG_IGNPAR | IFLAG_ISTRIP;
-    const lflag_clear: u32 = LFLAG_ICANON | LFLAG_ECHO | LFLAG_ECHOE | LFLAG_ECHOK | LFLAG_ECHONL;
+    const lflag_clear: u32 = LFLAG_ISIG | LFLAG_ICANON | LFLAG_ECHO | LFLAG_ECHOE | LFLAG_ECHOK | LFLAG_ECHONL;
     attrs.c_iflag = attrs.c_iflag & (4294967295u32 ^ iflag_clear);
     attrs.c_lflag = attrs.c_lflag & (4294967295u32 ^ lflag_clear);
     attrs.c_cc[CC_VMIN] = 1 as byte;

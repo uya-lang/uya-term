@@ -56,6 +56,24 @@ export fn err_bytes(data: &const byte, n: usize) isize {
     return write(ERR_FD, data, n);
 }
 
+/// 向标准错误写入一个有符号整数（十进制，带换行可选）。
+/// 参数：value 为数值，newline 为是否补换行。
+/// 返回值：实际写入的字节数。
+export fn err_i64(value: i64, newline: bool) usize {
+    var buf: [byte: 24] = [0: 24];
+    const n: usize = format_i64(&buf[0], 24, value);
+    var written: usize = 0;
+    if n > 0 {
+        written = write(ERR_FD, &buf[0], n) as usize;
+    }
+    if newline {
+        const nl: [byte: 1] = [10];
+        _ = write(ERR_FD, &nl[0], 1);
+        written = written + 1;
+    }
+    return written;
+}
+
 /// 把有符号整数格式化为十进制文本。
 /// 参数：buf 为输出缓冲，value 为待格式化数值。
 /// 返回值：写入 buf 的字节数。
@@ -120,8 +138,7 @@ export fn out_i64(value: i64, newline: bool) usize {
 /// 以大写十六进制输出一段字节（便于调试）。
 /// 参数：data 为源指针，n 为字节数。
 /// 返回值：无。
-export fn out_hex(data: &const byte, n: usize) void {
-    if data == null {
+export fn out_hex(data: &const byte, n: usize) void {    if data == null {
         return;
     }
     var line: [byte: 64] = [0: 64];

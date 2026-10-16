@@ -237,6 +237,46 @@ verbose = no
   打时间戳，断言 **X11 交付 < 子进程收到按键**；并已用 `--ctrl-v-import=no`
   做过**负向验证**：同一断言在拉模式下必然反转（反例跑得出来，断言才算有区分力）。
 
+### 原生 SSH 会话（P2）的坑
+
+这些都是"跑得通一次"之后才暴露、且症状与原因相距很远的：
+
+- **poll 的 pollfd 必须真的填**：`native_pump` 最初写成 `var fds: [i32: 2]`
+  且 events 全零。`events=0` 的含义是"这个 fd 我只关心错误/挂断"，于是
+  **stdin 可读永远不报**，`read(0,…)` 一次都没执行过。症状是"交互会话按键
+  毫无反应"加上"管道喂给 `cat` 永久挂住"——看起来像两个 bug，其实同一个。
+  strace 里长这样：`poll([{fd=0, events=0}], 1, 30) = 0 (Timeout)`。
+- **CHANNEL_OPEN_CONFIRMATION 里的 window 常常是 0**：本机实测
+  `open confirm rwindow 0 rmax 32768`（OpenSSH 客户端自己也这么记）。真正的
+  发送窗口靠**紧随其后的一条 WINDOW_ADJUST**补上。所以建立会话时不能把
+  "下一个包"当成回执：一旦那个包是 WINDOW_ADJUST，窗口就永远停在 0，
+  表现为"登录成功、远端命令也起来了，但本地一个字节都发不出去"。
+  正确做法是把途中的通道报文交给 `channel_handle`（它累加窗口），只把
+  真正的 SUCCESS/FAILURE 当回执。
+- **收包缓冲要与协议上限对齐**：`transport_recv` 的缓冲曾经只有 8 KiB、
+  上限写成 `8000 + 32`，而 `packet_parse` 接受 `PACKET_MAX + 64`——两层自相
+  矛盾的结果是 sshd 按 32 KiB 打的包被**整包丢弃**，症状是"命令输出凭空消失
+  但退出码仍是 0"（实测 8000 字节正常、8100 字节开始全没）。现在统一用
+  `PACKET_MAX` 推导。
+- **JSON 式的"退出码"在 SSH 里是单独一个请求**：远端退出码走
+  `CHANNEL_REQUEST("exit-status")`，不解析它 `exit 7` 到本地就是 0。
+  顺带要按**有符号**读（被信号终止时 sshd 会发 -1），否则会得到一个
+  天文数字的退出码。
+- **raw 模式必须连 ISIG 一起清**：ISIG 开着时本地内核把 Ctrl-C 变成给
+  **我们自己**的 SIGINT，客户端直接消失、远端 `sleep 30` 变孤儿、终端还留在
+  raw 模式。OpenSSH 的做法是关掉 ISIG、把 0x03 当普通字节转发，由远端 pty
+  的行规程解释成远端 SIGINT。**别只清 ICANON/ECHO**——`t03` 那种只看
+  ICANON/ECHO 的断言完全测不出这一条。
+- **信号路径也要恢复终端**：进程被 SIGTERM 打死时正常路径的恢复代码不会执行，
+  用户回到一个无回显的 shell（只能 `reset`）。`term/sigrec.uya` 用
+  "handler 里只写 termios + 重新按默认动作自杀"这个标准做法兜底；handler 里
+  不做任何分配，属性放模块级全局。
+- **发不完的输入要留在缓冲里**：对端窗口会被打满，剩下的字节必须等
+  WINDOW_ADJUST 回来再续发。原实现是 `break` 之后**静默丢弃**剩余输入；
+  同理 `channel_build_data` 现在用出参如实回报"实际装了多少字节"。
+- **本地 EOF 之后不能就此退出**：远端可能还在产出（`cat` 收完 EOF 才输出、
+  `sort` 要等输入完），必须继续泵远端数据直到对端 CLOSE；同时 EOF 只发一次。
+
 ## 测试
 
 ```
@@ -247,6 +287,7 @@ tests/unit/        协议编解码与状态机（uya test）
   test_osc5522.uya    5522 状态机（事件+口令读回、write 落盘、EINVAL）
   test_x11_display.uya X11 前置解析（DISPLAY→套接字、字节序、XAUTHORITY 记录）
   test_clip_prefetch.uya Ctrl-V 预取（按键判定、去抖窗口边界、时钟回拨、开关）
+  test_ssh_channel.uya 会话通道（WINDOW_ADJUST、分包与 sent 回报、exit-status）
 
 tests/integration/ 伪终端端到端（python 驱动）
   t01 透传/尺寸/退出码    t02 运行中改尺寸      t03 raw 模式恢复
@@ -259,6 +300,7 @@ tests/integration/ 伪终端端到端（python 驱动）
   t11 零依赖静态产物（无 INTERP/NEEDED、env -i 可运行、clip 往返、PTY 端到端）
   t12 本机 X11 剪贴板读取（文本 / 内联 PNG / 300 KiB INCR 大图 / 空板 / PTY 端到端）
   t13 Ctrl-V 先入库再转发（顺序时间戳、不吞键、前缀优先、开关、去重）
+  t14 原生 SSH 传输（exec/退出码/大输出/stdin/未知主机拒绝/交互与 Ctrl-C）
 ```
 
 t12 用 `tests/integration/fake_x11.py`——一个只应答剪贴板协议的**假 X 服务器**。
@@ -267,6 +309,13 @@ t12 用 `tests/integration/fake_x11.py`——一个只应答剪贴板协议的**
 假服务器还能稳定造出 >64 KiB 的图，把真机上难以复现的 **INCR 分段**路径测到。
 t13 用同一个假服务器，另加一个"收到按键就打时间戳"的假远端应用，用两侧时间戳
 证明**先入库、再转发**这个顺序。
+
+t14 是最特殊的一个：它验证**我们自己写的 SSH 协议栈**（不经系统 ssh），
+用临时 sshd（ed25519 主机密钥 + RSA 用户密钥）跑真实握手。除了 exec/退出码/
+大输出/stdin 这些批量断言，它还会起一个**真实伪终端**跑
+`tests/integration/native_interactive.py`，测 raw 模式有没有进来、Ctrl-C 是不是
+只中断远端命令、退出后终端属性有没有恢复——这些都是"线性脚本 + 管道"测不到的
+（t03 只看 ICANON/ECHO，测不出 ISIG 那条致命差异）。
 
 ## 状态与路线图
 
@@ -281,11 +330,29 @@ t13 用同一个假服务器，另加一个"收到按键就打时间戳"的假�
 | M6 | 零依赖静态构建（`-static`，无 INTERP/NEEDED） | ✅ 已交付 |
 | M7 | 本机 X11 剪贴板读取（不支持 5522 的终端也能贴图） | ✅ 已交付 |
 | M8 | Ctrl-V 先入库再转发（推前置，读取不再落在应用超时窗口里） | ✅ 已交付 |
-| P2 | 纯 Uya 的 SSH-2 协议客户端（curve25519/ed25519/bigint…） | 规划中 |
+| P2 | 纯 Uya 的 SSH-2 协议客户端（curve25519/ed25519/bigint…） | ✅ 已交付（交互会话见下） |
+
+## 原生 SSH 传输（`--transport=`）
+
+默认 `--transport=auto`：**先用原生客户端**，只有在"还没开始执行远端命令"的
+失败（连不上 / 没有可用私钥 / 通道建不起来）时才回落到系统 `ssh`。
+
+刻意**不回落**的两种情况：
+
+| 情况 | 为什么不回落 |
+|---|---|
+| 主机密钥未通过校验（未知/不一致/被吊销） | 回落会让用户以为"原生校验通过了"，实际是系统 ssh 用另一套 known_hosts 放行的 |
+| 会话已建立后中断（`session_failed`） | 远端命令**已经在跑**，回落等于把它再执行一遍（`rm -rf build` 会删两次目录） |
+
+`--transport=native` 则任何失败都直接报错，绝不悄悄改用系统 ssh。
+另外 `--program=X` 时直接走包装器：位置参数是给 X 的参数、不是主机名，
+硬拿去试原生会白等一次 DNS 解析。
+
+退出码与 OpenSSH 对齐：远端退出码原样返回，会话中断返回 255。
 
 ## 已知限制
 
-- SSH 协议本身仍由系统 `ssh` 完成；纯 Uya 的协议实现见路线图 P2。
+- SSH 协议本身默认仍可由系统 `ssh` 完成；纯 Uya 的协议实现见"原生 SSH 传输"一节。
 - 仅 Linux 已验证（termios/PTY 走 libc）；macOS 分支未测试。
 - 本机剪贴板读取目前只覆盖 **X11**（`$DISPLAY` + `XAUTHORITY`）；Wayland 原生会话下
   没有 XWayland 时读不到，仍需靠终端支持 5522 或外部 helper。
@@ -296,6 +363,20 @@ t13 用同一个假服务器，另加一个"收到按键就打时间戳"的假�
   （`clip_list` 的读窗口上限），需要时用 `clip clear` 腾位置。
 - 全屏程序交互依赖真实终端，自动化测试只断言关键序列。
 - 静态产物只覆盖自身；被包装的 `ssh` 仍需目标机上有可用的 libc 与 PATH。
+
+原生传输（`--transport=native`）的限制：
+
+- **不解析 `~/.ssh/config`**：`Host xjp` 这类别名、以及别名里的 `User`/`HostName`/
+  `Port` 都不会被读。直接 `uyassh --transport=native xjp` 会拿字面量 `xjp` 当主机名
+  （DNS 解析失败 → 回落系统 ssh，白等几秒）；请写成 `user@host` 或 `user@host:port`。
+- 只支持 **ed25519 与 RSA** 用户私钥（`id_ed25519` 优先，其次 `id_rsa`），
+  且加密私钥不静默降级，会明确报错。
+- 算法集是固定的最小集（curve25519-sha256 / ssh-ed25519 / rsa-sha2-* /
+  aes{128,256}-ctr / hmac-sha2-256 / none），不协商 chacha20-poly1305 等。
+- **没有 OSC 5522 / 剪贴板能力**：原生会话直接说 SSH，不经过包装层，
+  因此图片粘贴（Ctrl-V 预取、`Ctrl-] p`）目前只在系统 ssh 包装路径上有。
+  需要贴图时用默认的 auto（目标能被系统 ssh 解析时）或 `--transport=system`。
+- 不做 SSH 连接复用（ControlMaster）、端口转发、`ssh-agent`、`ProxyJump`。
 
 ## 许可证
 

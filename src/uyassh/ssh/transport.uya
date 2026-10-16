@@ -33,6 +33,7 @@ use ssh.packet.cipher_state_setup;
 use ssh.packet.packet_build;
 use ssh.packet.MAC_LEN;
 use ssh.packet.BLOCK_LEN;
+use ssh.packet.PACKET_MAX;
 use ssh.packet.packet_ctr_xor;
 use ssh.packet.cipher_state_copy;
 use ssh.packet.packet_parse;
@@ -79,7 +80,11 @@ export struct Transport {
     /// 加密是否已启用。
     encrypted: bool,
     /// 上次读取的报文载荷（有效数据在 payload[payload_off .. payload_off+payload_len)）。
-    payload: [byte: 8192],
+    /// 大小与 packet.uya 的 PACKET_MAX 对齐：sshd 会把命令输出按最多 32 KiB 打包，
+    /// 若这里只留 8 KiB，一个「大包」就会被当成非法包整个丢掉——症状是
+    /// **命令输出凭空消失且退出码仍是 0**（8000 字节以下正常，8100 字节开始全没），
+    /// 极难与「命令没产生输出」区分。必须给到协议上限。
+    payload: [byte: PACKET_MAX],
     payload_off: usize,
     payload_len: usize,
 }
@@ -115,7 +120,7 @@ export fn transport_new(fd: i32) Transport {
         k_mpint: [0: 40],
         k_mpint_len: 0,
         encrypted: false,
-        payload: [0: 8192],
+        payload: [0: PACKET_MAX],
         payload_off: 0,
         payload_len: 0,
     };
@@ -191,10 +196,15 @@ export fn transport_send(t: &Transport, payload: &const byte, n: usize) bool {
 /// 返回值：成功返回 true。
 export fn transport_recv(t: &Transport) bool {
     t.payload_len = 0;
+    // 收包缓冲：与 packet.packet_parse 接受的包长上界（PACKET_MAX + 64）对齐，
+    // 再给 4 字节长度字段与 MAC 留出余量。**不能**比它小：sshd 把命令输出
+    // 按最多 32 KiB 打包，缓冲一旦装不下这个大包，整包会被丢掉而调用方
+    // 只看到「recv 失败」——表现为输出凭空消失。
+    // 放在循环外声明：否则每跳过一个 IGNORE/DEBUG 就要重新清零 64 KiB。
+    var raw: [byte: RECV_MAX] = [0: RECV_MAX];
     // 最多跳过 16 个 IGNORE/DEBUG，避免异常连接下的死循环
     var skips: usize = 0;
     while skips < 16 {
-        var raw: [byte: 8192] = [0: 8192];
         // **加密后首个 block 必须整块读**：packet_length 本身也是密文（RFC 4253 §6），
         // 只读 4/5 字节是读不出真实长度的。所以固定先读 16 字节一个块，
         // 解密后才拿到长度，再按长度读剩余部分。
@@ -225,13 +235,15 @@ export fn transport_recv(t: &Transport) bool {
             plen = (((raw[0] as usize) << 24) | ((raw[1] as usize) << 16) |
                 ((raw[2] as usize) << 8) | (raw[3] as usize));
         }
-        if plen < 5 || plen > 8000 + 32 {
+        // 上界与 packet_parse 一致（PACKET_MAX + 64）。写小了会把服务端的
+        // 正常大包误判为非法——这是本文件最贵的一个坑。
+        if plen < 5 || plen > PACKET_MAX + 64 {
             return false;
         }
         var i: usize = 0;
         // 剩余要读的字节：整包 + MAC - 已读的 first 字节
         const need_total: usize = 4 + plen + (if t.rx.active { MAC_LEN } else { 0 });
-        if need_total > 8192 || need_total < first {
+        if need_total > RECV_MAX || need_total < first {
             return false;
         }
         const rest: usize = need_total - first;
@@ -256,7 +268,7 @@ export fn transport_recv(t: &Transport) bool {
             skips = skips + 1;
             continue;
         }
-        if len > 8192 {
+        if len > RECV_MAX {
             return false;
         }
         i = 0;
@@ -313,6 +325,10 @@ const VC: [byte: 16] = [
 ];
 /// 我方版本行长度。
 const VC_LEN: usize = 16;
+
+/// 收包缓冲上限：4 字节 packet_length + 包体（packet_parse 的上界 PACKET_MAX + 64）
+/// + MAC。取整到 16 的倍数，避免缓冲本身成为新的隐性上限。
+const RECV_MAX: usize = ((PACKET_MAX + 64 + 4 + MAC_LEN + 15) / 16) * 16;
 
 /// 执行 KEX（含对端版本串），安装密钥但不验签。
 ///

@@ -78,10 +78,36 @@ fail() {
 }
 
 # --- 1) 原生 exec：应取回输出与退出码 ---
+# 退出码必须**如实**传回来：不解析 exit-status 的话 `exit 7` 到本地会变成 0，
+# 而调用方（脚本、CI）正是靠它判断成败的——「看起来成功」比报错危险得多。
 OUT=$(HOME="$SSHD_DIR/home" timeout 60 "$BIN" --transport=native --no-pty \
         "$USER_NAME@127.0.0.1:$PORT" "echo NATIVE_MARK; exit 7" 2>&1) || RC=$?
 RC=${RC:-0}
 echo "$OUT" | grep -q "NATIVE_MARK" || fail "原生 exec 输出缺少 NATIVE_MARK（实际：$OUT）"
+[ "$RC" -eq 7 ] || fail "原生 exec 退出码是 $RC，期望 7（exit-status 没被解析？）"
+
+# --- 1b) 大输出必须完整 ---
+# 收包缓冲曾经只有 8 KiB，而 sshd 会把输出按最多 32 KiB 打包：一个「大包」
+# 就被整包丢掉，表现为**输出凭空消失、退出码还是 0**。这里用远超单包上限的
+# 输出量逐行比对（只数行数不够——中间丢一段也能凑够行数）。
+BIG_LINES=5000
+BIG=$(HOME="$SSHD_DIR/home" timeout 60 "$BIN" --transport=native --no-pty \
+        "$USER_NAME@127.0.0.1:$PORT" "seq 1 $BIG_LINES" 2>/dev/null) || true
+BIG_N=$(printf '%s\n' "$BIG" | grep -c '^[0-9]' || true)
+[ "$BIG_N" -eq "$BIG_LINES" ] || fail "大输出被截断：收到 $BIG_N 行，期望 $BIG_LINES 行"
+# 内容也要逐行对：首行/末行/中间抽样
+echo "$BIG" | sed -n '1p' | grep -qx '1' || fail "大输出首行不是 1"
+echo "$BIG" | sed -n "${BIG_LINES}p" | grep -qx "$BIG_LINES" || fail "大输出末行不是 $BIG_LINES"
+
+# --- 1c) stdin 必须转发，且 EOF 后远端能收尾（不能永久挂住）---
+# 这条覆盖两个曾经的致命缺陷：poll 的 pollfd 没填（events=0）导致 stdin
+# 永远不被读；以及本地 EOF 后不发 CHANNEL_EOF，读 stdin 的命令（cat 等）
+# 就永远等不到输入结束。用 timeout 兜底：挂住 = 失败。
+STDIN_OUT=$(printf 'STDIN_PAYLOAD\n' | HOME="$SSHD_DIR/home" timeout 45 "$BIN" \
+        --transport=native --no-pty "$USER_NAME@127.0.0.1:$PORT" "cat" 2>&1) || RC2=$?
+RC2=${RC2:-0}
+[ "$RC2" -ne 124 ] || fail "stdin 转发后 cat 挂死（超时）——EOF 没送达远端？"
+echo "$STDIN_OUT" | grep -q "STDIN_PAYLOAD" || fail "stdin 内容没有到达远端：$STDIN_OUT"
 
 # --- 2) 未知主机必须拒绝（不回落系统 ssh、更不执行命令）---
 # 要点：必须**同端口**、只清空 known_hosts，才真的走到「主机未知」这个分支。
@@ -126,4 +152,18 @@ if echo "$OUT3B" | grep -q "SHOULD_NOT_RUN3"; then
     fail "密钥不一致（无 accept-new）时居然执行了命令：$OUT3B"
 fi
 
-echo "PASS: 原生 SSH 传输（exec + 未知主机拒绝）"
+# --- 4) 交互会话：raw 模式、按键转发、Ctrl-C 的语义、退出后终端恢复 ---
+# 这一段是用户报的「卡死、没输出、Ctrl-C 直接退出」的直接回归测试，
+# 因此必须在**真实伪终端**里跑（用 ptydrive 那种线性脚本测不到 termios）。
+# 注意文件名不以 t 开头：Makefile 用 t*.py 通配集成测试，本文件是它的子脚本。
+#
+# 先把 known_hosts 恢复成**正确**的那份：上面第 3 步故意写进了不一致的主机密钥，
+# 不恢复的话这里的连接会在「主机密钥未通过校验」处被拒——那样本段测的就不是
+# 交互行为了（血泪：第一版就忘了恢复，看到的是一堆与 raw 模式无关的失败）。
+ssh-keyscan -p "$PORT" -t ed25519 127.0.0.1 > "$SSHD_DIR/home/.ssh/known_hosts" 2>/dev/null
+chmod 600 "$SSHD_DIR/home/.ssh/known_hosts"
+HOME="$SSHD_DIR/home" timeout 90 python3 "$ROOT/tests/integration/native_interactive.py" \
+    "$BIN" "$USER_NAME@127.0.0.1:$PORT" || \
+    fail "交互会话用例失败（见上面的输出）"
+
+echo "PASS: 原生 SSH 传输（exec/大输出/stdin/未知主机拒绝/交互与 Ctrl-C）"

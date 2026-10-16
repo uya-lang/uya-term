@@ -55,11 +55,15 @@ export fn main() i32 {
     if opts.transport == 1 {
         return run_native_strict(&opts);
     }
-    // --transport=auto：先用原生；**安全类失败绝不回落**，其余（连不上、
-    // 认证方式不支持等）才交给系统 ssh——这正是 auto 的意义。
+    // --transport=auto：先用原生；**安全类失败与「会话已建立后的失败」绝不回落**，
+    // 其余（连不上、认证方式不支持、通道建不起来）才交给系统 ssh——这正是 auto 的意义。
     // 之所以对安全类失败破例：回落会掩盖「主机未校验通过」这件事，
     // 用户看到命令照样执行，会以为原生这条链路是可信的。
-    if opts.transport == 0 && opts.arg_count > 0 {
+    // 之所以对「会话已建立」破例：那时远端命令已经在跑，回落 = 再跑一遍。
+    //
+    // --program=X 时直接跳过原生：位置参数是给 X 的参数，不是主机名。
+    // 照旧先试原生的话会拿它去做 DNS（实测白等 5 秒）再回落，纯浪费。
+    if opts.transport == 0 && opts.arg_count > 0 && !opts.program_set {
         const rc: i32 = run_native(&opts);
         if rc == NATIVE_FALLBACK || rc == NATIVE_TRY_SYSTEM {
             return run_wrapper(&opts);
@@ -143,8 +147,9 @@ fn run_native(opts: &Options) i32 {
     }
     req.accept_new = opts.accept_new;
     var res: NativeResult = NativeResult.ok;
-    if native_run(&req, &res) {
-        return 0;
+    var remote_code: i32 = 0;
+    if native_run(&req, &res, &remote_code) {
+        return remote_code;
     }
     // 安全类失败**不回落**，并给出可操作的提示；其余失败允许调用方回退系统 ssh。
     if res == NativeResult.host_untrusted {
@@ -152,12 +157,23 @@ fn run_native(opts: &Options) i32 {
         out_str("  若确认这是首次连接，可加 --accept-new 接受。\n" as &const byte);
         return 5;
     }
-    // auto 模式允许回落的失败类型：连不上、没有可用私钥/认证失败、通道建不起来。
-    // 只有**安全类失败**（主机未知/不一致/被吊销）不回落——那种情况下回落
-    // 会让用户误以为原生这条链路是可信的。
-    if res == NativeResult.connect_failed || res == NativeResult.io_failed ||
+    // auto 模式允许回落的失败类型：**还没开始执行远端命令**的那些
+    // （连不上、没有可用私钥/认证失败、通道建不起来）。
+    //
+    // 两类失败绝不回落：
+    //   * 安全类（主机未知/不一致/被吊销）——回落会让用户误以为原生这条链路可信；
+    //   * session_failed —— 远端命令**已经跑起来了**，回落等于把它再执行一遍。
+    //     这条比看上去重要：`uyassh host 'rm -rf build'` 真的会删两次目录。
+    if res == NativeResult.connect_failed ||
         res == NativeResult.auth_failed || res == NativeResult.channel_failed {
         return NATIVE_TRY_SYSTEM;
+    }
+    if res == NativeResult.session_failed {
+        out_str("uyassh: 原生会话中断：" as &const byte);
+        out_str(native_result_text(res));
+        out_str("\n  远端命令可能已开始执行，不再回退系统 ssh（避免重复执行）。\n" as &const byte);
+        // 与 OpenSSH 的「连接/会话失败」退出码保持一致（255）。
+        return 255;
     }
     out_str("uyassh: 原生 SSH 失败：" as &const byte);
     out_str(native_result_text(res));

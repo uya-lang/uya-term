@@ -27,6 +27,7 @@ use util.buf.buf_new;
 use util.buf.buf_free;
 use util.buf.buf_append;
 use util.buf.buf_append_byte;
+use util.buf.bytes_eq_cstr;
 use ssh.wire.wire_get_u32;
 use ssh.wire.wire_put_u32;
 use ssh.wire.wire_append_string;
@@ -64,7 +65,9 @@ export const MSG_CHANNEL_FAILURE: byte = 100 as byte;
 /// 字段：local_id 为我方 channel 号（收到的包用它）；remote_id 为对端 channel 号
 ///       （发出去的包用它）；remote_window 为对端允许我们再发的字节数；
 ///       remote_max_packet 为对端单包上限；open 表示已确认；eof 表示对端已发 EOF；
-///       close_sent/close_recv 用于避免重复 CLOSE。
+///       close_sent/close_recv 用于避免重复 CLOSE；
+///       exit_status 为远端命令退出码（exit_status_set 表示收到过）；
+///       exit_signal 为远端因信号终止时的信号号（0 表示没有）。
 export struct SessionChannel {
     local_id: u32,
     remote_id: u32,
@@ -76,6 +79,12 @@ export struct SessionChannel {
     close_recv: bool,
     /// 最近一次请求的回执（0=未收到，99=成功，100=失败）。
     last_reply: byte,
+    /// 远端命令退出码（SSH_MSG_CHANNEL_REQUEST 里的 "exit-status"）。
+    exit_status: i32,
+    /// 是否收到过 exit-status（用来区分「退出码 0」与「没收到」）。
+    exit_status_set: bool,
+    /// 远端因信号终止时的信号号（"exit-signal"，0 表示未收到）。
+    exit_signal: i32,
 }
 
 /// 我方 channel 号（固定 0，单通道会话足够）。
@@ -99,6 +108,9 @@ export fn channel_new() SessionChannel {
         close_sent: false,
         close_recv: false,
         last_reply: 0 as byte,
+        exit_status: 0,
+        exit_status_set: false,
+        exit_signal: 0,
     };
 }
 
@@ -261,9 +273,18 @@ export fn channel_build_window_change(out: &Buf, ch: &const SessionChannel,
 }
 
 /// 构造 CHANNEL_DATA。
-/// 参数：out 为输出（会被重置）；ch 为通道；data/n 为要发送的数据。
-/// 返回值：成功返回 true（窗口不足返回 false）。
-export fn channel_build_data(out: &Buf, ch: &SessionChannel, data: &const byte, n: usize) bool {
+///
+/// 参数：out 为输出（会被重置）；ch 为通道；data/n 为要发送的数据；
+///       sent 为**实际装入的字节数**（输出）。
+/// 返回值：成功返回 true（窗口不足或 n 为 0 返回 false，此时 sent=0）。
+///
+/// 说明：`sent` 必须如实回报实际装进去多少：对端的 window 只允许发一半时，
+/// 载荷会被裁到 window 那么多，而调用方若按 n 记窗口、按 n 推进读偏移，
+/// 就会**丢掉后半段输入**并且把对端窗口算成负的。这类错误不会报错，
+/// 只表现为「粘进去的长文本少了一截」。
+export fn channel_build_data(out: &Buf, ch: &SessionChannel, data: &const byte, n: usize,
+    sent: &usize) bool {
+    sent[0] = 0;
     if n == 0 {
         return false;
     }
@@ -281,6 +302,7 @@ export fn channel_build_data(out: &Buf, ch: &SessionChannel, data: &const byte, 
     _ = r catch { return false; };
     wire_put_u32_into(out, ch.remote_id);
     wire_append_string(out, data, take);
+    sent[0] = take;
     return true;
 }
 
@@ -386,9 +408,94 @@ export fn channel_handle(payload: &const byte, n: usize, ch: &SessionChannel,
         ch.close_recv = true;
         return true;
     }
+    if t == MSG_CHANNEL_REQUEST {
+        channel_parse_request(payload, n, ch);
+        return true;
+    }
     if t == MSG_CHANNEL_SUCCESS || t == MSG_CHANNEL_FAILURE {
         ch.last_reply = t;
         return true;
     }
     return true;
 }
+
+/// 解析服务端发来的 CHANNEL_REQUEST，取出退出码/退出信号。
+///
+/// 参数：payload/n 为消息体，ch 为通道（就地更新）。
+/// 返回值：无。
+///
+/// 说明：sshd 用 `exit-status` 请求把远端命令的退出码告诉我们，**这是唯一
+/// 能拿到退出码的地方**——不解析它，`exit 7` 到本地就变成 0。报文格式：
+///     byte 98 | u32 recipient | string "exit-status" | bool want_reply | u32 code
+/// `exit-signal` 用于「被信号打死」：string 信号名 | bool core dumped | string msg | string lang。
+/// 退出码按**有符号**读（sshd 在命令被信号终止时会发 -1 之类的负值）。
+fn channel_parse_request(payload: &const byte, n: usize, ch: &SessionChannel) void {
+    // 1(type) + 4(recipient) + 4(len) = 9 起才是名字
+    if n < 13 {
+        return;
+    }
+    const name_len: usize = wire_get_u32(payload + 5) as usize;
+    if name_len == 0 || 9 + name_len > n {
+        return;
+    }
+    const name: &const byte = payload + 9;
+    if wire_name_eq(name, name_len, EXIT_STATUS_NAME) {
+        // 名字之后是 bool want_reply，再是 u32 退出码
+        if 9 + name_len + 1 + 4 > n {
+            return;
+        }
+        const code: u32 = wire_get_u32(payload + 9 + name_len + 1);
+        ch.exit_status = code as i32;
+        ch.exit_status_set = true;
+        return;
+    }
+    if wire_name_eq(name, name_len, EXIT_SIGNAL_NAME) {
+        ch.exit_signal = channel_parse_exit_signal(payload, n, 9 + name_len + 1);
+        return;
+    }
+}
+
+/// 解析 exit-signal 请求里的信号名并映射为信号号。
+///
+/// 参数：payload/n 为整条消息，off 为信号名字段（string 的长度前缀）的偏移。
+/// 返回值：映射出的信号号；认不出或不完整时返回 -1。
+///
+/// 说明：SSH 的信号名是**不带 SIG 前缀**的大写名（"TERM"、"KILL"）。认不出时
+/// 返回 -1 而不是 0：0 会伪装成「没有信号」，把「远端被信号打死」显示成
+/// 「正常结束」——那正是这个字段存在的意义。
+fn channel_parse_exit_signal(payload: &const byte, n: usize, off: usize) i32 {
+    if off + 4 > n {
+        return 0 - 1;
+    }
+    const l: usize = wire_get_u32(payload + off) as usize;
+    if l == 0 || off + 4 + l > n {
+        return 0 - 1;
+    }
+    const s: &const byte = payload + off + 4;
+    if wire_name_eq(s, l, "HUP") { return 1; }
+    if wire_name_eq(s, l, "INT") { return 2; }
+    if wire_name_eq(s, l, "QUIT") { return 3; }
+    if wire_name_eq(s, l, "KILL") { return 9; }
+    if wire_name_eq(s, l, "USR1") { return 10; }
+    if wire_name_eq(s, l, "SEGV") { return 11; }
+    if wire_name_eq(s, l, "USR2") { return 12; }
+    if wire_name_eq(s, l, "PIPE") { return 13; }
+    if wire_name_eq(s, l, "ALRM") { return 14; }
+    if wire_name_eq(s, l, "TERM") { return 15; }
+    return 0 - 1;
+}
+
+/// 比较 SSH 报文字符串（长度已知）与 C 串名字。
+/// 参数：s/n 为报文字符串，c 为 C 串名字。
+/// 返回值：相等返回 true。
+///
+/// 说明：直接用 util.buf 的 bytes_eq_cstr——不要在这里手写 `c[n] == 0` 之类的
+/// 越界读（指针下标越过已知长度会触发 DEBUG_BYTE_PTR_SUBSCRIPT_ERROR）。
+fn wire_name_eq(s: &const byte, n: usize, c: &const byte) bool {
+    return bytes_eq_cstr(s, n, c);
+}
+
+/// "exit-status" 的 C 串写法。
+const EXIT_STATUS_NAME: &const byte = "exit-status";
+/// "exit-signal" 的 C 串写法。
+const EXIT_SIGNAL_NAME: &const byte = "exit-signal";

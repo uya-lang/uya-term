@@ -69,6 +69,7 @@ use ssh.channel.MSG_REQUEST_FAILURE;
 use ssh.channel.MSG_REQUEST_SUCCESS;
 use ssh.channel.MSG_GLOBAL_REQUEST;
 use ssh.channel.channel_handle;
+use libc.sys_write;
 
 
 /// 连接阶段的结果。
@@ -358,12 +359,14 @@ export fn ssh_open_session(out: &SshSession, request_pty: bool, term: &const byt
             out.stage = Stage.io_failed;
             return false;
         }
-        // pty-req 带 want_reply，等服务端回执（成功/失败都继续，只记录）
-        if !transport_recv(&out.t) {
+        // pty-req 带 want_reply，等服务端回执（成功/失败都继续，只记录）。
+        // **必须用 channel_wait_reply 而不是裸 transport_recv**：sshd 会在
+        // OPEN_CONFIRMATION 之后紧接着发 WINDOW_ADJUST（见下），裸 recv 会把它
+        // 当成「回执」读掉并丢掉——症状是窗口永远是 0，一个字节都发不出去。
+        if !channel_wait_reply(out) {
             out.stage = Stage.io_failed;
             return false;
         }
-        out.ch.last_reply = out.t.payload[0];
     }
     if !channel_build_shell_or_exec(&b, &out.ch, command) {
         out.stage = Stage.channel_failed;
@@ -373,13 +376,66 @@ export fn ssh_open_session(out: &SshSession, request_pty: bool, term: &const byt
         out.stage = Stage.io_failed;
         return false;
     }
-    if !channel_wait_for(out, 0 as byte) {
+    if !channel_wait_reply(out) {
         out.stage = Stage.io_failed;
         return false;
     }
-    out.ch.last_reply = out.t.payload[0];
     out.stage = Stage.ok;
     return true;
+}
+
+/// 等待一个 CHANNEL_SUCCESS/CHANNEL_FAILURE 回执，沿途的通道报文照常处理。
+///
+/// 参数：out 为会话。
+/// 返回值：拿到回执返回 true。
+///
+/// 说明：这里踩过一个很贵的坑。sshd 的 CHANNEL_OPEN_CONFIRMATION 里
+/// **window 常常是 0**（本机实测 `open confirm rwindow 0 rmax 32768`，
+/// OpenSSH 客户端自己也是这么记的），真正可用的发送窗口随后用一个独立的
+/// WINDOW_ADJUST 报文补上。所以建立会话的过程中**不能把「下一个包」当成
+/// 「回执」**：一旦那个包是 WINDOW_ADJUST，窗口就永远停在 0，
+/// 表现为「登录成功、远端命令也起来了，但本地一个字节都发不过去」——
+/// 键盘无反应、`cat` 拿不到输入、`wc -c` 永远等不到 EOF。
+/// 正确做法是把途中的通道报文交给 channel_handle（它会累加窗口、取数据），
+/// 只把真正的 SUCCESS/FAILURE 当回执。
+fn channel_wait_reply(out: &SshSession) bool {
+    var tries: usize = 0;
+    while tries < 64 {
+        if !transport_recv(&out.t) {
+            return false;
+        }
+        if out.t.payload_len < 1 {
+            return false;
+        }
+        const mt: byte = out.t.payload[0];
+        if mt == MSG_CHANNEL_SUCCESS || mt == MSG_CHANNEL_FAILURE {
+            out.ch.last_reply = mt;
+            return true;
+        }
+        if mt == MSG_GLOBAL_REQUEST {
+            if !channel_answer_global_request(out) {
+                return false;
+            }
+            tries = tries + 1;
+            continue;
+        }
+        if mt == MSG_REQUEST_SUCCESS || mt == MSG_REQUEST_FAILURE {
+            tries = tries + 1;
+            continue;
+        }
+        // 其他通道报文（WINDOW_ADJUST / DATA / EOF / CLOSE …）就地处理，
+        // **不能丢**：WINDOW_ADJUST 丢掉就等于把发送窗口丢了。
+        var off: usize = 0;
+        var len: usize = 0;
+        var err: bool = false;
+        _ = channel_handle(&out.t.payload[0], out.t.payload_len, &out.ch, &off, &len, &err);
+        if len > 0 {
+            const wr: !isize = sys_write(1, out.t.payload + off, len);
+            _ = wr catch { 0 as isize; };
+        }
+        tries = tries + 1;
+    }
+    return false;
 }
 
 /// 等待一个通道相关报文，自动跳过并应答服务端的全局请求。
@@ -403,18 +459,8 @@ fn channel_wait_for(out: &SshSession, want: byte) bool {
         }
         const mt: byte = out.t.payload[0];
         if mt == MSG_GLOBAL_REQUEST {
-            // 末尾的 want_reply 决定是否需要回执
-            if out.t.payload_len >= 1 && out.t.payload_len <= 8192 {
-                const wr: byte = out.t.payload[out.t.payload_len - 1];
-                if wr != 0 {
-                    var nack: Buf = buf_new();
-                    defer { buf_free(&nack); }
-                    const r: !void = buf_append_byte(&nack, MSG_REQUEST_FAILURE);
-                    _ = r catch { return false; };
-                    if !transport_send(&out.t, nack.data, nack.len) {
-                        return false;
-                    }
-                }
+            if !channel_answer_global_request(out) {
+                return false;
             }
             tries = tries + 1;
             continue;
@@ -432,10 +478,38 @@ fn channel_wait_for(out: &SshSession, want: byte) bool {
             var len: usize = 0;
             var err: bool = false;
             _ = channel_handle(&out.t.payload[0], out.t.payload_len, &out.ch, &off, &len, &err);
+            if len > 0 {
+                const wr: !isize = sys_write(1, out.t.payload + off, len);
+                _ = wr catch { 0 as isize; };
+            }
             tries = tries + 1;
             continue;
         }
         return true;
     }
     return false;
+}
+
+/// 应答服务端的 GLOBAL_REQUEST（带 want_reply 时回 REQUEST_FAILURE）。
+///
+/// 参数：out 为会话，当前 payload 是那条全局请求。
+/// 返回值：成功（含「不需要回执」）返回 true。
+///
+/// 说明：必须回 REQUEST_FAILURE(82)。sshd 发 `hostkeys-00@openssh.com`
+/// 时会带 want_reply=true，我们不理它 sshd 就一直等——表现是「认证成功、
+/// 之后彻底没动静」。想在同一条连接上继续走，就必须明确拒绝它。
+fn channel_answer_global_request(out: &SshSession) bool {
+    if out.t.payload_len < 1 || out.t.payload_len > 8192 {
+        return false;
+    }
+    // 末尾的 want_reply 决定是否需要回执
+    const wr: byte = out.t.payload[out.t.payload_len - 1];
+    if wr == 0 {
+        return true;
+    }
+    var nack: Buf = buf_new();
+    defer { buf_free(&nack); }
+    const r: !void = buf_append_byte(&nack, MSG_REQUEST_FAILURE);
+    _ = r catch { return false; };
+    return transport_send(&out.t, nack.data, nack.len);
 }
